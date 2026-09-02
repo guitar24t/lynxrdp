@@ -46,7 +46,11 @@ pub fn unix_peer(stream: &UnixStream) -> io::Result<PeerIdentity> {
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(PeerIdentity { uid: cred.uid, gid: Some(cred.gid), pid: Some(cred.pid) })
+        Ok(PeerIdentity {
+            uid: cred.uid,
+            gid: Some(cred.gid),
+            pid: Some(cred.pid),
+        })
     }
 }
 
@@ -67,7 +71,11 @@ pub fn tcp_peer(stream: &TcpStream) -> io::Result<Option<PeerIdentity>> {
         let text = std::fs::read_to_string("/proc/net/tcp6")?;
         find_socket_owner(&text, &peer, &local)
     };
-    Ok(uid.map(|uid| PeerIdentity { uid, gid: None, pid: None }))
+    Ok(uid.map(|uid| PeerIdentity {
+        uid,
+        gid: None,
+        pid: None,
+    }))
 }
 
 /// Find the owner uid of the socket whose *local* address is `sock_local`
@@ -190,7 +198,10 @@ mod tests {
         // Listening socket is not a peer.
         assert_eq!(find_socket_owner(SAMPLE, &server, &client), Some(0));
         assert_eq!(find_socket_owner("", &client, &server), None);
-        assert_eq!(find_socket_owner("garbage\nmore garbage", &client, &server), None);
+        assert_eq!(
+            find_socket_owner("garbage\nmore garbage", &client, &server),
+            None
+        );
     }
 
     #[test]

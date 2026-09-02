@@ -6,7 +6,10 @@ use std::os::unix::net::UnixStream;
 
 /// Send `payload` together with `fd` over `sock`.
 pub fn send_with_fd(sock: &UnixStream, payload: &[u8], fd: RawFd) -> io::Result<()> {
-    assert!(!payload.is_empty(), "must send at least one byte with an fd");
+    assert!(
+        !payload.is_empty(),
+        "must send at least one byte with an fd"
+    );
     // SAFETY: we build a valid msghdr with one iovec and one SCM_RIGHTS control
     // message; all buffers outlive the sendmsg call.
     unsafe {
@@ -49,8 +52,10 @@ pub fn recv_with_fd(sock: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Opt
     // SAFETY: valid msghdr with one iovec and a control buffer large enough for
     // one fd; MSG_CMSG_CLOEXEC ensures received fds are close-on-exec.
     unsafe {
-        let mut iov =
-            libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
         let space = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize;
         let mut cbuf = vec![0u8; space];
         let mut msg: libc::msghdr = std::mem::zeroed();
@@ -86,7 +91,10 @@ pub fn recv_with_fd(sock: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Opt
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
         if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-            return Err(io::Error::new(io::ErrorKind::Other, "control data truncated"));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "control data truncated",
+            ));
         }
         Ok((n, fd))
     }

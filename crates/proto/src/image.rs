@@ -23,7 +23,12 @@ pub struct Rect {
 impl Rect {
     /// Construct a rectangle.
     pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// True if the rectangle covers no pixels.
@@ -124,13 +129,21 @@ impl fmt::Debug for Framebuffer {
 impl Framebuffer {
     /// Create a black framebuffer.
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height, pixels: vec![0; (width as usize) * (height as usize)] }
+        Self {
+            width,
+            height,
+            pixels: vec![0; (width as usize) * (height as usize)],
+        }
     }
 
     /// Create a framebuffer from existing pixels. Panics if the length is wrong.
     pub fn from_pixels(width: u32, height: u32, pixels: Vec<u32>) -> Self {
         assert_eq!(pixels.len(), (width as usize) * (height as usize));
-        Self { width, height, pixels }
+        Self {
+            width,
+            height,
+            pixels,
+        }
     }
 
     /// Width in pixels.
@@ -261,7 +274,10 @@ mod tests {
         let r = Rect::new(10, 70, 5, 5);
         assert_eq!(r.align_to_tiles(64, &bounds), Rect::new(0, 64, 64, 36));
         assert_eq!(Rect::default().align_to_tiles(64, &bounds), Rect::default());
-        assert_eq!(Rect::new(63, 63, 2, 2).align_to_tiles(64, &bounds), Rect::new(0, 0, 100, 100));
+        assert_eq!(
+            Rect::new(63, 63, 2, 2).align_to_tiles(64, &bounds),
+            Rect::new(0, 0, 100, 100)
+        );
     }
 
     #[test]

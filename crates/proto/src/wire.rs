@@ -31,7 +31,10 @@ impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DecodeError::UnexpectedEof { needed, remaining } => {
-                write!(f, "unexpected end of input: need {needed} bytes, {remaining} remaining")
+                write!(
+                    f,
+                    "unexpected end of input: need {needed} bytes, {remaining} remaining"
+                )
             }
             DecodeError::InvalidUtf8 => write!(f, "invalid UTF-8 in string field"),
             DecodeError::LengthTooLarge(n) => write!(f, "length prefix too large: {n}"),
@@ -61,7 +64,9 @@ impl Writer {
 
     /// Create a writer with reserved capacity.
     pub fn with_capacity(cap: usize) -> Self {
-        Self { buf: Vec::with_capacity(cap) }
+        Self {
+            buf: Vec::with_capacity(cap),
+        }
     }
 
     /// Consume the writer and return the bytes.
@@ -171,7 +176,10 @@ impl<'a> Reader<'a> {
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         if self.remaining() < n {
-            return Err(DecodeError::UnexpectedEof { needed: n, remaining: self.remaining() });
+            return Err(DecodeError::UnexpectedEof {
+                needed: n,
+                remaining: self.remaining(),
+            });
         }
         let s = &self.data[self.pos..self.pos + n];
         self.pos += n;
@@ -237,7 +245,9 @@ impl<'a> Reader<'a> {
     /// Read a length-prefixed UTF-8 string.
     pub fn string(&mut self) -> Result<String, DecodeError> {
         let b = self.bytes()?;
-        std::str::from_utf8(b).map(|s| s.to_owned()).map_err(|_| DecodeError::InvalidUtf8)
+        std::str::from_utf8(b)
+            .map(|s| s.to_owned())
+            .map_err(|_| DecodeError::InvalidUtf8)
     }
 }
 
@@ -274,7 +284,13 @@ mod tests {
     #[test]
     fn eof_is_detected() {
         let mut r = Reader::new(&[1, 2, 3]);
-        assert_eq!(r.u32(), Err(DecodeError::UnexpectedEof { needed: 4, remaining: 3 }));
+        assert_eq!(
+            r.u32(),
+            Err(DecodeError::UnexpectedEof {
+                needed: 4,
+                remaining: 3
+            })
+        );
     }
 
     #[test]

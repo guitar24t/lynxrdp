@@ -52,20 +52,32 @@ impl Handoff {
     /// Parse.
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         let mut r = Reader::new(bytes);
-        let bad = |e: lynxrdp_proto::wire::DecodeError| io::Error::new(io::ErrorKind::InvalidData, e);
+        let bad =
+            |e: lynxrdp_proto::wire::DecodeError| io::Error::new(io::ErrorKind::InvalidData, e);
         if r.raw(4).map_err(bad)? != MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad handoff magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad handoff magic",
+            ));
         }
         let uid = r.u32().map_err(bad)?;
         let username = r.string().map_err(bad)?;
         let peer = r.string().map_err(bad)?;
         r.finish().map_err(bad)?;
-        Ok(Handoff { uid, username, peer })
+        Ok(Handoff {
+            uid,
+            username,
+            peer,
+        })
     }
 }
 
 /// Daemon side: send the client fd to the session and wait for the reply.
-pub fn send_handoff(control: &UnixStream, handoff: &Handoff, client_fd: RawFd) -> io::Result<Reply> {
+pub fn send_handoff(
+    control: &UnixStream,
+    handoff: &Handoff,
+    client_fd: RawFd,
+) -> io::Result<Reply> {
     control.set_write_timeout(Some(Duration::from_secs(5)))?;
     control.set_read_timeout(Some(Duration::from_secs(10)))?;
     send_with_fd(control, &handoff.encode(), client_fd)?;
@@ -74,7 +86,10 @@ pub fn send_handoff(control: &UnixStream, handoff: &Handoff, client_fd: RawFd) -
     match b[0] {
         1 => Ok(Reply::Accepted),
         2 => Ok(Reply::Refused),
-        other => Err(io::Error::new(io::ErrorKind::InvalidData, format!("bad reply {other}"))),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad reply {other}"),
+        )),
     }
 }
 
@@ -101,7 +116,11 @@ mod tests {
 
     #[test]
     fn handoff_roundtrip() {
-        let h = Handoff { uid: 1000, username: "alice".into(), peer: "127.0.0.1:5".into() };
+        let h = Handoff {
+            uid: 1000,
+            username: "alice".into(),
+            peer: "127.0.0.1:5".into(),
+        };
         assert_eq!(Handoff::decode(&h.encode()).unwrap(), h);
         assert!(Handoff::decode(b"nope").is_err());
         let mut bad = h.encode();
@@ -115,7 +134,11 @@ mod tests {
         let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server_side, _) = listener.accept().unwrap();
         let (daemon, session) = UnixStream::pair().unwrap();
-        let h = Handoff { uid: 7, username: "u".into(), peer: "p".into() };
+        let h = Handoff {
+            uid: 7,
+            username: "u".into(),
+            peer: "p".into(),
+        };
         let t = std::thread::spawn(move || {
             let (got, fd) = recv_handoff(&session).unwrap();
             assert_eq!(got.uid, 7);

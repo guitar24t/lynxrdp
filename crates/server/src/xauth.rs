@@ -57,8 +57,20 @@ pub fn encode_entry(family: u16, address: &[u8], number: &str, name: &str, data:
 pub fn encode_file(display_num: u32, cookie: &[u8; 16]) -> Vec<u8> {
     let host = hostname().unwrap_or_else(|| "localhost".to_string());
     let num = display_num.to_string();
-    let mut out = encode_entry(FAMILY_LOCAL, host.as_bytes(), &num, "MIT-MAGIC-COOKIE-1", cookie);
-    out.extend(encode_entry(FAMILY_WILD, &[], &num, "MIT-MAGIC-COOKIE-1", cookie));
+    let mut out = encode_entry(
+        FAMILY_LOCAL,
+        host.as_bytes(),
+        &num,
+        "MIT-MAGIC-COOKIE-1",
+        cookie,
+    );
+    out.extend(encode_entry(
+        FAMILY_WILD,
+        &[],
+        &num,
+        "MIT-MAGIC-COOKIE-1",
+        cookie,
+    ));
     out
 }
 

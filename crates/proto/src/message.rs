@@ -336,7 +336,13 @@ impl Message {
     pub fn encode_into(&self, w: &mut Writer) {
         w.u8(self.kind() as u8);
         match self {
-            Message::ClientHello { version, client_name, features, width, height } => {
+            Message::ClientHello {
+                version,
+                client_name,
+                features,
+                width,
+                height,
+            } => {
                 w.u16(*version);
                 w.string(client_name);
                 w.u32(*features);
@@ -444,17 +450,37 @@ impl Message {
                 width: r.u16()?,
                 height: r.u16()?,
             },
-            Kind::Rejected => Message::Rejected { code: r.u16()?, reason: r.string()? },
-            Kind::KeyEvent => Message::KeyEvent { keysym: r.u32()?, down: r.bool()? },
-            Kind::PointerMotion => Message::PointerMotion { x: r.u16()?, y: r.u16()? },
-            Kind::PointerButton => Message::PointerButton { button: r.u8()?, down: r.bool()? },
-            Kind::Scroll => Message::Scroll { dx: r.i16()?, dy: r.i16()? },
+            Kind::Rejected => Message::Rejected {
+                code: r.u16()?,
+                reason: r.string()?,
+            },
+            Kind::KeyEvent => Message::KeyEvent {
+                keysym: r.u32()?,
+                down: r.bool()?,
+            },
+            Kind::PointerMotion => Message::PointerMotion {
+                x: r.u16()?,
+                y: r.u16()?,
+            },
+            Kind::PointerButton => Message::PointerButton {
+                button: r.u8()?,
+                down: r.bool()?,
+            },
+            Kind::Scroll => Message::Scroll {
+                dx: r.i16()?,
+                dy: r.i16()?,
+            },
             Kind::FrameAck => Message::FrameAck { frame_id: r.u64()? },
-            Kind::ResizeRequest => Message::ResizeRequest { width: r.u16()?, height: r.u16()? },
+            Kind::ResizeRequest => Message::ResizeRequest {
+                width: r.u16()?,
+                height: r.u16()?,
+            },
             Kind::ClipboardText => Message::ClipboardText { text: r.string()? },
             Kind::Ping => Message::Ping { nonce: r.u64()? },
             Kind::Pong => Message::Pong { nonce: r.u64()? },
-            Kind::Disconnect => Message::Disconnect { reason: r.string()? },
+            Kind::Disconnect => Message::Disconnect {
+                reason: r.string()?,
+            },
             Kind::RefreshRequest => Message::RefreshRequest,
             Kind::ScreenUpdate => {
                 let frame_id = r.u64()?;
@@ -464,7 +490,10 @@ impl Message {
                 }
                 // Each tile needs at least 13 bytes; refuse absurd counts early.
                 if n.saturating_mul(13) > r.remaining() {
-                    return Err(DecodeError::UnexpectedEof { needed: n * 13, remaining: r.remaining() });
+                    return Err(DecodeError::UnexpectedEof {
+                        needed: n * 13,
+                        remaining: r.remaining(),
+                    });
                 }
                 let mut tiles = Vec::with_capacity(n);
                 for _ in 0..n {
@@ -477,11 +506,18 @@ impl Message {
                     }
                     let encoding = TileEncoding::from_u8(r.u8()?)?;
                     let data = r.bytes()?.to_vec();
-                    tiles.push(TileUpdate { rect: Rect::new(x, y, width, height), encoding, data });
+                    tiles.push(TileUpdate {
+                        rect: Rect::new(x, y, width, height),
+                        encoding,
+                        data,
+                    });
                 }
                 Message::ScreenUpdate { frame_id, tiles }
             }
-            Kind::ScreenResized => Message::ScreenResized { width: r.u16()?, height: r.u16()? },
+            Kind::ScreenResized => Message::ScreenResized {
+                width: r.u16()?,
+                height: r.u16()?,
+            },
             Kind::CursorShape => {
                 let width = r.u16()?;
                 let height = r.u16()?;
@@ -498,9 +534,20 @@ impl Message {
                 for _ in 0..n {
                     argb.push(r.u32()?);
                 }
-                Message::CursorShape { cursor: CursorImage { width, height, hot_x, hot_y, argb } }
+                Message::CursorShape {
+                    cursor: CursorImage {
+                        width,
+                        height,
+                        hot_x,
+                        hot_y,
+                        argb,
+                    },
+                }
             }
-            Kind::CursorPosition => Message::CursorPosition { x: r.u16()?, y: r.u16()? },
+            Kind::CursorPosition => Message::CursorPosition {
+                x: r.u16()?,
+                y: r.u16()?,
+            },
             Kind::Notice => Message::Notice { text: r.string()? },
         };
         r.finish()?;
@@ -531,17 +578,33 @@ mod tests {
                 width: 800,
                 height: 600,
             },
-            Message::Rejected { code: reject::VERSION, reason: "nope".into() },
-            Message::KeyEvent { keysym: 0xff0d, down: true },
+            Message::Rejected {
+                code: reject::VERSION,
+                reason: "nope".into(),
+            },
+            Message::KeyEvent {
+                keysym: 0xff0d,
+                down: true,
+            },
             Message::PointerMotion { x: 1, y: 2 },
-            Message::PointerButton { button: button::LEFT, down: false },
+            Message::PointerButton {
+                button: button::LEFT,
+                down: false,
+            },
             Message::Scroll { dx: -1, dy: 3 },
             Message::FrameAck { frame_id: u64::MAX },
-            Message::ResizeRequest { width: 1, height: 1 },
-            Message::ClipboardText { text: "clip ✂".into() },
+            Message::ResizeRequest {
+                width: 1,
+                height: 1,
+            },
+            Message::ClipboardText {
+                text: "clip ✂".into(),
+            },
             Message::Ping { nonce: 9 },
             Message::Pong { nonce: 9 },
-            Message::Disconnect { reason: "bye".into() },
+            Message::Disconnect {
+                reason: "bye".into(),
+            },
             Message::RefreshRequest,
             Message::ScreenUpdate {
                 frame_id: 3,
@@ -558,12 +621,23 @@ mod tests {
                     },
                 ],
             },
-            Message::ScreenResized { width: 10, height: 20 },
+            Message::ScreenResized {
+                width: 10,
+                height: 20,
+            },
             Message::CursorShape {
-                cursor: CursorImage { width: 2, height: 1, hot_x: 0, hot_y: 1, argb: vec![1, 2] },
+                cursor: CursorImage {
+                    width: 2,
+                    height: 1,
+                    hot_x: 0,
+                    hot_y: 1,
+                    argb: vec![1, 2],
+                },
             },
             Message::CursorPosition { x: 5, y: 6 },
-            Message::Notice { text: "hello".into() },
+            Message::Notice {
+                text: "hello".into(),
+            },
         ]
     }
 
@@ -591,7 +665,11 @@ mod tests {
         for m in all_samples() {
             let bytes = m.encode();
             for cut in 0..bytes.len() {
-                assert!(Message::decode(&bytes[..cut]).is_err(), "cut {cut} of {:?}", m.kind());
+                assert!(
+                    Message::decode(&bytes[..cut]).is_err(),
+                    "cut {cut} of {:?}",
+                    m.kind()
+                );
             }
         }
     }
@@ -613,7 +691,10 @@ mod tests {
                 data: vec![0, 0, 0],
             }],
         };
-        assert_eq!(Message::decode(&m.encode()), Err(DecodeError::InvalidValue("tile size")));
+        assert_eq!(
+            Message::decode(&m.encode()),
+            Err(DecodeError::InvalidValue("tile size"))
+        );
     }
 
     #[test]
@@ -642,7 +723,10 @@ mod tests {
         w.u16(0);
         w.u16(0);
         w.u32(1_000_000);
-        assert_eq!(Message::decode(w.as_slice()), Err(DecodeError::InvalidValue("cursor size")));
+        assert_eq!(
+            Message::decode(w.as_slice()),
+            Err(DecodeError::InvalidValue("cursor size"))
+        );
     }
 
     proptest! {

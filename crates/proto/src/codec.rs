@@ -110,10 +110,18 @@ pub fn encode_pixels(rect: Rect, pixels: &[u32]) -> TileUpdate {
     if raw.len() >= 48 {
         let compressed = lz4_flex::block::compress_prepend_size(&raw);
         if compressed.len() < raw.len() {
-            return TileUpdate { rect, encoding: TileEncoding::Lz4, data: compressed };
+            return TileUpdate {
+                rect,
+                encoding: TileEncoding::Lz4,
+                data: compressed,
+            };
         }
     }
-    TileUpdate { rect, encoding: TileEncoding::Raw, data: raw }
+    TileUpdate {
+        rect,
+        encoding: TileEncoding::Raw,
+        data: raw,
+    }
 }
 
 /// Decode a tile into `0x00RRGGBB` pixels.
@@ -184,7 +192,12 @@ pub fn changed_bbox(a: &Framebuffer, b: &Framebuffer, rect: &Rect) -> Option<Rec
     if min_x == u32::MAX {
         None
     } else {
-        Some(Rect::new(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+        Some(Rect::new(
+            min_x,
+            min_y,
+            max_x - min_x + 1,
+            max_y - min_y + 1,
+        ))
     }
 }
 
@@ -200,7 +213,10 @@ impl Encoder {
     /// starts black, so the first call to [`Encoder::encode_region`] emits
     /// tiles for every non-black pixel.
     pub fn new(width: u32, height: u32) -> Self {
-        Self { prev: Framebuffer::new(width, height), tile: TILE_SIZE }
+        Self {
+            prev: Framebuffer::new(width, height),
+            tile: TILE_SIZE,
+        }
     }
 
     /// Use a custom tile size (mostly for tests).
@@ -287,7 +303,9 @@ pub struct Decoder {
 impl Decoder {
     /// Create a decoder with a black screen of the given size.
     pub fn new(width: u32, height: u32) -> Self {
-        Self { fb: Framebuffer::new(width, height) }
+        Self {
+            fb: Framebuffer::new(width, height),
+        }
     }
 
     /// Resize the local copy (content outside the new size is dropped).
@@ -365,15 +383,34 @@ mod tests {
 
     #[test]
     fn corrupt_data_is_rejected() {
-        let t = TileUpdate { rect: Rect::new(0, 0, 2, 2), encoding: TileEncoding::Raw, data: vec![1] };
+        let t = TileUpdate {
+            rect: Rect::new(0, 0, 2, 2),
+            encoding: TileEncoding::Raw,
+            data: vec![1],
+        };
         assert!(decode_pixels(&t).is_err());
-        let t = TileUpdate { rect: Rect::new(0, 0, 2, 2), encoding: TileEncoding::Lz4, data: vec![1, 2, 3] };
+        let t = TileUpdate {
+            rect: Rect::new(0, 0, 2, 2),
+            encoding: TileEncoding::Lz4,
+            data: vec![1, 2, 3],
+        };
         assert!(decode_pixels(&t).is_err());
-        let t = TileUpdate { rect: Rect::new(0, 0, 2, 2), encoding: TileEncoding::Solid, data: vec![1] };
+        let t = TileUpdate {
+            rect: Rect::new(0, 0, 2, 2),
+            encoding: TileEncoding::Solid,
+            data: vec![1],
+        };
         assert!(decode_pixels(&t).is_err());
         let mut fb = Framebuffer::new(4, 4);
-        let t = TileUpdate { rect: Rect::new(3, 3, 2, 2), encoding: TileEncoding::Solid, data: vec![1, 2, 3] };
-        assert!(matches!(apply_tile(&mut fb, &t), Err(CodecError::OutOfBounds(_))));
+        let t = TileUpdate {
+            rect: Rect::new(3, 3, 2, 2),
+            encoding: TileEncoding::Solid,
+            data: vec![1, 2, 3],
+        };
+        assert!(matches!(
+            apply_tile(&mut fb, &t),
+            Err(CodecError::OutOfBounds(_))
+        ));
     }
 
     #[test]
@@ -416,7 +453,9 @@ mod tests {
     fn region_outside_bounds_is_ignored() {
         let mut enc = Encoder::new(64, 64);
         let screen = checker(64, 64, 1);
-        assert!(enc.encode_region(&screen, &Rect::new(100, 100, 10, 10)).is_empty());
+        assert!(enc
+            .encode_region(&screen, &Rect::new(100, 100, 10, 10))
+            .is_empty());
         assert!(enc.encode_region(&screen, &Rect::default()).is_empty());
     }
 
@@ -427,8 +466,14 @@ mod tests {
         assert_eq!(changed_bbox(&a, &b, &a.bounds()), None);
         b.set(3, 4, 1);
         b.set(7, 8, 1);
-        assert_eq!(changed_bbox(&a, &b, &a.bounds()), Some(Rect::new(3, 4, 5, 5)));
-        assert_eq!(changed_bbox(&a, &b, &Rect::new(0, 0, 5, 5)), Some(Rect::new(3, 4, 1, 1)));
+        assert_eq!(
+            changed_bbox(&a, &b, &a.bounds()),
+            Some(Rect::new(3, 4, 5, 5))
+        );
+        assert_eq!(
+            changed_bbox(&a, &b, &Rect::new(0, 0, 5, 5)),
+            Some(Rect::new(3, 4, 1, 1))
+        );
     }
 
     proptest! {
