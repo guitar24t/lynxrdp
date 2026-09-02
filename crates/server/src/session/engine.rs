@@ -548,6 +548,11 @@ impl Core {
                     }
                 }
             }
+            Message::Ping { nonce } => {
+                if let Some(c) = self.client.as_mut() {
+                    c.send(&Message::Pong { nonce });
+                }
+            }
             Message::RefreshRequest => {
                 if let Some(c) = self.client.as_mut() {
                     c.full_refresh = true;
