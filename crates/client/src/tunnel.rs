@@ -320,23 +320,35 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tunnel_comes_up_when_port_opens() {
-        // Simulate ssh with a shell script that listens on the port.
+        // A real listener stands in for the far end of the forward, so
+        // Tunnel::open's readiness wait sees the port accept connections. The
+        // fake "ssh" only has to stay alive and ignore its arguments, which a
+        // tiny /bin/sh + sleep script does portably (no python required).
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("fakessh.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in 127.0.0.1:*) port=$(echo \"$a\" | cut -d: -f2);; esac; done\nexec python3 -c \"import socket,time; s=socket.socket(); s.bind(('127.0.0.1',int('$port'))); s.listen(1); time.sleep(30)\"\n",
-        )
-        .unwrap();
+        std::fs::write(&script, "#!/bin/sh\nexec sleep 30\n").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let port = pick_free_port().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+            }
+        });
+
         let cfg = TunnelConfig {
             destination: "x".into(),
             ssh_program: script.display().to_string(),
+            local_port: port,
             ..Default::default()
         };
         let mut t = Tunnel::open(&cfg, Duration::from_secs(10)).unwrap();
         assert!(t.is_alive());
+        assert_eq!(t.local_addr().port(), port);
         assert!(TcpStream::connect(t.local_addr()).is_ok());
         t.close();
         assert!(!t.is_alive());
