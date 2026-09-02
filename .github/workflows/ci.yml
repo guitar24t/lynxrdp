@@ -10,6 +10,12 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Cancel superseded runs on the same ref so a new push does not leave stale
+# in-flight jobs (and stale failures) behind.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     name: Format and lint
