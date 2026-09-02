@@ -46,6 +46,8 @@ impl Desktop {
         unsafe {
             cmd.pre_exec(|| {
                 libc::setsid();
+                // Terminate the desktop if the session process dies unexpectedly.
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
                 Ok(())
             });
         }

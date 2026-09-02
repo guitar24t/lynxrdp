@@ -899,6 +899,7 @@ dependencies = [
  "libc",
  "libloading",
  "log",
+ "lynxrdp-client",
  "lynxrdp-proto",
  "serde",
  "tempfile",

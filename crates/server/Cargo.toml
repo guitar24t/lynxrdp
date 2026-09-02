@@ -31,3 +31,4 @@ x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "xtest", "ran
 
 [dev-dependencies]
 tempfile = "3"
+lynxrdp-client = { path = "../client" }

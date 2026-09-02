@@ -136,6 +136,9 @@ fn run() -> Result<()> {
     let reason = App::run(client, app_opts, slot)?;
     if let Some(r) = reason {
         log::info!("session closed: {r}");
+        if r.starts_with("rejected") || r.starts_with("protocol error") {
+            bail!("{r}");
+        }
     }
     Ok(())
 }

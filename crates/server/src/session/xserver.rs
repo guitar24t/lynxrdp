@@ -93,6 +93,8 @@ impl XServer {
             cmd.pre_exec(move || {
                 libc::close(read_fd);
                 libc::setsid();
+                // Die with the session process so no X server is ever orphaned.
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
                 Ok(())
             });
         }

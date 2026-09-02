@@ -204,6 +204,9 @@ impl App {
     }
 
     fn drain_network(&mut self, event_loop: &ActiveEventLoop) {
+        if self.exit_reason.is_some() {
+            return;
+        }
         loop {
             match self.client.try_event() {
                 Ok(Some(ev)) => match ev {
