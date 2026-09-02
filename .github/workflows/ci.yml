@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-linux:
+    name: Test (Linux, Xvfb end-to-end)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install X test dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q xvfb xterm xdotool xclip x11-utils x11-xserver-utils libxkbcommon-x11-0 libxkbcommon0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - name: Unit tests
+        run: cargo test --workspace --lib --bins
+      - name: End-to-end tests (session)
+        run: cargo test -p lynxrdp-server --test e2e -- --test-threads=2
+      - name: End-to-end tests (daemon)
+        run: cargo test -p lynxrdp-server --test daemon -- --test-threads=1
+      - name: Doc tests
+        run: cargo test --workspace --doc
+
+  build-client:
+    name: Client (${{ matrix.name }})
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bin: lynxrdp
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin: lynxrdp
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin: lynxrdp
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            bin: lynxrdp
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: lynxrdp.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Test protocol and client crates
+        run: cargo test -p lynxrdp-proto -p lynxrdp-client --target ${{ matrix.target }}
+      - name: Build release client
+        run: cargo build --release -p lynxrdp-client --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: packaging/package-client.sh "${{ matrix.target }}" "${{ matrix.name }}" "${{ matrix.bin }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lynxrdp-client-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  package-server:
+    name: Server packages (${{ matrix.name }})
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            os: ubuntu-24.04
+            arch: amd64
+          - name: aarch64
+            os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-${{ matrix.arch }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.1
+      - name: Build server and client (release)
+        run: cargo build --release -p lynxrdp-server -p lynxrdp-client
+      - name: Build .deb and .rpm
+        run: packaging/package-server.sh "${{ matrix.arch }}"
+      - name: Install the .deb and smoke test
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ./dist/lynxrdp-server_*_${{ matrix.arch }}.deb
+          lynxrdpd --version
+          lynxrdp-session --version
+          lynxrdpd --check
+          test -f /etc/pam.d/lynxrdp
+          test -x /etc/lynxrdp/startwm.sh
+          systemd-analyze verify /usr/lib/systemd/system/lynxrdpd.service
+          systemctl is-enabled lynxrdpd
+          systemctl is-active lynxrdpd
+          sudo journalctl -u lynxrdpd --no-pager | tail -20
+          sudo apt-get remove -y -q lynxrdp-server
+      - name: Inspect the .rpm
+        run: |
+          sudo apt-get install -y -q rpm
+          rpm -qpi dist/lynxrdp-server-*.rpm
+          rpm -qpl dist/lynxrdp-server-*.rpm
+          rpm -qp --scripts dist/lynxrdp-server-*.rpm | head -40
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lynxrdp-server-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error

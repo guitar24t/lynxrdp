@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(dst[2], 0x123456);
         assert_eq!(dst[3], 0);
         assert_eq!(dst[8], 0);
-        let mut small = vec![0u32; 2 * 1];
+        let mut small = vec![0u32; 2];
         blit(&mut small, 2, 1, &fb);
         assert_eq!(small, vec![0x123456, 0x123456]);
     }
@@ -617,10 +617,10 @@ mod tests {
         // Hotspot at (0,0) => image origin at (-1,-1); only bottom-right pixel visible.
         assert_eq!(dst[0], 0x0000FF);
         draw_cursor(&mut dst, 4, 4, &cur, 2, 2);
-        assert_eq!(dst[1 * 4 + 1], 0x00FF00);
-        assert_eq!(dst[1 * 4 + 2], 0x800000);
-        assert_eq!(dst[2 * 4 + 2], 0x0000FF);
-        assert_eq!(dst[2 * 4 + 1], 0);
+        assert_eq!(dst[4 + 1], 0x00FF00);
+        assert_eq!(dst[4 + 2], 0x800000);
+        assert_eq!(dst[8 + 2], 0x0000FF);
+        assert_eq!(dst[8 + 1], 0);
         let hidden = CursorImage {
             width: 0,
             height: 0,

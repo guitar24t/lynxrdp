@@ -91,10 +91,7 @@ pub fn recv_with_fd(sock: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Opt
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
         if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "control data truncated",
-            ));
+            return Err(io::Error::other("control data truncated"));
         }
         Ok((n, fd))
     }

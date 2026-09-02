@@ -185,7 +185,10 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
                 libc::close(control_fd);
             }
             libc::umask(0o022);
-            if libc::getuid() == 0 {
+            // Switch to the target user only when we are root and it differs
+            // from us. Serving our own uid needs no change and must not try to
+            // drop privileges.
+            if need_switch && libc::getuid() == 0 {
                 if libc::initgroups(c_user.as_ptr(), gid) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -195,12 +198,10 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
                 if libc::setuid(uid) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                // Make sure privileges cannot be regained.
-                if libc::setuid(0) == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "privilege drop failed",
-                    ));
+                // When dropping to a non-root user, make sure root cannot be
+                // regained.
+                if uid != 0 && libc::setuid(0) == 0 {
+                    return Err(std::io::Error::other("privilege drop failed"));
                 }
             }
             Ok(())

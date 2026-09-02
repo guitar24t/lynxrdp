@@ -61,6 +61,9 @@ impl Default for TunnelConfig {
 impl TunnelConfig {
     /// Build the argument list for `ssh` given the chosen local port.
     pub fn args(&self, local_port: u16) -> Vec<String> {
+        // Note: ClearAllForwardings must NOT be set here. OpenSSH applies it
+        // to command-line forwardings too, which would silently discard the
+        // -L below and the tunnel would never come up.
         let mut a = vec![
             "-N".to_string(),
             "-o".into(),
@@ -69,8 +72,6 @@ impl TunnelConfig {
             "ServerAliveInterval=15".into(),
             "-o".into(),
             "ServerAliveCountMax=3".into(),
-            "-o".into(),
-            "ClearAllForwardings=yes".into(),
         ];
         // TCP keepalive on the SSH connection itself and no compression: our
         // stream is already compressed and adding zlib only adds latency.

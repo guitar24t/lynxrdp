@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/lynxrdp/lynxrdp.toml";
 
 /// Top-level configuration.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Listener settings.
@@ -86,16 +86,6 @@ pub struct SessionConfig {
     pub log_dir: Option<PathBuf>,
     /// DPI reported by the X server.
     pub dpi: u32,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            listen: ListenConfig::default(),
-            access: AccessConfig::default(),
-            session: SessionConfig::default(),
-        }
-    }
 }
 
 impl Default for ListenConfig {

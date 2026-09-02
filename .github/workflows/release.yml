@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-client:
+    name: Client (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-24.04,     target: x86_64-unknown-linux-gnu,  bin: lynxrdp }
+          - { name: linux-aarch64,  os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, bin: lynxrdp }
+          - { name: macos-aarch64,  os: macos-latest,     target: aarch64-apple-darwin,      bin: lynxrdp }
+          - { name: macos-x86_64,   os: macos-13,         target: x86_64-apple-darwin,       bin: lynxrdp }
+          - { name: windows-x86_64, os: windows-latest,   target: x86_64-pc-windows-msvc,    bin: lynxrdp.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release -p lynxrdp-client --target ${{ matrix.target }}
+      - shell: bash
+        run: packaging/package-client.sh "${{ matrix.target }}" "${{ matrix.name }}" "${{ matrix.bin }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lynxrdp-client-${{ matrix.name }}
+          path: dist/*
+
+  package-server:
+    name: Server packages (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86_64,  os: ubuntu-24.04,     arch: amd64 }
+          - { name: aarch64, os: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-${{ matrix.arch }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.1
+      - run: cargo build --release -p lynxrdp-server -p lynxrdp-client
+      - run: packaging/package-server.sh "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lynxrdp-server-${{ matrix.name }}
+          path: dist/*
+
+  release:
+    name: Publish GitHub release
+    needs: [build-client, package-server]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          (cd release && sha256sum * > SHA256SUMS)
+          ls -la release
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false

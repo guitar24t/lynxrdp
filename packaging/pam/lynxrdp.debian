@@ -1,0 +1,10 @@
+#%PAM-1.0
+# PAM configuration for LynxRDP sessions (Debian/Ubuntu).
+#
+# Authentication is not performed here: the user has already authenticated
+# through SSH. Only the account and session stacks are used so that
+# systemd-logind, pam_env, pam_limits and friends see a normal login.
+@include common-account
+session    required     pam_loginuid.so
+session    optional     pam_keyinit.so force revoke
+@include common-session

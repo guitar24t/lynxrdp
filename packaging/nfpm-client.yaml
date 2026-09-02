@@ -1,0 +1,31 @@
+# nfpm configuration for the Linux client package (.deb and .rpm).
+name: lynxrdp-client
+arch: "${ARCH}"
+platform: linux
+version: "${VERSION}"
+release: "1"
+section: x11
+priority: optional
+maintainer: LynxRDP contributors <lynxrdp@users.noreply.github.com>
+description: |
+  LynxRDP remote desktop client.
+  Connects to a LynxRDP server through an SSH port forward.
+vendor: LynxRDP
+homepage: https://github.com/guitar24t/lynxrdp
+license: MIT
+contents:
+  - src: target/release/lynxrdp
+    dst: /usr/bin/lynxrdp
+    file_info:
+      mode: 0755
+overrides:
+  deb:
+    depends:
+      - openssh-client
+      - libxkbcommon-x11-0
+      - libxkbcommon0
+  rpm:
+    depends:
+      - openssh-clients
+      - libxkbcommon-x11
+      - libxkbcommon

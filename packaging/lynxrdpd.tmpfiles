@@ -1,0 +1,3 @@
+# Runtime and log directories for lynxrdpd (root only).
+d /run/lynxrdp 0700 root root -
+d /var/log/lynxrdp 0700 root root -

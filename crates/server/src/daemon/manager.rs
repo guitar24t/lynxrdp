@@ -62,7 +62,7 @@ impl SessionManager {
         // connect to a session socket can hand it arbitrary connections.
         fs::set_permissions(
             &sessions_dir,
-            fs::Permissions::from(std::os::unix::fs::PermissionsExt::from_mode(0o700)),
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
         )?;
         Ok(Self {
             cfg,

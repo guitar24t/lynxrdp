@@ -427,9 +427,8 @@ impl Client {
             if remaining.is_zero() {
                 return Ok(false);
             }
-            match self.poll_event(remaining)? {
-                Some(ClientEvent::Disconnected(r)) => bail!("disconnected: {r}"),
-                _ => {}
+            if let Some(ClientEvent::Disconnected(r)) = self.poll_event(remaining)? {
+                bail!("disconnected: {r}");
             }
         }
         Ok(true)

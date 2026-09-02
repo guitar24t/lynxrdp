@@ -10,7 +10,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use lynxrdp_client::connection::{Client, ClientEvent, ConnectOptions};
-use lynxrdp_proto::message::button;
 use lynxrdp_proto::{keysym, Rect};
 
 fn have(prog: &str) -> bool {
@@ -254,34 +253,179 @@ fn incremental_updates_only_send_changes() {
     );
 }
 
+/// A window on the session display that receives keyboard focus and
+/// records the keysyms it is sent. This is deterministic, unlike typing into
+/// a terminal emulator under a window-manager-less X server.
+struct KeySink {
+    conn: x11rb::rust_connection::RustConnection,
+    window: u32,
+    keysyms_per_keycode: u8,
+    min_keycode: u8,
+    keysyms: Vec<u32>,
+}
+
+impl KeySink {
+    fn open(s: &Session) -> Self {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::{
+            ConnectionExt as _, CreateWindowAux, EventMask, InputFocus, WindowClass,
+        };
+        use x11rb::rust_connection::RustConnection;
+        // Connect as an ordinary X client using the session's display and
+        // its private authority cookie.
+        std::env::set_var("XAUTHORITY", s.xauth());
+        let (conn, screen_num) =
+            RustConnection::connect(Some(&s.display)).expect("connect display");
+        let setup = conn.setup();
+        let root = setup.roots[screen_num].root;
+        let (min, max) = (setup.min_keycode, setup.max_keycode);
+        let window = conn.generate_id().unwrap();
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            window,
+            root,
+            0,
+            0,
+            200,
+            100,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new()
+                .event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE | EventMask::BUTTON_PRESS)
+                .background_pixel(0x00ff00),
+        )
+        .unwrap();
+        conn.map_window(window).unwrap();
+        conn.set_input_focus(InputFocus::POINTER_ROOT, window, x11rb::CURRENT_TIME)
+            .unwrap();
+        conn.flush().unwrap();
+        let mapping = conn
+            .get_keyboard_mapping(min, max - min + 1)
+            .unwrap()
+            .reply()
+            .unwrap();
+        Self {
+            conn,
+            window,
+            keysyms_per_keycode: mapping.keysyms_per_keycode,
+            min_keycode: min,
+            keysyms: mapping.keysyms,
+        }
+    }
+
+    fn keysym(&mut self, keycode: u8, state: u16) -> u32 {
+        // Re-read the mapping lazily when a keycode has no entry (the server
+        // binds new keysyms on the fly and sends MappingNotify).
+        let idx = |k: u8, col: usize, syms: &[u32], per: u8, min: u8| {
+            syms[(k - min) as usize * per as usize + col]
+        };
+        let refresh = |this: &mut Self| {
+            use x11rb::connection::Connection as _;
+            use x11rb::protocol::xproto::ConnectionExt as _;
+            let setup = this.conn.setup();
+            let (min, max) = (setup.min_keycode, setup.max_keycode);
+            let m = this
+                .conn
+                .get_keyboard_mapping(min, max - min + 1)
+                .unwrap()
+                .reply()
+                .unwrap();
+            this.keysyms = m.keysyms;
+            this.keysyms_per_keycode = m.keysyms_per_keycode;
+        };
+        let mut plain = idx(
+            keycode,
+            0,
+            &self.keysyms,
+            self.keysyms_per_keycode,
+            self.min_keycode,
+        );
+        if plain == 0 {
+            refresh(self);
+            plain = idx(
+                keycode,
+                0,
+                &self.keysyms,
+                self.keysyms_per_keycode,
+                self.min_keycode,
+            );
+        }
+        let shifted = idx(
+            keycode,
+            1,
+            &self.keysyms,
+            self.keysyms_per_keycode,
+            self.min_keycode,
+        );
+        let shift = state & 1 != 0;
+        if shift && shifted != 0 {
+            shifted
+        } else if shift {
+            // Implicit case conversion for alphabetic keys.
+            lynxrdp_proto::keysym::char_from_keysym(plain)
+                .and_then(|c| c.to_uppercase().next())
+                .map(lynxrdp_proto::keysym::keysym_from_char)
+                .unwrap_or(plain)
+        } else {
+            plain
+        }
+    }
+
+    /// Collect (keysym, pressed, state) until a press of `until` is seen, or
+    /// for `drain` extra time after it, or the timeout elapses.
+    fn collect_until(&mut self, until: u32, timeout: Duration) -> Vec<(u32, bool, u16)> {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::Event;
+        let deadline = Instant::now() + timeout;
+        let mut out = Vec::new();
+        let mut stop_at: Option<Instant> = None;
+        while Instant::now() < deadline {
+            if let Some(t) = stop_at {
+                if Instant::now() >= t {
+                    break;
+                }
+            }
+            match self.conn.poll_for_event().unwrap() {
+                Some(Event::KeyPress(e)) if e.event == self.window => {
+                    let ks = self.keysym(e.detail, e.state.into());
+                    out.push((ks, true, e.state.into()));
+                    if ks == until {
+                        // Give the matching release a moment to arrive.
+                        stop_at = Some(Instant::now() + Duration::from_millis(200));
+                    }
+                }
+                Some(Event::KeyRelease(e)) if e.event == self.window => {
+                    let ks = self.keysym(e.detail, e.state.into());
+                    out.push((ks, false, e.state.into()));
+                }
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        out
+    }
+
+    /// Collect all events for a fixed duration.
+    fn drain(&mut self, timeout: Duration) -> Vec<(u32, bool, u16)> {
+        self.collect_until(u32::MAX, timeout)
+    }
+}
+
 #[test]
 fn keyboard_input_reaches_application() {
     require_xvfb!();
-    if !have("xterm") {
-        eprintln!("SKIP: xterm not installed");
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("typed.txt");
-    // xterm runs `cat > file`; whatever we type lands in the file after Enter.
-    let cmd = format!("xterm -geometry 60x10+0+0 -e 'cat > {}'", out.display());
-    let s = Session::start(640, 480, &cmd, &[]);
+    let s = Session::start(640, 480, "none", &[]);
     let mut c = s.connect(None);
-    // Wait until xterm has drawn its window (a good chunk of non-black pixels,
-    // not just the blinking cursor) so it is mapped and ready for input.
-    assert!(
-        wait_for(&mut c, Duration::from_secs(15), |_, c| {
-            c.framebuffer().pixels().iter().filter(|&&p| p != 0).count() > 200
-        }),
-        "xterm never drew"
-    );
-    // With no window manager, X uses focus-follows-pointer, so keep the
-    // pointer inside the terminal and give it time to take focus.
-    c.pointer_move(40, 40).unwrap();
-    std::thread::sleep(Duration::from_millis(800));
-    c.click(40, 40, button::LEFT).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-    c.type_text("Hello, LynxRDP!").unwrap();
+    let mut sink = KeySink::open(&s);
+    // Let the window map and take focus; the server sends a frame for it.
+    assert!(wait_for(&mut c, Duration::from_secs(10), |_, c| c
+        .framebuffer()
+        .get(10, 10)
+        == 0x00ff00));
+    // Plain, shifted (temporary shift), explicitly shifted, unicode (dynamic
+    // binding), a named key, and a control chord.
+    c.type_text("aB!").unwrap();
     c.key(keysym::SHIFT_L, true).unwrap();
     c.tap_key(keysym::keysym_from_char('Z')).unwrap();
     c.key(keysym::SHIFT_L, false).unwrap();
@@ -290,16 +434,48 @@ fn keyboard_input_reaches_application() {
     c.key(keysym::CONTROL_L, true).unwrap();
     c.tap_key(keysym::keysym_from_char('d')).unwrap();
     c.key(keysym::CONTROL_L, false).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut text = String::new();
-    while Instant::now() < deadline {
-        text = std::fs::read_to_string(&out).unwrap_or_default();
-        if text.contains('\n') {
-            break;
-        }
-        let _ = c.poll_event(Duration::from_millis(100));
-    }
-    assert_eq!(text.trim_end(), "Hello, LynxRDP!Zé");
+    // Collect until the final 'd' press arrives (the server injects its own
+    // temporary Shift/AltGr presses to reach shifted symbols, so we cannot
+    // predict the exact number of events; we filter those modifiers out).
+    let events = sink.collect_until(0x64, Duration::from_secs(10));
+    let presses: Vec<u32> = events
+        .iter()
+        .filter(|e| e.1 && !keysym::is_modifier(e.0))
+        .map(|e| e.0)
+        .collect();
+    let expected = vec![
+        0x61,                          // a
+        0x42,                          // B (server presses Shift for us)
+        0x21,                          // ! (server presses Shift for us)
+        0x5a,                          // Z (we held Shift)
+        keysym::keysym_from_char('é'), // dynamically bound keysym
+        keysym::RETURN,                // named key
+        0x64,                          // d (we held Control)
+    ];
+    assert_eq!(presses, expected, "events: {events:x?}");
+    // Every press was eventually released (the exact keysym of a release can
+    // differ from its press when a modifier was let go in between, so we only
+    // check that presses and releases balance out).
+    let n_press = events.iter().filter(|e| e.1).count();
+    let n_release = events.iter().filter(|e| !e.1).count();
+    assert!(
+        n_release >= n_press - 1 && n_release <= n_press + 1,
+        "unbalanced press/release ({n_press}/{n_release}): {events:x?}"
+    );
+    // The 'd' arrived with Control held (state bit 2) and 'Z' with Shift (bit 0).
+    let d = events.iter().find(|e| e.0 == 0x64 && e.1).unwrap();
+    assert!(d.2 & 4 != 0, "control not held for d: {events:x?}");
+    let z = events.iter().find(|e| e.0 == 0x5a && e.1).unwrap();
+    assert!(z.2 & 1 != 0, "shift not held for Z: {events:x?}");
+    // Disconnecting releases everything the client left pressed.
+    c.key(keysym::SHIFT_L, true).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    c.disconnect("bye");
+    let ev = sink.drain(Duration::from_millis(500));
+    assert!(
+        ev.iter().any(|e| e.0 == keysym::SHIFT_L && !e.1),
+        "stuck shift not released: {ev:x?}"
+    );
 }
 
 #[test]
@@ -435,6 +611,7 @@ fn clipboard_roundtrip() {
         assert!(wait_for(&mut c, Duration::from_secs(5), |ev, _| ev
             == &ClientEvent::Clipboard("from session".into())));
         let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
