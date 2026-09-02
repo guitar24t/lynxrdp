@@ -124,6 +124,7 @@ jobs:
         run: packaging/package-server.sh "${{ matrix.arch }}"
       - name: Install the .deb and smoke test
         run: |
+          set -x
           sudo apt-get update -q
           sudo apt-get install -y -q ./dist/lynxrdp-server_*_${{ matrix.arch }}.deb
           lynxrdpd --version
@@ -133,8 +134,20 @@ jobs:
           test -x /etc/lynxrdp/startwm.sh
           systemd-analyze verify /usr/lib/systemd/system/lynxrdpd.service
           systemctl is-enabled lynxrdpd
-          systemctl is-active lynxrdpd
-          sudo journalctl -u lynxrdpd --no-pager | tail -20
+          # Give the freshly-installed unit a moment to reach its running state.
+          for i in $(seq 1 10); do
+            state="$(systemctl is-active lynxrdpd || true)"
+            [ "$state" = "active" ] && break
+            sleep 1
+          done
+          sudo journalctl -u lynxrdpd --no-pager | tail -30 || true
+          if [ "$(systemctl is-active lynxrdpd)" != "active" ]; then
+            echo "::error::lynxrdpd is not active after install"
+            systemctl status lynxrdpd --no-pager || true
+            exit 1
+          fi
+          # The daemon must be listening on loopback only.
+          sudo ss -ltnp | grep -E '127\.0\.0\.1:3390' || (echo "::error::not listening on 127.0.0.1:3390"; exit 1)
           sudo apt-get remove -y -q lynxrdp-server
       - name: Inspect the .rpm
         run: |
