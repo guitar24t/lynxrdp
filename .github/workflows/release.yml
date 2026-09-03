@@ -59,14 +59,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: server-${{ matrix.arch }}
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
       - run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.1
-      - run: cargo build --release -p lynxrdp-server -p lynxrdp-client
+      # Built against the RHEL 9 glibc; see the note in ci.yml.
+      - name: Build server and client (release, against the RHEL 9 glibc)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e CARGO_TERM_COLOR=always \
+            almalinux:9 bash -euo pipefail -c '
+              dnf -y install gcc >/dev/null
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null
+              . "$HOME/.cargo/env"
+              cargo build --release -p lynxrdp-server -p lynxrdp-client
+            '
+          sudo chown -R "$(id -u):$(id -g)" target
+      - name: Check the packaged binaries can load on RHEL 9
+        run: |
+          packaging/check-glibc-floor.sh \
+            target/release/lynxrdpd \
+            target/release/lynxrdp-session \
+            target/release/lynxrdp
       - run: packaging/package-server.sh "${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
         with:

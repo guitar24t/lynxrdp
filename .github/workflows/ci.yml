@@ -115,16 +115,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: server-${{ matrix.arch }}
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
       - name: Install nfpm
         run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.1
-      - name: Build server and client (release)
-        run: cargo build --release -p lynxrdp-server -p lynxrdp-client
+      # Built inside AlmaLinux 9 (RHEL 9 ABI, glibc 2.34) rather than on the
+      # runner. glibc is backward compatible but not forward: binaries linked
+      # against the runner's 2.39 refuse to start on RHEL 9. Building against
+      # the oldest glibc we target produces packages that run everywhere we
+      # claim support, Ubuntu 24.04 and 26.04 included.
+      - name: Build server and client (release, against the RHEL 9 glibc)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e CARGO_TERM_COLOR=always \
+            almalinux:9 bash -euo pipefail -c '
+              dnf -y install gcc >/dev/null
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null
+              . "$HOME/.cargo/env"
+              cargo build --release -p lynxrdp-server -p lynxrdp-client
+            '
+          # The container runs as root, so hand the tree back to the runner.
+          sudo chown -R "$(id -u):$(id -g)" target
+      - name: Check the packaged binaries can load on RHEL 9
+        run: |
+          packaging/check-glibc-floor.sh \
+            target/release/lynxrdpd \
+            target/release/lynxrdp-session \
+            target/release/lynxrdp
       - name: Build .deb and .rpm
         run: packaging/package-server.sh "${{ matrix.arch }}"
       - name: Install the .deb and smoke test

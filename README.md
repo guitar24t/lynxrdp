@@ -177,6 +177,18 @@ Packages (needs [nfpm](https://nfpm.goreleaser.com/)):
 packaging/package-server.sh amd64      # dist/*.deb, dist/*.rpm
 ```
 
+If those packages are meant to run on RHEL 9, build the binaries against its
+glibc rather than your own. glibc is backward compatible but not forward, so
+a binary linked on Ubuntu 24.04 (glibc 2.39) will not start on RHEL 9 (2.34):
+the loader rejects it outright with ``version `GLIBC_2.39' not found``. CI
+builds the server inside AlmaLinux 9 for this reason, and
+
+```sh
+packaging/check-glibc-floor.sh target/release/lynxrdpd
+```
+
+fails if a binary needs anything newer than the floor.
+
 ## Repository layout
 
 | Path | What |
