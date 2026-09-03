@@ -7,8 +7,8 @@
 # which is how a Mac user expects to install something.
 #
 # macOS only: hdiutil exists nowhere else. The image is neither signed nor
-# notarised, so Gatekeeper will refuse the first launch; docs/INSTALL.md says
-# how to get past that.
+# notarised, so Gatekeeper will refuse the first launch; "The installers are
+# not signed" in the README says how to get past that.
 set -euo pipefail
 APP="$1"; OUT="$2"; ARCH="${3:-macos-aarch64}"
 cd "$(dirname "$0")/.."

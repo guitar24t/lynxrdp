@@ -8,8 +8,8 @@
 # as one item. The command line still works -- the binary inside the bundle is
 # the same one, at LynxRDP.app/Contents/MacOS/lynxrdp.
 #
-# The bundle is not signed or notarised. See docs/INSTALL.md for what Gatekeeper
-# does about that and how a user gets past it.
+# The bundle is not signed or notarised; "The installers are not signed" in the
+# README says what Gatekeeper does about that and how a user gets past it.
 set -euo pipefail
 BIN="$1"; OUT="$2"
 cd "$(dirname "$0")/.."

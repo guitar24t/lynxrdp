@@ -1,8 +1,9 @@
 ; LynxRDP Windows installer.
 ;
-; Built by packaging/make-setup-exe.sh, which passes VERSION, SOURCE and
+; Built by packaging/make-setup-exe.sh, which passes VERSION, EXEPATH and
 ; OUTFILE on the command line. Nothing here is signed, so Windows will warn
-; about an unknown publisher; docs/INSTALL.md says what to expect.
+; about an unknown publisher; "The installers are not signed" in the README
+; says what to expect.
 
 Unicode true
 ManifestDPIAware true

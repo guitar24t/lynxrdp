@@ -94,12 +94,15 @@ jobs:
         run: packaging/package-client.sh "${{ matrix.target }}" "${{ matrix.name }}" "${{ matrix.bin }}"
       # Built on every run, not only on release, so a broken installer script
       # is caught by the pull request that broke it.
+      # NSIS is not part of the runner image, so install it rather than hope.
+      # make-setup-exe.sh finds makensis in Program Files without help.
+      - name: Install NSIS
+        if: startsWith(matrix.name, 'windows-')
+        run: choco install nsis --no-progress -y
       - name: Windows installer
         if: startsWith(matrix.name, 'windows-')
         shell: bash
         run: |
-          # NSIS is preinstalled on the windows runners, but not on PATH.
-          export PATH="$PATH:/c/Program Files (x86)/NSIS"
           packaging/make-setup-exe.sh \
             "target/${{ matrix.target }}/release/lynxrdp.exe" dist
       - name: macOS disk image
