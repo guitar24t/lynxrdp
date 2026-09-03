@@ -44,9 +44,42 @@ session and then `exec`s `lynxrdp-session` after `initgroups`/`setgid`/
 `setuid` (and verifies that regaining root fails). All X11, image and
 protocol parsing code runs with the user's privileges only.
 
-The protocol parser is written without `unsafe`, bounds-checks every
-length, caps message sizes and is fuzzed with property tests against
-random input.
+The protocol crate is `#![forbid(unsafe_code)]`, so that is compiler
+enforced rather than a convention: every length is bounds-checked, message
+sizes are capped before allocation, and random input is thrown at the
+parser with property tests. `unsafe` in the rest of the tree is confined to
+places that must call C: the daemon's `libc` and PAM calls on the server,
+and the Win32 clipboard calls in the client's `fileclip.rs`.
+
+## File transfer and clipboard
+
+Files move over the transfer channel in both directions, so each side
+decides for itself what it will accept. Neither side trusts a name or an
+offer from the other:
+
+* **Upload destinations are relative and cannot escape.**
+  `safe_relative_path` rejects any `..` component, rejects embedded NULs,
+  and treats `\` as a separator as well as `/` so a Windows client cannot
+  smuggle a path through as one odd filename. The result is always joined
+  onto the session's upload directory.
+* **Neither side accepts a download it did not ask for.** A transfer is
+  only written to disk if its id is already registered as one this side
+  requested; anything else is refused as an "unsolicited download". This
+  is what stops a compromised session from pushing files onto the client.
+* **The client serves only what it published.** When the session asks for
+  a file by path, the client answers only for paths it explicitly put on
+  the clipboard, so a file request cannot be turned into a read of
+  arbitrary client files.
+* **Sizes are bounded everywhere.** Transfers are capped at
+  `MAX_TRANSFER_SIZE`, clipboard text at 4 MiB, clipboard images at 64 MiB
+  and decoded images at `MAX_PIXELS`, so a hostile peer cannot make either
+  side allocate without limit. A drag-and-drop is capped at
+  `MAX_DROPPED_FILES` and does not follow symlinks.
+
+None of this replaces trusting the server: a session you log in to runs
+your own code as you. The boundary these rules defend is the *client's*
+filesystem against a server that turns out to be hostile, and the server's
+upload directory against a malformed name.
 
 ## Hardening tips
 

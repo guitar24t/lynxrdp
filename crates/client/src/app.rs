@@ -783,12 +783,16 @@ pub fn collect_dropped_files(
     while let Some((dir, prefix)) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
-            let meta = entry.metadata()?;
+            // Note both DirEntry::file_type and DirEntry::metadata describe the
+            // entry itself rather than a symlink's target, unlike fs::metadata.
+            // The walk depends on that: following a link would upload files
+            // outside the dropped tree, and a link to an ancestor would loop.
+            let kind = entry.file_type()?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let dest = format!("{prefix}/{name}");
-            if meta.is_dir() {
+            if kind.is_dir() {
                 stack.push((entry.path(), dest));
-            } else if meta.is_file() {
+            } else if kind.is_file() {
                 if out.len() >= MAX_DROPPED_FILES {
                     anyhow::bail!("more than {MAX_DROPPED_FILES} files in the dropped directory");
                 }
@@ -892,6 +896,34 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, vec!["project/README.md", "project/src/main.rs"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_a_dropped_directory_is_not_followed() {
+        // Following links here would upload files the user never dropped, and
+        // a link back to an ancestor would make the walk loop forever. This
+        // holds today because DirEntry does not resolve links; the test pins
+        // it so a switch to fs::metadata cannot quietly reintroduce either.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"s").unwrap();
+
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("real.txt"), b"r").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link-to-outside")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link-to-file")).unwrap();
+        // A link back to the directory being walked: the loop case.
+        std::os::unix::fs::symlink(&root, root.join("link-to-self")).unwrap();
+
+        let got: Vec<String> = collect_dropped_files(&root)
+            .unwrap()
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(got, vec!["project/real.txt"]);
     }
 
     #[test]

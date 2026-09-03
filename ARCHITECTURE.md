@@ -81,6 +81,28 @@ Pixels travel as tightly packed 24-bit RGB. The client keeps a framebuffer
 in `0x00RRGGBB` and presents it with `softbuffer`, which maps directly to
 the window system's native format on all three platforms.
 
+## Transfer channel
+
+Clipboard images, clipboard file copies and explicit file transfers all
+share one mechanism (`crates/proto/src/transfer.rs`): an offer the peer may
+accept or refuse, then numbered 64 KiB chunks, then an end marker. Both
+directions run over the same connection as the screen stream, so it must
+never stall interaction:
+
+* Chunks are capped at `CHUNK_SIZE`, so a frame waits for at most one chunk
+  to drain rather than a whole file.
+* The sender keeps at most `WINDOW_CHUNKS` chunks unacknowledged, which
+  bounds how much of a large file can be in flight.
+
+A receiver decides what to do with each offer through a `TransferPolicy`,
+which returns either an in-memory sink or a file. That is the single place
+each side enforces what it is willing to receive, so the rules live in one
+readable function per side rather than spread through the message loop.
+
+Clipboard contents are fetched on demand: an offer names the formats
+available, and the bytes only move if the other side asks for them. Copying
+a large image you never paste therefore costs nothing.
+
 ## Client
 
 `crates/client/src/connection.rs` is a UI-free protocol client used by the
@@ -96,10 +118,15 @@ after authentication succeeded).
 * `crates/server/tests/e2e.rs` starts real `lynxrdp-session` processes on
   Xvfb and drives them with the headless client: first frame, incremental
   updates, keyboard (verified with an in-process X11 window that receives
-  the events), pointer (`xdotool`), resize (RandR), clipboard (`xclip`),
-  reconnection, lifecycle.
+  the events), pointer (`xdotool`), resize (RandR), clipboard text, images
+  and file copies (`xclip`), file upload and download including refusal of
+  a path-traversing destination, reconnection, lifecycle.
 * `crates/server/tests/daemon.rs` runs `lynxrdpd --allow-non-root` and
   checks identification, handoff, session reuse and policy rejections.
-* CI builds the client on Windows, macOS (both architectures) and Linux
+* CI builds the client on Windows, macOS (Apple Silicon) and Linux
   (x86_64, aarch64), builds the `.deb`/`.rpm`, installs the `.deb` and
   checks the service starts.
+* The Windows and macOS clipboard file backends are the one part CI cannot
+  exercise fully: they are compiled for their targets under
+  `clippy -D warnings`, and the CF_HDROP block builder is pure and unit
+  tested, but pasting into a real Explorer or Finder is a manual check.
