@@ -26,10 +26,11 @@ pub mod frame;
 pub mod image;
 pub mod keysym;
 pub mod message;
+pub mod transfer;
 pub mod wire;
 
 /// Protocol version spoken by this build. Bumped on incompatible changes.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Default TCP port the server listens on (loopback only).
 pub const DEFAULT_PORT: u16 = 3390;
@@ -44,3 +45,4 @@ pub const TILE_SIZE: u32 = 64;
 pub use codec::{CopyRect, FrameUpdate};
 pub use image::{Framebuffer, Rect};
 pub use message::Message;
+pub use transfer::{FileEntry, TransferPurpose};

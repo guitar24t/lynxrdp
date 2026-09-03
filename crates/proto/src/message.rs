@@ -22,6 +22,7 @@
 
 use crate::codec::{CopyRect, TileEncoding, TileUpdate};
 use crate::image::Rect;
+use crate::transfer::{FileEntry, TransferPurpose, CHUNK_SIZE, MAX_FILE_LIST, MAX_TRANSFER_SIZE};
 use crate::wire::{DecodeError, Reader, Writer};
 
 /// Feature bits advertised in the hello messages.
@@ -32,6 +33,22 @@ pub mod features {
     pub const CLIPBOARD: u32 = 1 << 1;
     /// Dynamic screen resizing.
     pub const RESIZE: u32 = 1 << 2;
+    /// Images on the clipboard, transferred on demand as PNG.
+    pub const CLIPBOARD_IMAGE: u32 = 1 << 3;
+    /// File transfer in either direction.
+    pub const FILE_TRANSFER: u32 = 1 << 4;
+    /// Files on the clipboard (copy in one place, paste in the other).
+    pub const CLIPBOARD_FILES: u32 = 1 << 5;
+}
+
+/// Clipboard content types, as a bitmask in [`super::Message::ClipboardOffer`].
+pub mod clipboard_format {
+    /// UTF-8 text, sent eagerly because it is small.
+    pub const TEXT: u32 = 1 << 0;
+    /// A PNG image, fetched on demand.
+    pub const PNG: u32 = 1 << 1;
+    /// One or more files, fetched on demand.
+    pub const FILES: u32 = 1 << 2;
 }
 
 /// Reasons a server refuses a client.
@@ -102,6 +119,24 @@ pub enum Kind {
     Ping = 38,
     /// [`Message::Notice`]
     Notice = 39,
+    /// [`Message::TransferOffer`]
+    TransferOffer = 64,
+    /// [`Message::TransferAccept`]
+    TransferAccept = 65,
+    /// [`Message::TransferData`]
+    TransferData = 66,
+    /// [`Message::TransferAck`]
+    TransferAck = 67,
+    /// [`Message::TransferEnd`]
+    TransferEnd = 68,
+    /// [`Message::FileRequest`]
+    FileRequest = 69,
+    /// [`Message::FileList`]
+    FileList = 70,
+    /// [`Message::ClipboardOffer`]
+    ClipboardOffer = 71,
+    /// [`Message::ClipboardRequest`]
+    ClipboardRequest = 72,
 }
 
 impl Kind {
@@ -127,6 +162,15 @@ impl Kind {
             37 => Kind::CursorPosition,
             38 => Kind::Ping,
             39 => Kind::Notice,
+            64 => Kind::TransferOffer,
+            65 => Kind::TransferAccept,
+            66 => Kind::TransferData,
+            67 => Kind::TransferAck,
+            68 => Kind::TransferEnd,
+            69 => Kind::FileRequest,
+            70 => Kind::FileList,
+            71 => Kind::ClipboardOffer,
+            72 => Kind::ClipboardRequest,
             other => return Err(DecodeError::InvalidTag(u32::from(other))),
         })
     }
@@ -284,6 +328,81 @@ pub enum Message {
         /// Text.
         text: String,
     },
+
+    // ---- transfers (either side may originate one) ----
+    /// Offer to send a blob. The receiver answers [`Message::TransferAccept`].
+    TransferOffer {
+        /// Identifier, unique within the connection.
+        id: u64,
+        /// What the blob is for.
+        purpose: TransferPurpose,
+        /// Suggested name; for uploads, the destination path.
+        name: String,
+        /// Total size in bytes.
+        size: u64,
+    },
+    /// Answer to a [`Message::TransferOffer`].
+    TransferAccept {
+        /// Transfer being answered.
+        id: u64,
+        /// Whether the receiver wants it.
+        accepted: bool,
+        /// Why not, when declined.
+        reason: String,
+    },
+    /// One chunk of a transfer.
+    TransferData {
+        /// Transfer this belongs to.
+        id: u64,
+        /// Chunk index, starting at zero.
+        seq: u32,
+        /// Payload, at most `CHUNK_SIZE` bytes.
+        data: Vec<u8>,
+    },
+    /// Acknowledge a chunk, freeing a slot in the sender's window.
+    TransferAck {
+        /// Transfer being acknowledged.
+        id: u64,
+        /// Chunk index that arrived.
+        seq: u32,
+    },
+    /// End a transfer, successfully or not. Either side may send this.
+    TransferEnd {
+        /// Transfer being ended.
+        id: u64,
+        /// Whether it completed successfully.
+        ok: bool,
+        /// Explanation when it did not.
+        message: String,
+    },
+    /// Ask the peer to send a file. It replies with a
+    /// [`Message::TransferOffer`] carrying the same `id`, or a
+    /// [`Message::TransferEnd`] explaining why not.
+    FileRequest {
+        /// Identifier the peer should use for the resulting transfer.
+        id: u64,
+        /// Path to read, as the session user.
+        path: String,
+    },
+    /// The files behind a clipboard file copy or a drag-and-drop batch.
+    FileList {
+        /// Batch identifier; individual files are fetched with
+        /// [`Message::FileRequest`] using paths from this listing.
+        id: u64,
+        /// The files.
+        files: Vec<FileEntry>,
+    },
+    /// Announce which clipboard formats are now available. Large formats
+    /// are not sent until the peer asks with [`Message::ClipboardRequest`].
+    ClipboardOffer {
+        /// Bitmask of [`clipboard_format`].
+        formats: u32,
+    },
+    /// Ask for one clipboard format previously announced.
+    ClipboardRequest {
+        /// A single bit of [`clipboard_format`].
+        format: u32,
+    },
 }
 
 /// Maximum number of tiles accepted in one screen update.
@@ -316,6 +435,15 @@ impl Message {
             Message::CursorShape { .. } => Kind::CursorShape,
             Message::CursorPosition { .. } => Kind::CursorPosition,
             Message::Notice { .. } => Kind::Notice,
+            Message::TransferOffer { .. } => Kind::TransferOffer,
+            Message::TransferAccept { .. } => Kind::TransferAccept,
+            Message::TransferData { .. } => Kind::TransferData,
+            Message::TransferAck { .. } => Kind::TransferAck,
+            Message::TransferEnd { .. } => Kind::TransferEnd,
+            Message::FileRequest { .. } => Kind::FileRequest,
+            Message::FileList { .. } => Kind::FileList,
+            Message::ClipboardOffer { .. } => Kind::ClipboardOffer,
+            Message::ClipboardRequest { .. } => Kind::ClipboardRequest,
         }
     }
 
@@ -333,6 +461,8 @@ impl Message {
             }
             Message::CursorShape { cursor } => 16 + cursor.argb.len() * 4,
             Message::ClipboardText { text } => 8 + text.len(),
+            Message::TransferData { data, .. } => 24 + data.len(),
+            Message::FileList { files, .. } => 16 + files.len() * 64,
             _ => 32,
         }
     }
@@ -444,6 +574,54 @@ impl Message {
                 w.u16(*y);
             }
             Message::Notice { text } => w.string(text),
+            Message::TransferOffer {
+                id,
+                purpose,
+                name,
+                size,
+            } => {
+                w.u64(*id);
+                w.u8(*purpose as u8);
+                w.string(name);
+                w.u64(*size);
+            }
+            Message::TransferAccept {
+                id,
+                accepted,
+                reason,
+            } => {
+                w.u64(*id);
+                w.bool(*accepted);
+                w.string(reason);
+            }
+            Message::TransferData { id, seq, data } => {
+                w.u64(*id);
+                w.u32(*seq);
+                w.bytes(data);
+            }
+            Message::TransferAck { id, seq } => {
+                w.u64(*id);
+                w.u32(*seq);
+            }
+            Message::TransferEnd { id, ok, message } => {
+                w.u64(*id);
+                w.bool(*ok);
+                w.string(message);
+            }
+            Message::FileRequest { id, path } => {
+                w.u64(*id);
+                w.string(path);
+            }
+            Message::FileList { id, files } => {
+                w.u64(*id);
+                w.u32(files.len() as u32);
+                for f in files {
+                    w.string(&f.path);
+                    w.u64(f.size);
+                }
+            }
+            Message::ClipboardOffer { formats } => w.u32(*formats),
+            Message::ClipboardRequest { format } => w.u32(*format),
         }
     }
 
@@ -598,6 +776,78 @@ impl Message {
                 y: r.u16()?,
             },
             Kind::Notice => Message::Notice { text: r.string()? },
+            Kind::TransferOffer => {
+                let id = r.u64()?;
+                let purpose = TransferPurpose::from_u8(r.u8()?)
+                    .ok_or(DecodeError::InvalidValue("transfer purpose"))?;
+                let name = r.string()?;
+                let size = r.u64()?;
+                if size > MAX_TRANSFER_SIZE {
+                    return Err(DecodeError::InvalidValue("transfer size"));
+                }
+                Message::TransferOffer {
+                    id,
+                    purpose,
+                    name,
+                    size,
+                }
+            }
+            Kind::TransferAccept => Message::TransferAccept {
+                id: r.u64()?,
+                accepted: r.bool()?,
+                reason: r.string()?,
+            },
+            Kind::TransferData => {
+                let id = r.u64()?;
+                let seq = r.u32()?;
+                let data = r.bytes()?;
+                if data.len() > CHUNK_SIZE {
+                    return Err(DecodeError::InvalidValue("transfer chunk size"));
+                }
+                Message::TransferData {
+                    id,
+                    seq,
+                    data: data.to_vec(),
+                }
+            }
+            Kind::TransferAck => Message::TransferAck {
+                id: r.u64()?,
+                seq: r.u32()?,
+            },
+            Kind::TransferEnd => Message::TransferEnd {
+                id: r.u64()?,
+                ok: r.bool()?,
+                message: r.string()?,
+            },
+            Kind::FileRequest => Message::FileRequest {
+                id: r.u64()?,
+                path: r.string()?,
+            },
+            Kind::FileList => {
+                let id = r.u64()?;
+                let n = r.u32()? as usize;
+                if n > MAX_FILE_LIST {
+                    return Err(DecodeError::LengthTooLarge(n));
+                }
+                // Each entry needs at least 12 bytes; refuse absurd counts
+                // before allocating for them.
+                if n.saturating_mul(12) > r.remaining() {
+                    return Err(DecodeError::UnexpectedEof {
+                        needed: n * 12,
+                        remaining: r.remaining(),
+                    });
+                }
+                let mut files = Vec::with_capacity(n);
+                for _ in 0..n {
+                    files.push(FileEntry {
+                        path: r.string()?,
+                        size: r.u64()?,
+                    });
+                }
+                Message::FileList { id, files }
+            }
+            Kind::ClipboardOffer => Message::ClipboardOffer { formats: r.u32()? },
+            Kind::ClipboardRequest => Message::ClipboardRequest { format: r.u32()? },
         };
         r.finish()?;
         Ok(msg)
@@ -698,6 +948,56 @@ mod tests {
             Message::CursorPosition { x: 5, y: 6 },
             Message::Notice {
                 text: "hello".into(),
+            },
+            Message::TransferOffer {
+                id: 7,
+                purpose: TransferPurpose::ClipboardImage,
+                name: "screenshot.png".into(),
+                size: 4096,
+            },
+            Message::TransferAccept {
+                id: 7,
+                accepted: true,
+                reason: String::new(),
+            },
+            Message::TransferAccept {
+                id: 8,
+                accepted: false,
+                reason: "too large".into(),
+            },
+            Message::TransferData {
+                id: 7,
+                seq: 3,
+                data: vec![9; 128],
+            },
+            Message::TransferAck { id: 7, seq: 3 },
+            Message::TransferEnd {
+                id: 7,
+                ok: true,
+                message: String::new(),
+            },
+            Message::FileRequest {
+                id: 9,
+                path: "/home/alice/notes.md".into(),
+            },
+            Message::FileList {
+                id: 9,
+                files: vec![
+                    FileEntry {
+                        path: "a.txt".into(),
+                        size: 12,
+                    },
+                    FileEntry {
+                        path: "sub/b.bin".into(),
+                        size: u64::MAX / 2,
+                    },
+                ],
+            },
+            Message::ClipboardOffer {
+                formats: clipboard_format::TEXT | clipboard_format::PNG,
+            },
+            Message::ClipboardRequest {
+                format: clipboard_format::PNG,
             },
         ]
     }
