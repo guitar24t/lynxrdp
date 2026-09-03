@@ -159,7 +159,7 @@ impl App {
                 let (a, b) = self.client.transfer_progress(*id).unwrap_or((0, 0));
                 (d + a, t + b)
             });
-            let pct = if total > 0 { done * 100 / total } else { 0 };
+            let pct = (done * 100).checked_div(total).unwrap_or(0);
             t.push_str(&format!(
                 " - uploading {} file(s) {pct}%",
                 self.uploads.len()
