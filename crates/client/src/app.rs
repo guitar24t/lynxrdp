@@ -68,6 +68,8 @@ pub struct App {
     /// Hash of the last image seen on the local clipboard, so an image we
     /// received from the session is not immediately offered back to it.
     last_image: Option<u64>,
+    /// Uploads started by dropping files on the window: (transfer id, name).
+    uploads: Vec<(u64, String)>,
     last_clipboard_poll: Instant,
     last_ping: Instant,
     rtt: Option<Duration>,
@@ -109,6 +111,7 @@ impl App {
             clipboard,
             last_clipboard: None,
             last_image: None,
+            uploads: Vec::new(),
             last_clipboard_poll: Instant::now(),
             last_ping: Instant::now(),
             rtt: None,
@@ -144,6 +147,17 @@ impl App {
         );
         if let Some(rtt) = self.rtt {
             t.push_str(&format!(" - {:.0} ms", rtt.as_secs_f64() * 1000.0));
+        }
+        if !self.uploads.is_empty() {
+            let (done, total) = self.uploads.iter().fold((0u64, 0u64), |(d, t), (id, _)| {
+                let (a, b) = self.client.transfer_progress(*id).unwrap_or((0, 0));
+                (d + a, t + b)
+            });
+            let pct = if total > 0 { done * 100 / total } else { 0 };
+            t.push_str(&format!(
+                " - uploading {} file(s) {pct}%",
+                self.uploads.len()
+            ));
         }
         t
     }
@@ -261,9 +275,20 @@ impl App {
                     ClientEvent::FileDownloaded { path, name } => {
                         log::info!("downloaded {name} to {}", path.display());
                     }
-                    ClientEvent::FileUploaded { name } => log::info!("uploaded {name}"),
+                    ClientEvent::FileUploaded { name } => {
+                        log::info!("uploaded {name}");
+                        let done = self
+                            .uploads
+                            .iter()
+                            .find(|(_, n)| *n == name)
+                            .map(|(id, _)| *id);
+                        if let Some(id) = done {
+                            self.finish_upload(id);
+                        }
+                    }
                     ClientEvent::TransferFailed { id, reason } => {
                         log::warn!("transfer {id} failed: {reason}");
+                        self.finish_upload(id);
                     }
                     ClientEvent::Notice(text) => log::info!("server: {text}"),
                     ClientEvent::Rtt(rtt) => {
@@ -316,6 +341,47 @@ impl App {
             if let Some(g) = &self.gfx {
                 g.window.set_title(&self.title());
             }
+        }
+    }
+
+    /// Upload a file or directory dropped onto the window.
+    fn on_dropped_file(&mut self, path: &std::path::Path) {
+        if self.client.info().features & features::FILE_TRANSFER == 0 {
+            log::warn!("the server did not enable file transfer; ignoring dropped file");
+            return;
+        }
+        let files = match collect_dropped_files(path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("cannot read {}: {e:#}", path.display());
+                return;
+            }
+        };
+        if files.is_empty() {
+            log::warn!("nothing to upload from {}", path.display());
+            return;
+        }
+        for (local, dest) in files {
+            match self.client.send_file(&local, &dest) {
+                Ok(id) => {
+                    log::info!("uploading {} as {dest}", local.display());
+                    self.uploads.push((id, dest));
+                }
+                Err(e) => log::warn!("uploading {} failed: {e:#}", local.display()),
+            }
+        }
+        self.update_title();
+    }
+
+    /// Forget an upload that finished or failed.
+    fn finish_upload(&mut self, id: u64) {
+        self.uploads.retain(|(uid, _)| *uid != id);
+        self.update_title();
+    }
+
+    fn update_title(&self) {
+        if let Some(g) = &self.gfx {
+            g.window.set_title(&self.title());
         }
     }
 
@@ -516,6 +582,7 @@ impl ApplicationHandler<Wake> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
+            WindowEvent::DroppedFile(path) => self.on_dropped_file(&path),
             WindowEvent::CloseRequested => {
                 self.exit_reason = Some("window closed".into());
                 event_loop.exit();
@@ -609,6 +676,57 @@ impl ApplicationHandler<Wake> for App {
     }
 }
 
+/// Largest number of files one drop may upload, so dropping a huge tree
+/// does not queue thousands of transfers by accident.
+pub const MAX_DROPPED_FILES: usize = 512;
+
+/// Work out what to upload for a dropped path.
+///
+/// Returns (local path, destination path relative to the session's upload
+/// directory) pairs. A dropped directory keeps its structure, rooted at the
+/// directory's own name; symlinks are not followed, so a link into `/` cannot
+/// turn one drop into a copy of the filesystem.
+pub fn collect_dropped_files(
+    path: &std::path::Path,
+) -> anyhow::Result<Vec<(std::path::PathBuf, String)>> {
+    let mut out = Vec::new();
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_file() {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow::anyhow!("dropped path has no file name"))?;
+        out.push((path.to_path_buf(), name));
+        return Ok(out);
+    }
+    if !meta.is_dir() {
+        // A symlink or special file: nothing sensible to upload.
+        return Ok(out);
+    }
+    let root = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "dropped".to_string());
+    let mut stack = vec![(path.to_path_buf(), root)];
+    while let Some((dir, prefix)) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let dest = format!("{prefix}/{name}");
+            if meta.is_dir() {
+                stack.push((entry.path(), dest));
+            } else if meta.is_file() {
+                if out.len() >= MAX_DROPPED_FILES {
+                    anyhow::bail!("more than {MAX_DROPPED_FILES} files in the dropped directory");
+                }
+                out.push((entry.path(), dest));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// A cheap digest of image bytes, used only to notice that the clipboard
 /// image changed. Collisions would merely skip one redundant offer.
 fn image_digest(bytes: &[u8]) -> u64 {
@@ -677,6 +795,53 @@ pub fn draw_cursor(dst: &mut [u32], dst_w: u32, dst_h: u32, cur: &CursorImage, p
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_a_file_uploads_it_under_its_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.txt");
+        std::fs::write(&f, b"x").unwrap();
+        let got = collect_dropped_files(&f).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, "notes.txt");
+    }
+
+    #[test]
+    fn dropping_a_directory_keeps_its_structure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("README.md"), b"r").unwrap();
+        std::fs::write(root.join("src/main.rs"), b"m").unwrap();
+        let mut got: Vec<String> = collect_dropped_files(&root)
+            .unwrap()
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["project/README.md", "project/src/main.rs"]);
+    }
+
+    #[test]
+    fn dropping_something_unreadable_is_an_error_not_a_panic() {
+        let missing = std::path::Path::new("/definitely/not/here");
+        assert!(collect_dropped_files(missing).is_err());
+    }
+
+    #[test]
+    fn destinations_from_a_drop_are_safe_to_join() {
+        // Whatever a drop produces must survive the session's traversal check.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/c.txt"), b"c").unwrap();
+        for (_, dest) in collect_dropped_files(&root).unwrap() {
+            assert!(
+                lynxrdp_proto::transfer::safe_relative_path(&dest).is_some(),
+                "{dest} would be refused by the session"
+            );
+        }
+    }
 
     #[test]
     fn blit_clips_and_pads() {
