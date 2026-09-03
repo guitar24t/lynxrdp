@@ -19,16 +19,36 @@ set -eu
 MAX="${LYNXRDP_MAX_GLIBC:-2.34}"
 status=0
 
+# A guard that cannot inspect a binary must fail rather than report success:
+# silently passing is exactly the failure mode this script exists to prevent.
+if ! command -v objdump >/dev/null 2>&1; then
+    echo "check-glibc-floor: objdump not found; install binutils" >&2
+    exit 1
+fi
+if [ "$#" -eq 0 ]; then
+    echo "check-glibc-floor: no binaries given" >&2
+    exit 1
+fi
+
 for bin in "$@"; do
     if [ ! -e "$bin" ]; then
         echo "check-glibc-floor: $bin does not exist" >&2
         status=1
         continue
     fi
+    # Read the dynamic symbol table. A failure here means we do not know what
+    # the binary needs, which is not the same as needing nothing.
+    if ! syms="$(objdump -T "$bin" 2>&1)"; then
+        echo "FAIL  $bin could not be read by objdump:" >&2
+        printf '      %s\n' "$syms" >&2
+        status=1
+        continue
+    fi
     # Every glibc version this binary references, newest last.
-    versions="$(objdump -T "$bin" 2>/dev/null \
+    versions="$(printf '%s\n' "$syms" \
         | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -u -V || true)"
     if [ -z "$versions" ]; then
+        # Genuinely no versioned glibc references: a static binary, say.
         echo "ok    $bin (no versioned glibc references)"
         continue
     fi
