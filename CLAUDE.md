@@ -170,17 +170,27 @@ Real failures from this repo, each of which passed on Linux first:
 
 ## Releases
 
-Tag pushes are typically rejected in agent sessions (HTTP 403 — credentials are
-scoped to the working branch). The release workflow therefore takes a
-`workflow_dispatch` input and **creates the tag itself**:
+Pushing a tag matching `v*` is the normal way to cut one — the workflow builds
+every artifact and creates the GitHub release:
 
-```
-Actions → Release → Run workflow → tag: v0.1.0-rc.4
+```bash
+git tag -a v0.1.0-rc.4 -m "LynxRDP v0.1.0-rc.4"
+git push origin v0.1.0-rc.4
 ```
 
-A hyphen in the tag marks it a prerelease automatically. This is how every
-release so far has been cut. If a `git push origin <tag>` returns 403, that is
-expected — use the dispatch, do not try to work around the credential scope.
+**A hyphen in the tag marks it a prerelease** (`contains(tag, '-')` in
+`release.yml`), so `v0.1.0-rc.4` is a prerelease and `v0.1.0` is not. Check the
+existing tags before picking a name; releases so far are `v0.1.0-rc.1` onward.
+
+The workflow also accepts a `workflow_dispatch` input that **creates the tag
+itself** (Actions → Release → Run workflow → `tag: v0.1.0-rc.4`). That is the
+fallback for an environment where pushing a tag ref is not permitted — some
+sandboxed sessions hold a write grant scoped to their working branch and get an
+HTTP 403 on the tag push. Reach for it only after a real tag push fails; it is
+not the preferred route.
+
+A pushed tag ships the commit the tag points at; a dispatch ships the head of
+the ref you dispatch against (`main`) and creates the tag there.
 
 CI builds the Windows `setup.exe` and macOS `.dmg` on **every** run, not only
 at release time, so a broken installer script fails the pull request that broke
