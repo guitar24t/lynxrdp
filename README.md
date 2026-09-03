@@ -94,7 +94,10 @@ sudo lynxrdpd --dump-config    # prints the effective configuration
 ## Installing the client
 
 Download the archive for your platform from the releases page and put the
-`lynxrdp` binary somewhere on your `PATH`. You need an OpenSSH client:
+`lynxrdp` binary somewhere on your `PATH`. Prebuilt archives cover Windows
+x86_64, macOS on Apple Silicon, and Linux x86_64 and aarch64. Intel Macs have
+no prebuilt archive — `cargo build --release -p lynxrdp-client` still targets
+them. You need an OpenSSH client:
 
 * **Windows 10/11**: ships with OpenSSH (`ssh.exe`). Enable it under
   *Settings → Apps → Optional features* if it is missing.

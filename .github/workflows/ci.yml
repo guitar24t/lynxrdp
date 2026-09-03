@@ -65,13 +65,12 @@ jobs:
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             bin: lynxrdp
+          # Apple Silicon only. Intel Macs are end of life and the macos-13
+          # runner pool no longer schedules reliably; the source still builds
+          # for x86_64-apple-darwin if anyone needs it.
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
-            bin: lynxrdp
-          - name: macos-x86_64
-            os: macos-13
-            target: x86_64-apple-darwin
             bin: lynxrdp
           - name: windows-x86_64
             os: windows-latest
