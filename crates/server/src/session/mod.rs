@@ -6,6 +6,7 @@ pub mod listener;
 pub mod socket;
 pub mod xserver;
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use lynxrdp_proto::Message;
@@ -38,6 +39,8 @@ pub struct SessionOptions {
     pub idle_timeout: Option<Duration>,
     /// Peer uid that connections must come from (`None` disables the check).
     pub require_uid: Option<u32>,
+    /// Directory that uploaded files land in.
+    pub upload_dir: PathBuf,
 }
 
 impl Default for SessionOptions {
@@ -54,7 +57,22 @@ impl Default for SessionOptions {
             exit_on_disconnect: false,
             idle_timeout: None,
             require_uid: Some(crate::peer::own_uid()),
+            upload_dir: default_upload_dir(),
         }
+    }
+}
+
+/// Where uploaded files land by default: the user's `Downloads` directory
+/// when it exists, otherwise their home directory.
+pub fn default_upload_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let downloads = home.join("Downloads");
+    if downloads.is_dir() {
+        downloads
+    } else {
+        home
     }
 }
 

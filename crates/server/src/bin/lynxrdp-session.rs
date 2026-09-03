@@ -95,6 +95,9 @@ struct Args {
     /// Private directory for authority files and sockets.
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
+    /// Directory that uploaded files land in (default: ~/Downloads or ~).
+    #[arg(long)]
+    upload_dir: Option<PathBuf>,
     /// Print the display of the started X server to stdout.
     #[arg(long)]
     print_display: bool,
@@ -255,6 +258,10 @@ fn run() -> Result<i32> {
             None
         },
         require_uid,
+        upload_dir: args
+            .upload_dir
+            .clone()
+            .unwrap_or_else(lynxrdp_server::session::default_upload_dir),
     };
     let mut core = Core::new(display.clone(), opts, tx.clone(), rx)?;
     let _x_thread = Core::spawn_x_event_thread(display.clone(), tx.clone());

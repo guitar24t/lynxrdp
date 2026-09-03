@@ -1,7 +1,9 @@
 //! Protocol client without any user interface.
 
+use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -10,7 +12,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel::Receiver;
 use lynxrdp_proto::codec::Decoder;
 use lynxrdp_proto::frame::{frame_message, read_message, FrameError};
-use lynxrdp_proto::message::{features, CursorImage};
+use lynxrdp_proto::message::{clipboard_format, features, CursorImage};
+use lynxrdp_proto::transfer::{Completed, Sink, TransferManager, TransferPolicy, TransferPurpose};
 use lynxrdp_proto::{Framebuffer, Message, Rect, PROTOCOL_VERSION};
 
 /// Options for connecting.
@@ -30,7 +33,12 @@ impl Default for ConnectOptions {
     fn default() -> Self {
         Self {
             size: None,
-            features: features::LOCAL_CURSOR | features::CLIPBOARD | features::RESIZE,
+            features: features::LOCAL_CURSOR
+                | features::CLIPBOARD
+                | features::RESIZE
+                | features::CLIPBOARD_IMAGE
+                | features::FILE_TRANSFER
+                | features::CLIPBOARD_FILES,
             timeout: Duration::from_secs(15),
             client_name: crate::CLIENT_NAME.to_string(),
         }
@@ -73,12 +81,73 @@ pub enum ClientEvent {
     CursorPosition(u16, u16),
     /// Clipboard text from the remote session.
     Clipboard(String),
+    /// A clipboard image (PNG bytes) from the remote session.
+    ClipboardImage(Vec<u8>),
+    /// A file finished downloading to this path.
+    FileDownloaded {
+        /// Where it was written locally.
+        path: PathBuf,
+        /// Name the server reported.
+        name: String,
+    },
+    /// A file finished uploading into the session.
+    FileUploaded {
+        /// Name as offered to the server.
+        name: String,
+    },
+    /// A transfer failed.
+    TransferFailed {
+        /// Transfer identifier.
+        id: u64,
+        /// Why it failed.
+        reason: String,
+    },
     /// A notice for the user.
     Notice(String),
     /// Round trip time measured from a ping/pong.
     Rtt(Duration),
     /// The connection ended.
     Disconnected(String),
+}
+
+/// Accepts what the session sends us.
+///
+/// Downloads only land where this client asked them to: a `FileDownload`
+/// offer whose id we did not request is refused, so the session cannot write
+/// files onto the client's disk of its own accord.
+struct ClientTransferPolicy {
+    downloads: HashMap<u64, PathBuf>,
+}
+
+impl TransferPolicy for ClientTransferPolicy {
+    fn accept(
+        &mut self,
+        id: u64,
+        purpose: TransferPurpose,
+        _name: &str,
+        _size: u64,
+    ) -> Result<Sink, String> {
+        match purpose {
+            TransferPurpose::ClipboardImage => Ok(Sink::Memory(Vec::new())),
+            TransferPurpose::FileDownload => {
+                let dest = self
+                    .downloads
+                    .get(&id)
+                    .ok_or_else(|| "unsolicited download".to_string())?;
+                if let Some(parent) = dest.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                    }
+                }
+                let f = std::fs::File::create(dest)
+                    .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+                Ok(Sink::Stream(Box::new(f)))
+            }
+            // The session never uploads to us.
+            TransferPurpose::FileUpload => Err("unexpected upload offer".into()),
+        }
+    }
 }
 
 /// Client-side connection state.
@@ -93,6 +162,11 @@ pub struct Client {
     frames_received: u64,
     bytes_received: Arc<Mutex<u64>>,
     last_ping: Option<(u64, Instant)>,
+    transfers: TransferManager,
+    /// Destinations for downloads this client asked for.
+    downloads: HashMap<u64, PathBuf>,
+    /// An image copied locally, held until the session asks for it.
+    pending_image: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -227,6 +301,9 @@ impl Client {
             frames_received: 0,
             bytes_received,
             last_ping: None,
+            transfers: TransferManager::new(true),
+            downloads: HashMap::new(),
+            pending_image: None,
         })
     }
 
@@ -325,6 +402,61 @@ impl Client {
         })
     }
 
+    /// Offer an image copied locally to the session. The PNG is held until
+    /// the session asks for it, so copying an image the user never pastes
+    /// costs nothing on the wire.
+    pub fn offer_clipboard_image(&mut self, png: Vec<u8>) -> Result<()> {
+        if self.info.features & features::CLIPBOARD_IMAGE == 0 {
+            return Ok(());
+        }
+        self.pending_image = Some(png);
+        self.send(&Message::ClipboardOffer {
+            formats: clipboard_format::PNG,
+        })
+    }
+
+    /// Upload a local file into the session. `dest` is a path relative to the
+    /// session's upload directory. Returns the transfer id.
+    pub fn send_file(&mut self, local: &Path, dest: &str) -> Result<u64> {
+        anyhow::ensure!(
+            self.info.features & features::FILE_TRANSFER != 0,
+            "the server did not enable file transfer"
+        );
+        let file =
+            std::fs::File::open(local).with_context(|| format!("opening {}", local.display()))?;
+        let size = file.metadata()?.len();
+        let id = self.transfers.next_id();
+        let offer = self.transfers.offer_stream_with_id(
+            id,
+            TransferPurpose::FileUpload,
+            dest.to_string(),
+            size,
+            Box::new(file),
+        );
+        self.send(&offer)?;
+        Ok(id)
+    }
+
+    /// Download `remote` out of the session to `local`. Returns the transfer id.
+    pub fn request_file(&mut self, remote: &str, local: PathBuf) -> Result<u64> {
+        anyhow::ensure!(
+            self.info.features & features::FILE_TRANSFER != 0,
+            "the server did not enable file transfer"
+        );
+        let id = self.transfers.next_id();
+        self.downloads.insert(id, local);
+        self.send(&Message::FileRequest {
+            id,
+            path: remote.to_string(),
+        })?;
+        Ok(id)
+    }
+
+    /// Progress of a transfer, as (done, total).
+    pub fn transfer_progress(&self, id: u64) -> Option<(u64, u64)> {
+        self.transfers.progress(id)
+    }
+
     /// Ask the server to resend the whole screen.
     pub fn request_refresh(&self) -> Result<()> {
         self.send(&Message::RefreshRequest)
@@ -356,7 +488,51 @@ impl Client {
         self.poll_event(Duration::ZERO)
     }
 
+    /// Feed a message to the transfer manager, sending any replies.
+    /// Returns the event it produced, if any.
+    fn handle_transfer(&mut self, msg: &Message) -> Option<Result<Option<ClientEvent>>> {
+        let mut policy = ClientTransferPolicy {
+            downloads: self.downloads.clone(),
+        };
+        let outcome = self.transfers.handle(msg, &mut policy)?;
+        for reply in &outcome.replies {
+            if let Err(e) = self.send(reply) {
+                return Some(Err(e));
+            }
+        }
+        if let Some((id, reason)) = outcome.failed.into_iter().next() {
+            self.downloads.remove(&id);
+            return Some(Ok(Some(ClientEvent::TransferFailed { id, reason })));
+        }
+        for done in outcome.completed {
+            match self.on_completed(done) {
+                Ok(Some(ev)) => return Some(Ok(Some(ev))),
+                Ok(None) => {}
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(Ok(None))
+    }
+
+    fn on_completed(&mut self, done: Completed) -> Result<Option<ClientEvent>> {
+        Ok(match done.purpose {
+            TransferPurpose::ClipboardImage => done.data.map(ClientEvent::ClipboardImage),
+            TransferPurpose::FileDownload => {
+                self.downloads
+                    .remove(&done.id)
+                    .map(|path| ClientEvent::FileDownloaded {
+                        path,
+                        name: done.name,
+                    })
+            }
+            TransferPurpose::FileUpload => None,
+        })
+    }
+
     fn handle(&mut self, msg: Message) -> Result<Option<ClientEvent>> {
+        if let Some(result) = self.handle_transfer(&msg) {
+            return result;
+        }
         Ok(match msg {
             Message::ScreenUpdate {
                 frame_id,
@@ -386,6 +562,31 @@ impl Client {
             }
             Message::CursorPosition { x, y } => Some(ClientEvent::CursorPosition(x, y)),
             Message::ClipboardText { text } => Some(ClientEvent::Clipboard(text)),
+            Message::ClipboardOffer { formats } => {
+                // The session copied something; fetch an image only if we
+                // asked for image support in the first place.
+                if formats & clipboard_format::PNG != 0
+                    && self.info.features & features::CLIPBOARD_IMAGE != 0
+                {
+                    self.send(&Message::ClipboardRequest {
+                        format: clipboard_format::PNG,
+                    })?;
+                }
+                None
+            }
+            Message::ClipboardRequest { format } => {
+                if format & clipboard_format::PNG != 0 {
+                    if let Some(png) = self.pending_image.take() {
+                        let offer = self.transfers.offer_bytes(
+                            TransferPurpose::ClipboardImage,
+                            "clipboard.png".to_string(),
+                            png,
+                        );
+                        self.send(&offer)?;
+                    }
+                }
+                None
+            }
             Message::Notice { text } => Some(ClientEvent::Notice(text)),
             Message::Ping { nonce } => {
                 self.send(&Message::Pong { nonce })?;

@@ -14,6 +14,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -22,7 +23,10 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{after, never, select, Receiver, Sender};
 use lynxrdp_proto::codec::{Encoder, FrameUpdate};
 use lynxrdp_proto::frame::frame_message;
-use lynxrdp_proto::message::{features, reject, CursorImage};
+use lynxrdp_proto::message::{clipboard_format, features, reject, CursorImage};
+use lynxrdp_proto::transfer::{
+    safe_relative_path, Completed, Sink, TransferManager, TransferPolicy, TransferPurpose,
+};
 use lynxrdp_proto::{Framebuffer, Message, Rect, PROTOCOL_VERSION, TILE_SIZE};
 use x11rb::protocol::Event;
 
@@ -30,7 +34,7 @@ use super::listener::spawn_client_reader;
 use super::socket::ClientSocket;
 use super::{CoreEvent, NewClient, SessionOptions};
 use crate::x11::capture::{coalesce, DamageTracker, ScreenCapture};
-use crate::x11::clipboard::Clipboard;
+use crate::x11::clipboard::{Clipboard, ClipboardEvent};
 use crate::x11::cursor::CursorTracker;
 use crate::x11::input::InputInjector;
 use crate::x11::resize::resize_screen;
@@ -49,7 +53,12 @@ const HOUSEKEEPING: Duration = Duration::from_millis(250);
 const WRITE_QUEUE: usize = 256;
 
 /// Supported feature bits.
-const SUPPORTED_FEATURES: u32 = features::LOCAL_CURSOR | features::CLIPBOARD | features::RESIZE;
+const SUPPORTED_FEATURES: u32 = features::LOCAL_CURSOR
+    | features::CLIPBOARD
+    | features::RESIZE
+    | features::CLIPBOARD_IMAGE
+    | features::FILE_TRANSFER
+    | features::CLIPBOARD_FILES;
 
 struct Client {
     generation: u64,
@@ -97,6 +106,44 @@ impl Client {
     }
 }
 
+/// Decides what the session accepts from the client.
+///
+/// The session runs as the user, so an upload cannot reach anything the user
+/// could not already write. It still refuses path traversal, so a malicious
+/// or buggy offer cannot escape the upload directory into, say, `~/.ssh`.
+struct SessionTransferPolicy {
+    upload_dir: PathBuf,
+}
+
+impl TransferPolicy for SessionTransferPolicy {
+    fn accept(
+        &mut self,
+        _id: u64,
+        purpose: TransferPurpose,
+        name: &str,
+        _size: u64,
+    ) -> Result<Sink, String> {
+        match purpose {
+            TransferPurpose::ClipboardImage => Ok(Sink::Memory(Vec::new())),
+            TransferPurpose::FileUpload => {
+                let rel = safe_relative_path(name)
+                    .ok_or_else(|| format!("refusing unsafe upload path {name:?}"))?;
+                let dest = self.upload_dir.join(&rel);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                }
+                let file = std::fs::File::create(&dest)
+                    .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+                log::info!("receiving upload into {}", dest.display());
+                Ok(Sink::Stream(Box::new(file)))
+            }
+            // The client never sends us a download; that direction is ours.
+            TransferPurpose::FileDownload => Err("unexpected download offer".into()),
+        }
+    }
+}
+
 /// Everything the session core owns.
 pub struct Core {
     display: Arc<XDisplay>,
@@ -119,6 +166,12 @@ pub struct Core {
     last_clipboard_received: Option<String>,
     /// Queue of X events that arrived while we were busy (drained in order).
     pending_x: VecDeque<Event>,
+    /// Transfers in flight in both directions.
+    transfers: TransferManager,
+    /// Where uploads land.
+    upload_dir: PathBuf,
+    /// Clipboard formats the client last announced.
+    client_formats: u32,
 }
 
 /// Why the core loop stopped.
@@ -167,6 +220,7 @@ impl Core {
             }
         };
         let min_frame_interval = Duration::from_secs_f64(1.0 / f64::from(opts.max_fps.max(1)));
+        let upload_dir = opts.upload_dir.clone();
         log::info!(
             "session core ready: {w}x{h}, shm={}, cursor={}, clipboard={}, max_fps={}, in_flight={}",
             capture.uses_shm(),
@@ -194,6 +248,9 @@ impl Core {
             last_client_seen: Instant::now(),
             last_clipboard_received: None,
             pending_x: VecDeque::new(),
+            transfers: TransferManager::new(false),
+            upload_dir,
+            client_formats: 0,
         })
     }
 
@@ -332,13 +389,151 @@ impl Core {
             }
             _ => {}
         }
-        if let Some(cb) = self.clipboard.as_mut() {
-            if let Some(text) = cb.handle_event(&ev)? {
-                self.on_session_clipboard(text);
+        if self.clipboard.is_some() {
+            let events = self
+                .clipboard
+                .as_mut()
+                .expect("checked")
+                .handle_event(&ev)?;
+            for event in events {
+                self.on_clipboard_event(event)?;
             }
         }
         // Keep the queue type in use for future ordering needs.
         self.pending_x.clear();
+        Ok(())
+    }
+
+    /// React to something the session's clipboard did.
+    fn on_clipboard_event(&mut self, event: ClipboardEvent) -> Result<()> {
+        match event {
+            ClipboardEvent::Formats(formats) => {
+                // Announce what is available; the client asks for anything
+                // large only when it actually wants it.
+                let offered = formats & self.client_clipboard_formats();
+                if offered != 0 {
+                    self.send_to_client(vec![Message::ClipboardOffer { formats: offered }]);
+                }
+            }
+            ClipboardEvent::Text(text) => self.on_session_clipboard(text),
+            ClipboardEvent::Image(png) => {
+                if self.client_clipboard_formats() & clipboard_format::PNG == 0 {
+                    return Ok(());
+                }
+                log::debug!("clipboard image -> client ({} bytes)", png.len());
+                let offer = self.transfers.offer_bytes(
+                    TransferPurpose::ClipboardImage,
+                    "clipboard.png".to_string(),
+                    png,
+                );
+                self.send_to_client(vec![offer]);
+            }
+            ClipboardEvent::Unavailable(format) => {
+                log::debug!("clipboard format {format:#x} turned out to be unavailable");
+            }
+        }
+        Ok(())
+    }
+
+    /// Answer a client's request to download a file from the session.
+    fn on_file_request(&mut self, id: u64, path: &str) {
+        let reply = match std::fs::File::open(path).and_then(|f| {
+            let len = f.metadata()?.len();
+            Ok((f, len))
+        }) {
+            Ok((file, size)) => {
+                log::info!("sending {path} ({size} bytes) to the client");
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string());
+                self.transfers.offer_stream_with_id(
+                    id,
+                    TransferPurpose::FileDownload,
+                    name,
+                    size,
+                    Box::new(file),
+                )
+            }
+            Err(e) => {
+                log::warn!("cannot open {path} for download: {e}");
+                Message::TransferEnd {
+                    id,
+                    ok: false,
+                    message: format!("{path}: {e}"),
+                }
+            }
+        };
+        self.send_to_client(vec![reply]);
+    }
+
+    /// Clipboard formats the connected client can handle.
+    fn client_clipboard_formats(&self) -> u32 {
+        let Some(c) = self.client.as_ref() else {
+            return 0;
+        };
+        let mut f = 0;
+        if c.features & features::CLIPBOARD != 0 {
+            f |= clipboard_format::TEXT;
+        }
+        if c.features & features::CLIPBOARD_IMAGE != 0 {
+            f |= clipboard_format::PNG;
+        }
+        if c.features & features::CLIPBOARD_FILES != 0 {
+            f |= clipboard_format::FILES;
+        }
+        f
+    }
+
+    /// Send messages to the client, dropping it if its queue has backed up.
+    fn send_to_client(&mut self, msgs: Vec<Message>) {
+        let Some(c) = self.client.as_mut() else {
+            return;
+        };
+        for m in msgs {
+            if !c.send(&m) {
+                break;
+            }
+        }
+    }
+
+    /// Feed a message to the transfer manager. Returns true if it was one.
+    fn handle_transfer_message(&mut self, msg: &Message) -> bool {
+        let mut policy = SessionTransferPolicy {
+            upload_dir: self.upload_dir.clone(),
+        };
+        let Some(outcome) = self.transfers.handle(msg, &mut policy) else {
+            return false;
+        };
+        self.send_to_client(outcome.replies);
+        for (id, reason) in outcome.failed {
+            log::warn!("transfer {id} failed: {reason}");
+        }
+        for done in outcome.completed {
+            if let Err(e) = self.on_transfer_complete(done) {
+                log::warn!("handling a completed transfer failed: {e:#}");
+            }
+        }
+        true
+    }
+
+    fn on_transfer_complete(&mut self, done: Completed) -> Result<()> {
+        match done.purpose {
+            TransferPurpose::ClipboardImage => {
+                let Some(png) = done.data else { return Ok(()) };
+                log::debug!("clipboard image <- client ({} bytes)", png.len());
+                if let Some(cb) = self.clipboard.as_mut() {
+                    cb.set_image(png)?;
+                }
+            }
+            TransferPurpose::FileUpload => {
+                log::info!("upload of {:?} finished", done.name);
+                self.send_to_client(vec![Message::Notice {
+                    text: format!("Received {}", done.name),
+                }]);
+            }
+            TransferPurpose::FileDownload => {}
+        }
         Ok(())
     }
 
@@ -497,6 +692,10 @@ impl Core {
                 }
             };
         }
+        // Transfers are symmetric and stateless from the core's point of view.
+        if self.handle_transfer_message(&msg) {
+            return Ok(None);
+        }
         match msg {
             Message::KeyEvent { keysym, down } => {
                 if let Err(e) = self.input.key(keysym, down) {
@@ -553,6 +752,22 @@ impl Core {
                     c.send(&Message::Pong { nonce });
                 }
             }
+            Message::ClipboardOffer { formats } => {
+                // The client copied something. Text arrives on its own; ask
+                // for an image only when we can actually use it.
+                self.client_formats = formats;
+                if formats & clipboard_format::PNG != 0 && self.clipboard.is_some() {
+                    self.send_to_client(vec![Message::ClipboardRequest {
+                        format: clipboard_format::PNG,
+                    }]);
+                }
+            }
+            Message::ClipboardRequest { format } => {
+                if let Some(cb) = self.clipboard.as_mut() {
+                    cb.request_format(format)?;
+                }
+            }
+            Message::FileRequest { id, path } => self.on_file_request(id, &path),
             Message::RefreshRequest => {
                 if let Some(c) = self.client.as_mut() {
                     c.full_refresh = true;

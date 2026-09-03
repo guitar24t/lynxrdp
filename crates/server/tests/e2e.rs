@@ -615,6 +615,93 @@ fn clipboard_roundtrip() {
     }
 }
 
+/// A small PNG for clipboard tests.
+fn sample_png(w: usize, h: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            bytes.extend_from_slice(&[(x * 7 % 256) as u8, (y * 11 % 256) as u8, 0x40, 0xFF]);
+        }
+    }
+    let img = lynxrdp_client::imageclip::Rgba::new(w, h, bytes).unwrap();
+    lynxrdp_client::imageclip::encode_png(&img).unwrap()
+}
+
+#[test]
+fn clipboard_image_from_client_reaches_the_session() {
+    require_xvfb!();
+    if !have("xclip") {
+        eprintln!("SKIP: xclip not installed");
+        return;
+    }
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+    let png = sample_png(24, 16);
+
+    // Offer the image; the session asks for it and the transfer follows.
+    c.offer_clipboard_image(png.clone()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let _ = c.poll_event(Duration::from_millis(100));
+        let out = s.x(
+            "xclip",
+            &["-selection", "clipboard", "-t", "image/png", "-o"],
+        );
+        if out.stdout == png {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session clipboard image never matched ({} bytes vs {} expected)",
+            out.stdout.len(),
+            png.len()
+        );
+    }
+}
+
+#[test]
+fn clipboard_image_from_the_session_reaches_the_client() {
+    require_xvfb!();
+    if !have("xclip") {
+        eprintln!("SKIP: xclip not installed");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shot.png");
+    let png = sample_png(20, 12);
+    std::fs::write(&path, &png).unwrap();
+
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+
+    // xclip owns the selection for as long as it runs.
+    let mut owner = Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "image/png", "-i"])
+        .arg(&path)
+        .env("DISPLAY", &s.display)
+        .env("XAUTHORITY", s.xauth())
+        .spawn()
+        .unwrap();
+
+    let mut got: Option<Vec<u8>> = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && got.is_none() {
+        if let Ok(Some(ClientEvent::ClipboardImage(data))) =
+            c.poll_event(Duration::from_millis(200))
+        {
+            got = Some(data);
+        }
+    }
+    let _ = owner.kill();
+    let _ = owner.wait();
+    assert_eq!(
+        got.as_deref(),
+        Some(&png[..]),
+        "client did not receive the image"
+    );
+}
+
 #[test]
 fn exit_on_disconnect_ends_session() {
     require_xvfb!();

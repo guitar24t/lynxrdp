@@ -1,17 +1,29 @@
-//! X11 clipboard (`CLIPBOARD` selection) bridging.
+//! X11 clipboard (`CLIPBOARD` selection) bridging for text and images.
 //!
-//! Text copied inside the session is detected through XFIXES selection
-//! owner notifications, fetched with `ConvertSelection` (INCR aware) and
-//! reported to the caller. Text arriving from the remote client is offered
-//! to the session by taking ownership of the selection and answering
-//! `SelectionRequest`s for the common text targets.
+//! # How a copy inside the session reaches the client
 //!
-//! This is a state machine driven from the session core thread with the X
-//! events it receives.
+//! XFIXES tells us the moment another client takes ownership of the
+//! selection. We then ask that owner for `TARGETS` to learn which formats it
+//! can produce, and report those formats upwards as
+//! [`ClipboardEvent::Formats`]. Text is small, so it is fetched immediately;
+//! an image is only fetched when the far end asks for it with
+//! [`Clipboard::request_format`].
+//!
+//! # How a copy on the client reaches the session
+//!
+//! [`Clipboard::set_text`] and [`Clipboard::set_image`] take ownership of the
+//! selection and answer `SelectionRequest` events from session applications.
+//! Both hold the content in memory, because an X11 selection owner has to be
+//! able to answer a conversion request promptly; deferring a reply until a
+//! blob arrived over the network would block the pasting application.
+//!
+//! `INCR` transfers are handled in both directions, so content larger than
+//! the X server's maximum request size works rather than silently truncating.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use lynxrdp_proto::message::clipboard_format;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     self, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Property,
@@ -25,6 +37,10 @@ use super::XDisplay;
 /// Largest clipboard text accepted in either direction (4 MiB).
 pub const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
 
+/// Largest clipboard image accepted in either direction (64 MiB). Images are
+/// held in memory on both sides, so this bounds that cost.
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
 struct Atoms {
     clipboard: xproto::Atom,
     utf8_string: xproto::Atom,
@@ -32,14 +48,36 @@ struct Atoms {
     targets: xproto::Atom,
     incr: xproto::Atom,
     timestamp: xproto::Atom,
+    png: xproto::Atom,
     prop: xproto::Atom,
 }
 
+/// A conversion request in flight.
 struct Fetch {
+    /// Target atom we asked for.
     target: xproto::Atom,
+    /// Which [`clipboard_format`] this will produce (0 for `TARGETS`).
+    format: u32,
+    /// Whether the owner switched to an `INCR` transfer.
     incr: bool,
+    /// Accumulated `INCR` chunks.
     buf: Vec<u8>,
+    /// Whether a plain `STRING` fallback has already been tried.
     tried_string: bool,
+}
+
+/// What the session's clipboard did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardEvent {
+    /// New content was copied inside the session, offering these formats
+    /// (a mask of [`clipboard_format`]).
+    Formats(u32),
+    /// Text copied inside the session.
+    Text(String),
+    /// A PNG image produced in answer to [`Clipboard::request_format`].
+    Image(Vec<u8>),
+    /// A requested format turned out to be unavailable after all.
+    Unavailable(u32),
 }
 
 /// Clipboard bridge state.
@@ -47,9 +85,17 @@ pub struct Clipboard {
     display: Arc<XDisplay>,
     window: xproto::Window,
     atoms: Atoms,
+    /// Text we are currently offering to the session, if any.
     owned_text: Option<String>,
+    /// PNG we are currently offering to the session, if any.
+    owned_png: Option<Vec<u8>>,
     fetch: Option<Fetch>,
-    last_reported: Option<String>,
+    /// Formats the current session-side owner advertised.
+    available: u32,
+    /// Last text reported upwards, to suppress echoes.
+    last_text: Option<String>,
+    /// Timestamp of the selection we are reading from.
+    owner_time: xproto::Timestamp,
 }
 
 impl Clipboard {
@@ -80,6 +126,7 @@ impl Clipboard {
             targets: display.atom("TARGETS")?,
             incr: display.atom("INCR")?,
             timestamp: display.atom("TIMESTAMP")?,
+            png: display.atom("image/png")?,
             prop: display.atom("LYNXRDP_CLIP")?,
         };
         xfixes::select_selection_input(
@@ -98,8 +145,11 @@ impl Clipboard {
             window,
             atoms,
             owned_text: None,
+            owned_png: None,
             fetch: None,
-            last_reported: None,
+            available: 0,
+            last_text: None,
+            owner_time: x11rb::CURRENT_TIME,
         })
     }
 
@@ -109,6 +159,25 @@ impl Clipboard {
             log::warn!("ignoring clipboard text of {} bytes", text.len());
             return Ok(());
         }
+        self.last_text = Some(text.clone());
+        self.owned_text = Some(text);
+        // Replacing the clipboard drops any image we were offering.
+        self.owned_png = None;
+        self.acquire()
+    }
+
+    /// Offer a PNG image to applications in the session.
+    pub fn set_image(&mut self, png: Vec<u8>) -> Result<()> {
+        if png.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+            log::warn!("ignoring clipboard image of {} bytes", png.len());
+            return Ok(());
+        }
+        self.owned_png = Some(png);
+        self.owned_text = None;
+        self.acquire()
+    }
+
+    fn acquire(&mut self) -> Result<()> {
         let conn = self.display.conn();
         conn.set_selection_owner(self.window, self.atoms.clipboard, x11rb::CURRENT_TIME)?
             .check()?;
@@ -118,38 +187,62 @@ impl Clipboard {
             .owner;
         if owner != self.window {
             log::warn!("could not acquire CLIPBOARD ownership");
+            self.owned_text = None;
+            self.owned_png = None;
             return Ok(());
         }
-        self.last_reported = Some(text.clone());
-        self.owned_text = Some(text);
         conn.flush()?;
         Ok(())
     }
 
     /// Whether we currently own the selection.
     pub fn owns_selection(&self) -> bool {
-        self.owned_text.is_some()
+        self.owned_text.is_some() || self.owned_png.is_some()
     }
 
-    /// Feed an X event. Returns text newly copied inside the session, if any.
-    pub fn handle_event(&mut self, ev: &Event) -> Result<Option<String>> {
+    /// Formats the session currently offers.
+    pub fn available_formats(&self) -> u32 {
+        self.available
+    }
+
+    /// Ask the session's clipboard owner for one format. The result arrives
+    /// from [`Clipboard::handle_event`] as [`ClipboardEvent::Image`] (or
+    /// [`ClipboardEvent::Unavailable`]).
+    pub fn request_format(&mut self, format: u32) -> Result<()> {
+        if self.available & format == 0 {
+            return Ok(());
+        }
+        if self.fetch.is_some() {
+            // One conversion at a time; the caller can ask again later.
+            log::debug!("clipboard fetch already in flight, ignoring request");
+            return Ok(());
+        }
+        let target = match format {
+            f if f == clipboard_format::PNG => self.atoms.png,
+            f if f == clipboard_format::TEXT => self.atoms.utf8_string,
+            _ => return Ok(()),
+        };
+        self.request(target, format, self.owner_time)
+    }
+
+    /// Feed an X event, producing any clipboard activity it implies.
+    pub fn handle_event(&mut self, ev: &Event) -> Result<Vec<ClipboardEvent>> {
         match ev {
             Event::XfixesSelectionNotify(e) if e.selection == self.atoms.clipboard => {
                 if e.owner == self.window {
-                    return Ok(None);
-                }
-                if e.owner == x11rb::NONE {
-                    // Selection cleared; nothing to fetch.
-                    return Ok(None);
-                }
-                if self.fetch.is_some() {
-                    // A fetch is in flight; the new owner's content will be
-                    // picked up once this completes (we re-request then).
-                    return Ok(None);
+                    return Ok(Vec::new());
                 }
                 self.owned_text = None;
-                self.request(self.atoms.utf8_string, e.timestamp)?;
-                Ok(None)
+                self.owned_png = None;
+                self.available = 0;
+                if e.owner == x11rb::NONE {
+                    return Ok(Vec::new());
+                }
+                self.owner_time = e.timestamp;
+                // Learn what the new owner can produce before fetching.
+                self.fetch = None;
+                self.request(self.atoms.targets, 0, e.timestamp)?;
+                Ok(Vec::new())
             }
             Event::SelectionNotify(e) if e.requestor == self.window => self.on_selection_notify(e),
             Event::PropertyNotify(e)
@@ -161,19 +254,25 @@ impl Clipboard {
             }
             Event::SelectionRequest(e) if e.owner == self.window => {
                 self.on_selection_request(e)?;
-                Ok(None)
+                Ok(Vec::new())
             }
             Event::SelectionClear(e)
                 if e.owner == self.window && e.selection == self.atoms.clipboard =>
             {
                 self.owned_text = None;
-                Ok(None)
+                self.owned_png = None;
+                Ok(Vec::new())
             }
-            _ => Ok(None),
+            _ => Ok(Vec::new()),
         }
     }
 
-    fn request(&mut self, target: xproto::Atom, time: xproto::Timestamp) -> Result<()> {
+    fn request(
+        &mut self,
+        target: xproto::Atom,
+        format: u32,
+        time: xproto::Timestamp,
+    ) -> Result<()> {
         let conn = self.display.conn();
         conn.delete_property(self.window, self.atoms.prop)?;
         conn.convert_selection(
@@ -186,6 +285,7 @@ impl Clipboard {
         conn.flush()?;
         self.fetch = Some(Fetch {
             target,
+            format,
             incr: false,
             buf: Vec::new(),
             tried_string: target == AtomEnum::STRING.into(),
@@ -193,18 +293,22 @@ impl Clipboard {
         Ok(())
     }
 
-    fn on_selection_notify(&mut self, e: &SelectionNotifyEvent) -> Result<Option<String>> {
+    fn on_selection_notify(&mut self, e: &SelectionNotifyEvent) -> Result<Vec<ClipboardEvent>> {
         let Some(fetch) = self.fetch.as_mut() else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         if e.property == x11rb::NONE {
-            // Conversion refused. Fall back to STRING once.
-            let tried_string = fetch.tried_string;
+            // The owner refused this conversion.
+            let (format, tried_string, target) = (fetch.format, fetch.tried_string, fetch.target);
             self.fetch = None;
-            if !tried_string {
-                self.request(AtomEnum::STRING.into(), e.time)?;
+            if format == clipboard_format::TEXT && !tried_string {
+                self.request(AtomEnum::STRING.into(), format, e.time)?;
+                return Ok(Vec::new());
             }
-            return Ok(None);
+            if target == self.atoms.targets {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![ClipboardEvent::Unavailable(format)]);
         }
         let conn = self.display.conn();
         let reply = conn
@@ -220,22 +324,53 @@ impl Clipboard {
             .context("get clipboard property")?;
         conn.flush()?;
         if reply.type_ == self.atoms.incr {
-            // INCR transfer: deleting the property (done above) starts it.
+            // Deleting the property (done above) starts the INCR transfer.
             fetch.incr = true;
             fetch.buf.clear();
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        let _ = fetch.target;
+        if fetch.target == self.atoms.targets {
+            let targets: Vec<u32> = reply.value32().map(|v| v.collect()).unwrap_or_default();
+            self.fetch = None;
+            return self.on_targets(&targets, e.time);
+        }
+        let format = fetch.format;
         self.fetch = None;
-        self.finish(reply.value)
+        Ok(self.finish(format, reply.value))
     }
 
-    fn on_incr_chunk(&mut self) -> Result<Option<String>> {
+    /// Decide what the session's clipboard offers, and start fetching text.
+    fn on_targets(
+        &mut self,
+        targets: &[u32],
+        time: xproto::Timestamp,
+    ) -> Result<Vec<ClipboardEvent>> {
+        let has = |a: xproto::Atom| targets.contains(&a);
+        let mut formats = 0u32;
+        if has(self.atoms.utf8_string) || has(self.atoms.text) || has(AtomEnum::STRING.into()) {
+            formats |= clipboard_format::TEXT;
+        }
+        if has(self.atoms.png) {
+            formats |= clipboard_format::PNG;
+        }
+        self.available = formats;
+        let mut events = vec![ClipboardEvent::Formats(formats)];
+        // Text is small enough to be worth having before the user pastes.
+        if formats & clipboard_format::TEXT != 0 {
+            self.request(self.atoms.utf8_string, clipboard_format::TEXT, time)?;
+        } else if formats == 0 {
+            events.clear();
+            events.push(ClipboardEvent::Formats(0));
+        }
+        Ok(events)
+    }
+
+    fn on_incr_chunk(&mut self) -> Result<Vec<ClipboardEvent>> {
         let Some(fetch) = self.fetch.as_mut() else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         if !fetch.incr {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let conn = self.display.conn();
         let reply = conn
@@ -251,93 +386,60 @@ impl Clipboard {
             .context("get INCR chunk")?;
         conn.flush()?;
         if reply.value.is_empty() {
+            let format = fetch.format;
+            let is_targets = fetch.target == self.atoms.targets;
             let data = std::mem::take(&mut fetch.buf);
             self.fetch = None;
-            return self.finish(data);
+            if is_targets {
+                let targets: Vec<u32> = data
+                    .chunks_exact(4)
+                    .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                return self.on_targets(&targets, x11rb::CURRENT_TIME);
+            }
+            return Ok(self.finish(format, data));
         }
-        if fetch.buf.len() + reply.value.len() > MAX_CLIPBOARD_BYTES {
+        let limit = if fetch.format == clipboard_format::PNG {
+            MAX_CLIPBOARD_IMAGE_BYTES
+        } else {
+            MAX_CLIPBOARD_BYTES
+        };
+        if fetch.buf.len() + reply.value.len() > limit {
             log::warn!("clipboard INCR transfer exceeds limit; dropping");
+            let format = fetch.format;
             self.fetch = None;
-            return Ok(None);
+            return Ok(vec![ClipboardEvent::Unavailable(format)]);
         }
         fetch.buf.extend_from_slice(&reply.value);
-        Ok(None)
+        Ok(Vec::new())
     }
 
-    fn finish(&mut self, data: Vec<u8>) -> Result<Option<String>> {
+    fn finish(&mut self, format: u32, data: Vec<u8>) -> Vec<ClipboardEvent> {
+        if format == clipboard_format::PNG {
+            if data.is_empty() || data.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+                return vec![ClipboardEvent::Unavailable(format)];
+            }
+            return vec![ClipboardEvent::Image(data)];
+        }
         if data.len() > MAX_CLIPBOARD_BYTES {
             log::warn!("clipboard text too large ({} bytes)", data.len());
-            return Ok(None);
+            return Vec::new();
         }
         let text = String::from_utf8_lossy(&data).into_owned();
-        if text.is_empty() || self.last_reported.as_deref() == Some(text.as_str()) {
-            return Ok(None);
+        if text.is_empty() || self.last_text.as_deref() == Some(text.as_str()) {
+            return Vec::new();
         }
-        self.last_reported = Some(text.clone());
-        Ok(Some(text))
+        self.last_text = Some(text.clone());
+        vec![ClipboardEvent::Text(text)]
     }
 
     fn on_selection_request(&mut self, e: &SelectionRequestEvent) -> Result<()> {
-        let conn = self.display.conn();
         let mut property = e.property;
         if property == x11rb::NONE {
             property = e.target;
         }
-        let served = match &self.owned_text {
-            Some(text) if e.selection == self.atoms.clipboard => {
-                if e.target == self.atoms.targets {
-                    let list = [
-                        self.atoms.targets,
-                        self.atoms.timestamp,
-                        self.atoms.utf8_string,
-                        self.atoms.text,
-                        AtomEnum::STRING.into(),
-                    ];
-                    conn.change_property32(
-                        PropMode::REPLACE,
-                        e.requestor,
-                        property,
-                        AtomEnum::ATOM,
-                        &list,
-                    )?;
-                    true
-                } else if e.target == self.atoms.timestamp {
-                    conn.change_property32(
-                        PropMode::REPLACE,
-                        e.requestor,
-                        property,
-                        AtomEnum::INTEGER,
-                        &[0u32],
-                    )?;
-                    true
-                } else if e.target == self.atoms.utf8_string || e.target == self.atoms.text {
-                    conn.change_property8(
-                        PropMode::REPLACE,
-                        e.requestor,
-                        property,
-                        self.atoms.utf8_string,
-                        text.as_bytes(),
-                    )?;
-                    true
-                } else if e.target == AtomEnum::STRING.into() {
-                    let latin1: Vec<u8> = text
-                        .chars()
-                        .map(|c| if (c as u32) < 256 { c as u8 } else { b'?' })
-                        .collect();
-                    conn.change_property8(
-                        PropMode::REPLACE,
-                        e.requestor,
-                        property,
-                        AtomEnum::STRING,
-                        &latin1,
-                    )?;
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
+        let served = self.serve(e, property)?;
+        let conn = self.display.conn();
         let notify = SelectionNotifyEvent {
             response_type: SELECTION_NOTIFY_EVENT,
             sequence: 0,
@@ -350,6 +452,86 @@ impl Clipboard {
         conn.send_event(false, e.requestor, EventMask::NO_EVENT, notify)?;
         conn.flush()?;
         Ok(())
+    }
+
+    /// Answer one conversion request; returns whether it was satisfied.
+    fn serve(&mut self, e: &SelectionRequestEvent, property: xproto::Atom) -> Result<bool> {
+        if e.selection != self.atoms.clipboard {
+            return Ok(false);
+        }
+        let conn = self.display.conn();
+        if e.target == self.atoms.targets {
+            let mut list = vec![self.atoms.targets, self.atoms.timestamp];
+            if self.owned_text.is_some() {
+                list.extend([
+                    self.atoms.utf8_string,
+                    self.atoms.text,
+                    AtomEnum::STRING.into(),
+                ]);
+            }
+            if self.owned_png.is_some() {
+                list.push(self.atoms.png);
+            }
+            conn.change_property32(
+                PropMode::REPLACE,
+                e.requestor,
+                property,
+                AtomEnum::ATOM,
+                &list,
+            )?;
+            return Ok(true);
+        }
+        if e.target == self.atoms.timestamp {
+            conn.change_property32(
+                PropMode::REPLACE,
+                e.requestor,
+                property,
+                AtomEnum::INTEGER,
+                &[0u32],
+            )?;
+            return Ok(true);
+        }
+        if e.target == self.atoms.png {
+            let Some(png) = self.owned_png.as_ref() else {
+                return Ok(false);
+            };
+            conn.change_property8(
+                PropMode::REPLACE,
+                e.requestor,
+                property,
+                self.atoms.png,
+                png,
+            )?;
+            return Ok(true);
+        }
+        let Some(text) = self.owned_text.as_ref() else {
+            return Ok(false);
+        };
+        if e.target == self.atoms.utf8_string || e.target == self.atoms.text {
+            conn.change_property8(
+                PropMode::REPLACE,
+                e.requestor,
+                property,
+                self.atoms.utf8_string,
+                text.as_bytes(),
+            )?;
+            return Ok(true);
+        }
+        if e.target == AtomEnum::STRING.into() {
+            let latin1: Vec<u8> = text
+                .chars()
+                .map(|c| if (c as u32) < 256 { c as u8 } else { b'?' })
+                .collect();
+            conn.change_property8(
+                PropMode::REPLACE,
+                e.requestor,
+                property,
+                AtomEnum::STRING,
+                &latin1,
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 

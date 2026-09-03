@@ -65,6 +65,9 @@ pub struct App {
     pending_size: Option<(u32, u32)>,
     clipboard: Option<arboard::Clipboard>,
     last_clipboard: Option<String>,
+    /// Hash of the last image seen on the local clipboard, so an image we
+    /// received from the session is not immediately offered back to it.
+    last_image: Option<u64>,
     last_clipboard_poll: Instant,
     last_ping: Instant,
     rtt: Option<Duration>,
@@ -105,6 +108,7 @@ impl App {
             pending_size: None,
             clipboard,
             last_clipboard: None,
+            last_image: None,
             last_clipboard_poll: Instant::now(),
             last_ping: Instant::now(),
             rtt: None,
@@ -253,6 +257,14 @@ impl App {
                             self.last_clipboard = Some(text);
                         }
                     }
+                    ClientEvent::ClipboardImage(png) => self.on_remote_image(png),
+                    ClientEvent::FileDownloaded { path, name } => {
+                        log::info!("downloaded {name} to {}", path.display());
+                    }
+                    ClientEvent::FileUploaded { name } => log::info!("uploaded {name}"),
+                    ClientEvent::TransferFailed { id, reason } => {
+                        log::warn!("transfer {id} failed: {reason}");
+                    }
                     ClientEvent::Notice(text) => log::info!("server: {text}"),
                     ClientEvent::Rtt(rtt) => {
                         self.rtt = Some(rtt);
@@ -297,12 +309,79 @@ impl App {
         if self.focused && now.duration_since(self.last_clipboard_poll) >= CLIPBOARD_POLL {
             self.last_clipboard_poll = now;
             self.poll_clipboard();
+            self.poll_clipboard_image();
         }
         if now.duration_since(self.last_title_update) >= Duration::from_secs(1) {
             self.last_title_update = now;
             if let Some(g) = &self.gfx {
                 g.window.set_title(&self.title());
             }
+        }
+    }
+
+    /// Put an image from the session onto the local clipboard.
+    fn on_remote_image(&mut self, png: Vec<u8>) {
+        let Some(cb) = self.clipboard.as_mut() else {
+            return;
+        };
+        match crate::imageclip::decode_png(&png) {
+            Ok(img) => {
+                self.last_image = Some(image_digest(&img.bytes));
+                let data = arboard::ImageData {
+                    width: img.width,
+                    height: img.height,
+                    bytes: std::borrow::Cow::Owned(img.bytes),
+                };
+                if let Err(e) = cb.set_image(data) {
+                    log::warn!("setting the clipboard image failed: {e}");
+                }
+            }
+            Err(e) => log::warn!("undecodable clipboard image from the session: {e:#}"),
+        }
+    }
+
+    /// Look for an image on the local clipboard and offer it to the session.
+    fn poll_clipboard_image(&mut self) {
+        if self.client.info().features & features::CLIPBOARD_IMAGE == 0 {
+            return;
+        }
+        let Some(cb) = self.clipboard.as_mut() else {
+            return;
+        };
+        let img = match cb.get_image() {
+            Ok(i) => i,
+            // No image on the clipboard is the common case, not an error.
+            Err(arboard::Error::ContentNotAvailable) => return,
+            Err(e) => {
+                log::debug!("reading the clipboard image failed: {e}");
+                return;
+            }
+        };
+        let digest = image_digest(&img.bytes);
+        if self.last_image == Some(digest) {
+            return;
+        }
+        self.last_image = Some(digest);
+        let rgba = match crate::imageclip::Rgba::new(img.width, img.height, img.bytes.into_owned())
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log::debug!("clipboard image was not usable: {e:#}");
+                return;
+            }
+        };
+        match crate::imageclip::encode_png(&rgba) {
+            Ok(png) => {
+                log::debug!(
+                    "offering a {}x{} clipboard image to the session",
+                    rgba.width,
+                    rgba.height
+                );
+                if let Err(e) = self.client.offer_clipboard_image(png) {
+                    log::warn!("offering the clipboard image failed: {e:#}");
+                }
+            }
+            Err(e) => log::warn!("encoding the clipboard image failed: {e:#}"),
         }
     }
 
@@ -528,6 +607,17 @@ impl ApplicationHandler<Wake> for App {
         self.client
             .disconnect(self.exit_reason.as_deref().unwrap_or("client exiting"));
     }
+}
+
+/// A cheap digest of image bytes, used only to notice that the clipboard
+/// image changed. Collisions would merely skip one redundant offer.
+fn image_digest(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^ bytes.len() as u64
 }
 
 /// Copy the framebuffer into the window buffer (top-left anchored, black

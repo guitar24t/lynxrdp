@@ -619,3 +619,601 @@ mod tests {
         assert_eq!(rx.finish().unwrap(), data);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Transfer manager
+// ---------------------------------------------------------------------------
+
+use crate::message::Message;
+use std::collections::HashMap;
+
+/// Where the bytes of an incoming transfer should go.
+pub enum Sink {
+    /// Accumulate in memory and hand the buffer back on completion. Used for
+    /// clipboard images, which both sides must hold anyway.
+    Memory(Vec<u8>),
+    /// Stream somewhere else, typically a file being written.
+    Stream(Box<dyn Write + Send>),
+}
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Sink::Memory(v) => v.write(buf),
+            Sink::Stream(w) => w.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Sink::Memory(v) => v.flush(),
+            Sink::Stream(w) => w.flush(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Sink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Sink::Memory(v) => write!(f, "Sink::Memory({} bytes)", v.len()),
+            Sink::Stream(_) => write!(f, "Sink::Stream"),
+        }
+    }
+}
+
+/// Decides what to do with transfers the peer offers.
+pub trait TransferPolicy {
+    /// Accept an offer and say where the bytes go, or refuse with a reason.
+    fn accept(
+        &mut self,
+        id: u64,
+        purpose: TransferPurpose,
+        name: &str,
+        size: u64,
+    ) -> Result<Sink, String>;
+}
+
+/// An incoming transfer that finished successfully.
+#[derive(Debug)]
+pub struct Completed {
+    /// Transfer identifier.
+    pub id: u64,
+    /// What it was for.
+    pub purpose: TransferPurpose,
+    /// Name from the offer.
+    pub name: String,
+    /// Bytes, for [`Sink::Memory`] transfers only.
+    pub data: Option<Vec<u8>>,
+}
+
+/// What handling a transfer message produced.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    /// Messages to send to the peer.
+    pub replies: Vec<Message>,
+    /// Incoming transfers that completed.
+    pub completed: Vec<Completed>,
+    /// Transfers that failed, with a reason (either direction).
+    pub failed: Vec<(u64, String)>,
+}
+
+struct Outgoing {
+    sender: TransferSender<Box<dyn Read + Send>>,
+    purpose: TransferPurpose,
+    name: String,
+    accepted: bool,
+}
+
+struct Incoming {
+    receiver: TransferReceiver<Sink>,
+    purpose: TransferPurpose,
+    name: String,
+}
+
+/// Tracks every transfer in flight on one connection, in both directions.
+///
+/// Both endpoints run one of these; it is symmetric, because either side may
+/// originate a transfer.
+pub struct TransferManager {
+    ids: TransferIds,
+    outgoing: HashMap<u64, Outgoing>,
+    incoming: HashMap<u64, Incoming>,
+    max_size: u64,
+}
+
+impl std::fmt::Debug for TransferManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TransferManager({} out, {} in)",
+            self.outgoing.len(),
+            self.incoming.len()
+        )
+    }
+}
+
+impl TransferManager {
+    /// Create a manager. `client_side` partitions the identifier space so the
+    /// two ends of a connection never choose the same id.
+    pub fn new(client_side: bool) -> Self {
+        Self {
+            ids: TransferIds::new(client_side),
+            outgoing: HashMap::new(),
+            incoming: HashMap::new(),
+            max_size: MAX_TRANSFER_SIZE,
+        }
+    }
+
+    /// Refuse offers larger than this.
+    pub fn set_max_size(&mut self, max: u64) {
+        self.max_size = max;
+    }
+
+    /// Number of transfers in flight, outgoing and incoming.
+    pub fn in_flight(&self) -> (usize, usize) {
+        (self.outgoing.len(), self.incoming.len())
+    }
+
+    /// Allocate an identifier, for a request the peer will answer.
+    pub fn next_id(&mut self) -> u64 {
+        self.ids.allocate()
+    }
+
+    /// Offer a blob held in memory. Returns the offer to send.
+    pub fn offer_bytes(
+        &mut self,
+        purpose: TransferPurpose,
+        name: String,
+        data: Vec<u8>,
+    ) -> Message {
+        let id = self.ids.allocate();
+        self.offer_stream_with_id(
+            id,
+            purpose,
+            name,
+            data.len() as u64,
+            Box::new(io::Cursor::new(data)),
+        )
+    }
+
+    /// Offer a stream of known length using a specific identifier. Answering
+    /// a [`Message::FileRequest`] reuses the requester's id.
+    pub fn offer_stream_with_id(
+        &mut self,
+        id: u64,
+        purpose: TransferPurpose,
+        name: String,
+        size: u64,
+        source: Box<dyn Read + Send>,
+    ) -> Message {
+        self.outgoing.insert(
+            id,
+            Outgoing {
+                sender: TransferSender::new(id, size, source),
+                purpose,
+                name: name.clone(),
+                accepted: false,
+            },
+        );
+        Message::TransferOffer {
+            id,
+            purpose,
+            name,
+            size,
+        }
+    }
+
+    /// Abandon a transfer in either direction.
+    pub fn cancel(&mut self, id: u64, reason: &str) -> Option<Message> {
+        let known = self.outgoing.remove(&id).is_some() | self.incoming.remove(&id).is_some();
+        known.then(|| Message::TransferEnd {
+            id,
+            ok: false,
+            message: reason.to_string(),
+        })
+    }
+
+    /// Handle a transfer-related message. Returns `None` for messages that
+    /// are not part of the transfer protocol, so callers can fall through.
+    pub fn handle(&mut self, msg: &Message, policy: &mut dyn TransferPolicy) -> Option<Outcome> {
+        let mut out = Outcome::default();
+        match msg {
+            Message::TransferOffer {
+                id,
+                purpose,
+                name,
+                size,
+            } => {
+                if *size > self.max_size {
+                    out.replies.push(Message::TransferAccept {
+                        id: *id,
+                        accepted: false,
+                        reason: format!("{size} bytes exceeds the limit"),
+                    });
+                    return Some(out);
+                }
+                match policy.accept(*id, *purpose, name, *size) {
+                    Ok(sink) => {
+                        self.incoming.insert(
+                            *id,
+                            Incoming {
+                                receiver: TransferReceiver::new(*id, *size, sink),
+                                purpose: *purpose,
+                                name: name.clone(),
+                            },
+                        );
+                        out.replies.push(Message::TransferAccept {
+                            id: *id,
+                            accepted: true,
+                            reason: String::new(),
+                        });
+                        // A zero-length transfer has no chunks at all.
+                        if *size == 0 {
+                            self.complete_incoming(*id, &mut out);
+                        }
+                    }
+                    Err(reason) => out.replies.push(Message::TransferAccept {
+                        id: *id,
+                        accepted: false,
+                        reason,
+                    }),
+                }
+            }
+            Message::TransferAccept {
+                id,
+                accepted,
+                reason,
+            } => {
+                let Some(o) = self.outgoing.get_mut(id) else {
+                    return Some(out);
+                };
+                if !*accepted {
+                    let reason = reason.clone();
+                    self.outgoing.remove(id);
+                    out.failed.push((*id, format!("peer declined: {reason}")));
+                    return Some(out);
+                }
+                o.accepted = true;
+                self.pump_one(*id, &mut out);
+            }
+            Message::TransferData { id, seq, data } => {
+                let Some(i) = self.incoming.get_mut(id) else {
+                    return Some(out);
+                };
+                match i.receiver.chunk(*seq, data) {
+                    Ok(ack) => {
+                        out.replies.push(Message::TransferAck { id: *id, seq: ack });
+                        if i.receiver.is_complete() {
+                            self.complete_incoming(*id, &mut out);
+                        }
+                    }
+                    Err(e) => {
+                        self.incoming.remove(id);
+                        out.replies.push(Message::TransferEnd {
+                            id: *id,
+                            ok: false,
+                            message: e.to_string(),
+                        });
+                        out.failed.push((*id, e.to_string()));
+                    }
+                }
+            }
+            Message::TransferAck { id, seq } => {
+                if let Some(o) = self.outgoing.get_mut(id) {
+                    o.sender.on_ack(*seq);
+                }
+                self.pump_one(*id, &mut out);
+            }
+            Message::TransferEnd { id, ok, message } => {
+                let was_incoming = self.incoming.remove(id).is_some();
+                let was_outgoing = self.outgoing.remove(id).is_some();
+                if !*ok && (was_incoming || was_outgoing) {
+                    out.failed.push((*id, message.clone()));
+                }
+            }
+            _ => return None,
+        }
+        Some(out)
+    }
+
+    fn complete_incoming(&mut self, id: u64, out: &mut Outcome) {
+        let Some(i) = self.incoming.remove(&id) else {
+            return;
+        };
+        let (purpose, name) = (i.purpose, i.name);
+        match i.receiver.finish() {
+            Ok(sink) => {
+                let data = match sink {
+                    Sink::Memory(v) => Some(v),
+                    Sink::Stream(_) => None,
+                };
+                out.replies.push(Message::TransferEnd {
+                    id,
+                    ok: true,
+                    message: String::new(),
+                });
+                out.completed.push(Completed {
+                    id,
+                    purpose,
+                    name,
+                    data,
+                });
+            }
+            Err(e) => {
+                out.replies.push(Message::TransferEnd {
+                    id,
+                    ok: false,
+                    message: e.to_string(),
+                });
+                out.failed.push((id, e.to_string()));
+            }
+        }
+    }
+
+    /// Emit as many chunks for one transfer as its window allows.
+    fn pump_one(&mut self, id: u64, out: &mut Outcome) {
+        let Some(o) = self.outgoing.get_mut(&id) else {
+            return;
+        };
+        if !o.accepted {
+            return;
+        }
+        loop {
+            match o.sender.next_chunk() {
+                Ok(Some((seq, data))) => out.replies.push(Message::TransferData { id, seq, data }),
+                Ok(None) => break,
+                Err(e) => {
+                    self.outgoing.remove(&id);
+                    out.replies.push(Message::TransferEnd {
+                        id,
+                        ok: false,
+                        message: e.to_string(),
+                    });
+                    out.failed.push((id, e.to_string()));
+                    return;
+                }
+            }
+        }
+        if o.sender.is_complete() {
+            self.outgoing.remove(&id);
+        }
+    }
+
+    /// Describe a transfer in flight: its purpose, name and progress.
+    /// Used to render progress for uploads and downloads.
+    pub fn describe(&self, id: u64) -> Option<(TransferPurpose, &str, u64, u64)> {
+        if let Some(o) = self.outgoing.get(&id) {
+            let (done, total) = o.sender.progress();
+            return Some((o.purpose, o.name.as_str(), done, total));
+        }
+        let i = self.incoming.get(&id)?;
+        let (done, total) = i.receiver.progress();
+        Some((i.purpose, i.name.as_str(), done, total))
+    }
+
+    /// Progress of one transfer, as (done, total).
+    pub fn progress(&self, id: u64) -> Option<(u64, u64)> {
+        if let Some(o) = self.outgoing.get(&id) {
+            return Some(o.sender.progress());
+        }
+        self.incoming.get(&id).map(|i| i.receiver.progress())
+    }
+}
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+
+    /// Accepts everything into memory.
+    struct MemoryPolicy;
+    impl TransferPolicy for MemoryPolicy {
+        fn accept(&mut self, _: u64, _: TransferPurpose, _: &str, _: u64) -> Result<Sink, String> {
+            Ok(Sink::Memory(Vec::new()))
+        }
+    }
+
+    /// Refuses everything.
+    struct RefusePolicy;
+    impl TransferPolicy for RefusePolicy {
+        fn accept(&mut self, _: u64, _: TransferPurpose, _: &str, _: u64) -> Result<Sink, String> {
+            Err("not accepting".into())
+        }
+    }
+
+    /// Run both managers against each other until the queues drain.
+    fn exchange(
+        a: &mut TransferManager,
+        b: &mut TransferManager,
+        first: Message,
+    ) -> (Vec<Completed>, Vec<Completed>, Vec<(u64, String)>) {
+        let (mut done_a, mut done_b, mut failed) = (Vec::new(), Vec::new(), Vec::new());
+        // (message, goes_to_b)
+        let mut queue: Vec<(Message, bool)> = vec![(first, true)];
+        let mut guard = 0;
+        while let Some((msg, to_b)) = queue.pop() {
+            guard += 1;
+            assert!(guard < 100_000, "transfer did not settle");
+            let (target, done): (&mut TransferManager, &mut Vec<Completed>) = if to_b {
+                (b, &mut done_b)
+            } else {
+                (a, &mut done_a)
+            };
+            let mut policy = MemoryPolicy;
+            if let Some(outcome) = target.handle(&msg, &mut policy) {
+                done.extend(outcome.completed);
+                failed.extend(outcome.failed);
+                for reply in outcome.replies.into_iter().rev() {
+                    queue.push((reply, !to_b));
+                }
+            }
+        }
+        (done_a, done_b, failed)
+    }
+
+    #[test]
+    fn a_blob_moves_end_to_end() {
+        let payload: Vec<u8> = (0..CHUNK_SIZE * 3 + 11).map(|i| (i % 253) as u8).collect();
+        let mut client = TransferManager::new(true);
+        let mut server = TransferManager::new(false);
+        let offer = client.offer_bytes(
+            TransferPurpose::ClipboardImage,
+            "shot.png".into(),
+            payload.clone(),
+        );
+        let (_, done_server, failed) = exchange(&mut client, &mut server, offer);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(done_server.len(), 1);
+        assert_eq!(done_server[0].data.as_deref(), Some(&payload[..]));
+        assert_eq!(done_server[0].purpose, TransferPurpose::ClipboardImage);
+        assert_eq!(done_server[0].name, "shot.png");
+        // Both sides forgot about it.
+        assert_eq!(client.in_flight(), (0, 0));
+        assert_eq!(server.in_flight(), (0, 0));
+    }
+
+    #[test]
+    fn an_empty_blob_completes_without_chunks() {
+        let mut client = TransferManager::new(true);
+        let mut server = TransferManager::new(false);
+        let offer = client.offer_bytes(TransferPurpose::ClipboardImage, "empty".into(), Vec::new());
+        let (_, done_server, failed) = exchange(&mut client, &mut server, offer);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(done_server.len(), 1);
+        assert_eq!(done_server[0].data.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn a_declined_offer_is_reported_and_forgotten() {
+        let mut client = TransferManager::new(true);
+        let mut server = TransferManager::new(false);
+        let offer = client.offer_bytes(TransferPurpose::FileUpload, "x".into(), vec![1, 2, 3]);
+        let mut refuse = RefusePolicy;
+        let reply = server.handle(&offer, &mut refuse).unwrap();
+        assert_eq!(reply.replies.len(), 1);
+        let mut policy = MemoryPolicy;
+        let back = client.handle(&reply.replies[0], &mut policy).unwrap();
+        assert_eq!(back.failed.len(), 1);
+        assert!(back.failed[0].1.contains("declined"), "{:?}", back.failed);
+        assert_eq!(client.in_flight(), (0, 0));
+    }
+
+    #[test]
+    fn an_oversized_offer_is_refused_before_any_data() {
+        let mut server = TransferManager::new(false);
+        server.set_max_size(1024);
+        let offer = Message::TransferOffer {
+            id: 1,
+            purpose: TransferPurpose::FileUpload,
+            name: "big".into(),
+            size: 10_000,
+        };
+        let mut policy = MemoryPolicy;
+        let out = server.handle(&offer, &mut policy).unwrap();
+        assert!(matches!(
+            out.replies.as_slice(),
+            [Message::TransferAccept {
+                accepted: false,
+                ..
+            }]
+        ));
+        assert_eq!(server.in_flight(), (0, 0));
+    }
+
+    #[test]
+    fn a_corrupt_chunk_ends_the_transfer() {
+        let mut server = TransferManager::new(false);
+        let mut policy = MemoryPolicy;
+        server
+            .handle(
+                &Message::TransferOffer {
+                    id: 5,
+                    purpose: TransferPurpose::ClipboardImage,
+                    name: "x".into(),
+                    size: 10,
+                },
+                &mut policy,
+            )
+            .unwrap();
+        // Sequence 1 arrives before sequence 0.
+        let out = server
+            .handle(
+                &Message::TransferData {
+                    id: 5,
+                    seq: 1,
+                    data: vec![0; 4],
+                },
+                &mut policy,
+            )
+            .unwrap();
+        assert!(matches!(
+            out.replies.as_slice(),
+            [Message::TransferEnd { ok: false, .. }]
+        ));
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(server.in_flight(), (0, 0));
+    }
+
+    #[test]
+    fn unrelated_messages_fall_through() {
+        let mut m = TransferManager::new(true);
+        let mut policy = MemoryPolicy;
+        assert!(m.handle(&Message::RefreshRequest, &mut policy).is_none());
+        assert!(m.handle(&Message::Ping { nonce: 1 }, &mut policy).is_none());
+    }
+
+    #[test]
+    fn cancel_reports_only_known_transfers() {
+        let mut m = TransferManager::new(true);
+        assert!(m.cancel(42, "gone").is_none());
+        let offer = m.offer_bytes(TransferPurpose::FileUpload, "f".into(), vec![1, 2, 3]);
+        let Message::TransferOffer { id, .. } = offer else {
+            unreachable!()
+        };
+        assert!(m.cancel(id, "user cancelled").is_some());
+        assert_eq!(m.in_flight(), (0, 0));
+    }
+
+    #[test]
+    fn describe_reports_both_directions() {
+        let mut client = TransferManager::new(true);
+        let mut server = TransferManager::new(false);
+        let offer = client.offer_bytes(
+            TransferPurpose::FileUpload,
+            "notes.txt".into(),
+            vec![1; 4096],
+        );
+        let Message::TransferOffer { id, .. } = offer.clone() else {
+            unreachable!()
+        };
+        // Sender side knows the name and total before anything is acked.
+        let (purpose, name, done, total) = client.describe(id).unwrap();
+        assert_eq!(purpose, TransferPurpose::FileUpload);
+        assert_eq!(name, "notes.txt");
+        assert_eq!((done, total), (0, 4096));
+        // Receiver side knows them once the offer is accepted.
+        let mut policy = MemoryPolicy;
+        server.handle(&offer, &mut policy).unwrap();
+        let (purpose, name, done, total) = server.describe(id).unwrap();
+        assert_eq!(purpose, TransferPurpose::FileUpload);
+        assert_eq!(name, "notes.txt");
+        assert_eq!((done, total), (0, 4096));
+        assert!(client.describe(9999).is_none());
+    }
+
+    #[test]
+    fn data_for_an_unknown_transfer_is_ignored() {
+        let mut m = TransferManager::new(false);
+        let mut policy = MemoryPolicy;
+        let out = m
+            .handle(
+                &Message::TransferData {
+                    id: 999,
+                    seq: 0,
+                    data: vec![1],
+                },
+                &mut policy,
+            )
+            .unwrap();
+        assert!(out.replies.is_empty());
+        assert!(out.failed.is_empty());
+    }
+}
