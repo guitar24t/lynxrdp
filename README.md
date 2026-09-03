@@ -40,7 +40,13 @@ your SSH credentials.
   Zstd is smaller. An idle screen costs zero bytes.
 * **Dynamic resolution.** Resize the window and the remote screen follows;
   no scaling, no blurry text.
-* **Clipboard sync** (text) in both directions.
+* **Clipboard sync** in both directions: text, images (as lossless PNG,
+  fetched only when the other side asks, so copying an image you never
+  paste costs nothing), and files copied in the session.
+* **File transfer.** Drop files or folders on the window to upload them,
+  or use `lynxrdp send host ./file` and `lynxrdp get host ~/file`. Both
+  reuse the same SSH tunnel; transfers are chunked and windowed so a large
+  file never stalls the interactive screen stream.
 * **Pure Rust, tiny dependency surface.** No C libraries are linked at build
   time. The X server (Xvfb) and `libpam` are used at runtime.
 * **Runs without root too.** `lynxrdp-session --listen 127.0.0.1:3390` serves
