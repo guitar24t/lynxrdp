@@ -33,10 +33,20 @@ OUT_ABS="$(cd "$OUT" && pwd)"
 EXE_ABS="$(cd "$(dirname "$EXE")" && pwd)/$(basename "$EXE")"
 
 SETUP="$OUT_ABS/lynxrdp-${VERSION}-windows-x86_64-setup.exe"
+
+# NSIS wants native Windows paths. Under Git Bash the MSYS layer rewrites
+# /d/a/... to D:/a/... on its way to makensis.exe, and NSIS reads those forward
+# slashes literally -- "no files found" on a file that is plainly there. cygpath
+# gives us the D:\a\... form it actually wants. Off Windows there is no cygpath
+# and the POSIX path is already native.
+towin() {
+    if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi
+}
+
 "$MAKENSIS" -V2 \
     "-DVERSION=$VERSION" \
-    "-DEXEPATH=$EXE_ABS" \
-    "-DOUTFILE=$SETUP" \
+    "-DEXEPATH=$(towin "$EXE_ABS")" \
+    "-DOUTFILE=$(towin "$SETUP")" \
     packaging/windows/lynxrdp.nsi
 
 echo "built $SETUP"
