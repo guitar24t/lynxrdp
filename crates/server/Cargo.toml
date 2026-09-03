@@ -1,0 +1,34 @@
+[package]
+name = "lynxrdp-server"
+description = "LynxRDP server: secure loopback-only remote desktop sessions for Linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "lynxrdpd"
+path = "src/bin/lynxrdpd.rs"
+
+[[bin]]
+name = "lynxrdp-session"
+path = "src/bin/lynxrdp-session.rs"
+
+[dependencies]
+lynxrdp-proto = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+crossbeam-channel = { workspace = true }
+libloading = "0.8"
+x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "xtest", "randr", "allow-unsafe-code"] }
+
+[dev-dependencies]
+tempfile = "3"
+lynxrdp-client = { path = "../client" }

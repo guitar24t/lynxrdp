@@ -1,0 +1,50 @@
+# LynxRDP server configuration.
+#
+# Every key is optional; the values shown are the defaults. Run
+# `lynxrdpd --dump-config` to print the effective configuration.
+
+[listen]
+# Only loopback addresses are accepted: clients connect through an SSH
+# port forward that terminates on this host.
+address = "127.0.0.1"
+port = 3390
+# Optionally also listen on a Unix socket (forward with
+# `ssh -L 3390:/run/lynxrdp/lynxrdp.sock host`). Peers are identified with
+# SO_PEERCRED.
+#unix_socket = "/run/lynxrdp/lynxrdp.sock"
+
+[access]
+# Accounts below this uid (system accounts, root) are refused.
+min_uid = 1000
+# If non-empty, only these users may connect.
+allow_users = []
+# If non-empty, only members of these groups may connect.
+allow_groups = []
+# Always refused.
+deny_users = ["root"]
+
+[session]
+# Screen size used when the client does not request one.
+default_width = 1920
+default_height = 1080
+# Largest size a client may request; also the X server's virtual screen.
+max_width = 4096
+max_height = 2160
+# Headless X server and extra arguments.
+xserver = "Xvfb"
+xserver_args = []
+# Script that starts the desktop environment inside the session.
+startwm = "/etc/lynxrdp/startwm.sh"
+# Frame rate cap and number of unacknowledged frames allowed in flight
+# (1 = lowest latency, 2 = smoother on jittery links).
+max_fps = 60
+max_in_flight = 2
+# Seconds a session may stay without a client before it is ended (0 = never).
+idle_timeout_secs = 0
+# PAM service used to open the login session (/etc/pam.d/lynxrdp).
+pam_service = "lynxrdp"
+runtime_dir = "/run/lynxrdp"
+session_binary = "/usr/bin/lynxrdp-session"
+# Per-user session logs go to <log_dir>/<user>.log.
+#log_dir = "/var/log/lynxrdp"
+dpi = 96

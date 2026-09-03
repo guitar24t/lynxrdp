@@ -1,0 +1,7 @@
+/target
+/dist
+*.deb
+*.rpm
+*.log
+.DS_Store
+/crates/*/target

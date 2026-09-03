@@ -1,0 +1,45 @@
+[package]
+name = "lynxrdp-client"
+description = "LynxRDP client for Windows, macOS and Linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "lynxrdp"
+path = "src/main.rs"
+
+[lib]
+name = "lynxrdp_client"
+path = "src/lib.rs"
+
+[dependencies]
+lynxrdp-proto = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+clap = { workspace = true }
+crossbeam-channel = { workspace = true }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control", "image-data"] }
+png = "0.17"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11rb = "0.13"
+
+# Clipboard file lists have no cross-platform crate, so each platform brings
+# its own minimal binding: CF_HDROP on Windows, NSPasteboard on macOS.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }

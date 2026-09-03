@@ -1,0 +1,26 @@
+[Unit]
+Description=LynxRDP remote desktop daemon (loopback only, reached through SSH)
+Documentation=https://github.com/guitar24t/lynxrdp
+After=network.target systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lynxrdpd --config /etc/lynxrdp/lynxrdp.toml
+Restart=on-failure
+RestartSec=2
+# Sessions are child processes of the daemon but must outlive daemon
+# restarts and package upgrades, so only the daemon itself is stopped.
+KillMode=process
+RuntimeDirectory=lynxrdp
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+LogsDirectory=lynxrdp
+LogsDirectoryMode=0700
+Environment=RUST_LOG=info
+# The daemon must remain root to open PAM sessions and switch to users, and
+# the desktop sessions it starts need an unrestricted view of the system, so
+# the usual sandboxing directives are intentionally not applied here.
+
+[Install]
+WantedBy=multi-user.target

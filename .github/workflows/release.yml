@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets a build be cut without pushing a tag, which matters where tag
+  # pushes are not available. The tag is created by the release step.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create for this release, e.g. v0.1.0-rc.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-client:
+    name: Client (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-24.04,     target: x86_64-unknown-linux-gnu,  bin: lynxrdp }
+          - { name: linux-aarch64,  os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, bin: lynxrdp }
+          # Apple Silicon only; see the note in ci.yml.
+          - { name: macos-aarch64,  os: macos-latest,     target: aarch64-apple-darwin,      bin: lynxrdp }
+          - { name: windows-x86_64, os: windows-latest,   target: x86_64-pc-windows-msvc,    bin: lynxrdp.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release -p lynxrdp-client --target ${{ matrix.target }}
+      - shell: bash
+        run: packaging/package-client.sh "${{ matrix.target }}" "${{ matrix.name }}" "${{ matrix.bin }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lynxrdp-client-${{ matrix.name }}
+          path: dist/*
+
+  package-server:
+    name: Server packages (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86_64,  os: ubuntu-24.04,     arch: amd64 }
+          - { name: aarch64, os: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.1
+      # Built against the RHEL 9 glibc; see the note in ci.yml.
+      - name: Build server and client (release, against the RHEL 9 glibc)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e CARGO_TERM_COLOR=always \
+            almalinux:9 bash -euo pipefail -c '
+              dnf -y install gcc >/dev/null
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null
+              . "$HOME/.cargo/env"
+              cargo build --release -p lynxrdp-server -p lynxrdp-client
+            '
+          sudo chown -R "$(id -u):$(id -g)" target
+      - name: Check the packaged binaries can load on RHEL 9
+        run: |
+          packaging/check-glibc-floor.sh \
+            target/release/lynxrdpd \
+            target/release/lynxrdp-session \
+            target/release/lynxrdp
+      - run: packaging/package-server.sh "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lynxrdp-server-${{ matrix.name }}
+          path: dist/*
+
+  release:
+    name: Publish GitHub release
+    needs: [build-client, package-server]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          (cd release && sha256sum * > SHA256SUMS)
+          ls -la release
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          # Semver: a hyphen in the tag means a prerelease, so v0.1.0-rc.1 is
+          # marked as one and v0.1.0 is not. The packages themselves keep the
+          # Cargo.toml version, because an RPM Version field cannot contain a
+          # hyphen and nfpm would have to mangle it.
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}

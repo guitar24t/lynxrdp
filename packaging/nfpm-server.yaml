@@ -1,0 +1,92 @@
+# nfpm configuration for the LynxRDP server package (.deb and .rpm).
+# Built by packaging/package-server.sh, which sets VERSION and ARCH.
+name: lynxrdp-server
+arch: "${ARCH}"
+platform: linux
+version: "${VERSION}"
+release: "1"
+section: x11
+priority: optional
+maintainer: LynxRDP contributors <lynxrdp@users.noreply.github.com>
+description: |
+  Secure loopback-only remote desktop server.
+  LynxRDP serves a separate X11 desktop session per user. Clients reach it
+  exclusively through an SSH port forward; the daemon identifies the local
+  user behind each connection and never accepts passwords itself.
+vendor: LynxRDP
+homepage: https://github.com/guitar24t/lynxrdp
+license: MIT
+
+contents:
+  - src: target/release/lynxrdpd
+    dst: /usr/bin/lynxrdpd
+    file_info:
+      mode: 0755
+  - src: target/release/lynxrdp-session
+    dst: /usr/bin/lynxrdp-session
+    file_info:
+      mode: 0755
+  - src: packaging/lynxrdpd.service
+    dst: /usr/lib/systemd/system/lynxrdpd.service
+    file_info:
+      mode: 0644
+  - src: packaging/lynxrdp.toml
+    dst: /etc/lynxrdp/lynxrdp.toml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: packaging/startwm.sh
+    dst: /etc/lynxrdp/startwm.sh
+    type: config|noreplace
+    file_info:
+      mode: 0755
+  - src: packaging/pam/lynxrdp.debian
+    dst: /usr/share/lynxrdp/pam/lynxrdp.debian
+    file_info:
+      mode: 0644
+  - src: packaging/pam/lynxrdp.rhel
+    dst: /usr/share/lynxrdp/pam/lynxrdp.rhel
+    file_info:
+      mode: 0644
+  - src: packaging/lynxrdpd.tmpfiles
+    dst: /usr/lib/tmpfiles.d/lynxrdpd.conf
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/lynxrdp-server/README.md
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+  postremove: packaging/scripts/postremove.sh
+
+overrides:
+  deb:
+    depends:
+      - xvfb
+      - libpam0g
+      - libc6
+    recommends:
+      - dbus-x11
+      - xterm
+      - x11-xserver-utils
+    suggests:
+      - xfce4-session
+      - xfce4
+  rpm:
+    depends:
+      - xorg-x11-server-Xvfb
+      - pam
+    recommends:
+      - dbus-x11
+      - xterm
+      - xorg-x11-server-utils
+
+rpm:
+  group: User Interface/X
+  summary: Secure loopback-only remote desktop server
+  compression: xz
+deb:
+  compression: xz

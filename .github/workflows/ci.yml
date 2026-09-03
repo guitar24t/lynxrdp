@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Cancel superseded runs on the same ref so a new push does not leave stale
+# in-flight jobs (and stale failures) behind.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-linux:
+    name: Test (Linux, Xvfb end-to-end)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install X test dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q xvfb xterm xdotool xclip x11-utils x11-xserver-utils libxkbcommon-x11-0 libxkbcommon0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - name: Unit tests
+        run: cargo test --workspace --lib --bins
+      - name: End-to-end tests (session)
+        run: cargo test -p lynxrdp-server --test e2e -- --test-threads=2
+      - name: End-to-end tests (daemon)
+        run: cargo test -p lynxrdp-server --test daemon -- --test-threads=1
+      - name: Doc tests
+        run: cargo test --workspace --doc
+
+  build-client:
+    name: Client (${{ matrix.name }})
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bin: lynxrdp
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin: lynxrdp
+          # Apple Silicon only. Intel Macs are end of life and the macos-13
+          # runner pool no longer schedules reliably; the source still builds
+          # for x86_64-apple-darwin if anyone needs it.
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin: lynxrdp
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: lynxrdp.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Test protocol and client crates
+        run: cargo test -p lynxrdp-proto -p lynxrdp-client --target ${{ matrix.target }}
+      - name: Build release client
+        run: cargo build --release -p lynxrdp-client --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: packaging/package-client.sh "${{ matrix.target }}" "${{ matrix.name }}" "${{ matrix.bin }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lynxrdp-client-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  package-server:
+    name: Server packages (${{ matrix.name }})
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            os: ubuntu-24.04
+            arch: amd64
+          - name: aarch64
+            os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.1
+      # Built inside AlmaLinux 9 (RHEL 9 ABI, glibc 2.34) rather than on the
+      # runner. glibc is backward compatible but not forward: binaries linked
+      # against the runner's 2.39 refuse to start on RHEL 9. Building against
+      # the oldest glibc we target produces packages that run everywhere we
+      # claim support, Ubuntu 24.04 and 26.04 included.
+      - name: Build server and client (release, against the RHEL 9 glibc)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e CARGO_TERM_COLOR=always \
+            almalinux:9 bash -euo pipefail -c '
+              dnf -y install gcc >/dev/null
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null
+              . "$HOME/.cargo/env"
+              cargo build --release -p lynxrdp-server -p lynxrdp-client
+            '
+          # The container runs as root, so hand the tree back to the runner.
+          sudo chown -R "$(id -u):$(id -g)" target
+      - name: Check the packaged binaries can load on RHEL 9
+        run: |
+          packaging/check-glibc-floor.sh \
+            target/release/lynxrdpd \
+            target/release/lynxrdp-session \
+            target/release/lynxrdp
+      - name: Build .deb and .rpm
+        run: packaging/package-server.sh "${{ matrix.arch }}"
+      - name: Install the .deb and smoke test
+        run: |
+          set -x
+          sudo apt-get update -q
+          sudo apt-get install -y -q ./dist/lynxrdp-server_*_${{ matrix.arch }}.deb
+          lynxrdpd --version
+          lynxrdp-session --version
+          lynxrdpd --check
+          test -f /etc/pam.d/lynxrdp
+          test -x /etc/lynxrdp/startwm.sh
+          systemd-analyze verify /usr/lib/systemd/system/lynxrdpd.service
+          systemctl is-enabled lynxrdpd
+          # Give the freshly-installed unit a moment to reach its running state.
+          for i in $(seq 1 10); do
+            state="$(systemctl is-active lynxrdpd || true)"
+            [ "$state" = "active" ] && break
+            sleep 1
+          done
+          sudo journalctl -u lynxrdpd --no-pager | tail -30 || true
+          if [ "$(systemctl is-active lynxrdpd)" != "active" ]; then
+            echo "::error::lynxrdpd is not active after install"
+            systemctl status lynxrdpd --no-pager || true
+            exit 1
+          fi
+          # The daemon must be listening on loopback only.
+          sudo ss -ltnp | grep -E '127\.0\.0\.1:3390' || (echo "::error::not listening on 127.0.0.1:3390"; exit 1)
+          sudo apt-get remove -y -q lynxrdp-server
+      - name: Inspect the .rpm
+        run: |
+          sudo apt-get install -y -q rpm
+          rpm -qpi dist/lynxrdp-server-*.rpm
+          rpm -qpl dist/lynxrdp-server-*.rpm
+          rpm -qp --scripts dist/lynxrdp-server-*.rpm | head -40
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lynxrdp-server-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
