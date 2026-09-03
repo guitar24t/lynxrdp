@@ -113,12 +113,15 @@ impl Client {
 /// or buggy offer cannot escape the upload directory into, say, `~/.ssh`.
 struct SessionTransferPolicy {
     upload_dir: PathBuf,
+    /// Downloads the session asked the client for, while staging a clipboard
+    /// file copy. Anything else in that direction is refused.
+    staging: std::collections::HashMap<u64, PathBuf>,
 }
 
 impl TransferPolicy for SessionTransferPolicy {
     fn accept(
         &mut self,
-        _id: u64,
+        id: u64,
         purpose: TransferPurpose,
         name: &str,
         _size: u64,
@@ -138,8 +141,20 @@ impl TransferPolicy for SessionTransferPolicy {
                 log::info!("receiving upload into {}", dest.display());
                 Ok(Sink::Stream(Box::new(file)))
             }
-            // The client never sends us a download; that direction is ours.
-            TransferPurpose::FileDownload => Err("unexpected download offer".into()),
+            TransferPurpose::FileDownload => {
+                // Only files we asked for while staging a clipboard copy.
+                let dest = self
+                    .staging
+                    .get(&id)
+                    .ok_or_else(|| "unsolicited download offer".to_string())?;
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                }
+                let f = std::fs::File::create(dest)
+                    .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+                Ok(Sink::Stream(Box::new(f)))
+            }
         }
     }
 }
@@ -172,6 +187,13 @@ pub struct Core {
     upload_dir: PathBuf,
     /// Clipboard formats the client last announced.
     client_formats: u32,
+    /// Where the client's clipboard files are staged before being offered
+    /// to the session.
+    staging_dir: PathBuf,
+    /// Downloads in flight while staging: transfer id to destination.
+    staging_downloads: std::collections::HashMap<u64, PathBuf>,
+    /// Files staged so far in the current batch.
+    staging_batch: Vec<PathBuf>,
 }
 
 /// Why the core loop stopped.
@@ -221,6 +243,9 @@ impl Core {
         };
         let min_frame_interval = Duration::from_secs_f64(1.0 / f64::from(opts.max_fps.max(1)));
         let upload_dir = opts.upload_dir.clone();
+        // Clipboard files from the client are staged here so the session can
+        // paste them as ordinary local files.
+        let staging_dir = std::env::temp_dir().join(format!("lynxrdp-clip-{}", std::process::id()));
         log::info!(
             "session core ready: {w}x{h}, shm={}, cursor={}, clipboard={}, max_fps={}, in_flight={}",
             capture.uses_shm(),
@@ -251,6 +276,9 @@ impl Core {
             transfers: TransferManager::new(false),
             upload_dir,
             client_formats: 0,
+            staging_dir,
+            staging_downloads: std::collections::HashMap::new(),
+            staging_batch: Vec::new(),
         })
     }
 
@@ -428,11 +456,81 @@ impl Core {
                 );
                 self.send_to_client(vec![offer]);
             }
+            ClipboardEvent::Files(paths) => {
+                if self.client_clipboard_formats() & clipboard_format::FILES == 0 {
+                    return Ok(());
+                }
+                let mut files = Vec::new();
+                for p in &paths {
+                    // Directories would need recursive listing; skip them
+                    // rather than offering something we cannot deliver.
+                    match std::fs::metadata(p) {
+                        Ok(m) if m.is_file() => files.push(lynxrdp_proto::FileEntry {
+                            path: p.to_string_lossy().into_owned(),
+                            size: m.len(),
+                        }),
+                        Ok(_) => {
+                            log::debug!("skipping non-file {} in a clipboard copy", p.display())
+                        }
+                        Err(e) => log::debug!("skipping {}: {e}", p.display()),
+                    }
+                }
+                if files.is_empty() {
+                    return Ok(());
+                }
+                log::debug!("clipboard: offering {} file(s) to the client", files.len());
+                let id = self.transfers.next_id();
+                self.send_to_client(vec![
+                    Message::FileList { id, files },
+                    Message::ClipboardOffer {
+                        formats: clipboard_format::FILES,
+                    },
+                ]);
+            }
             ClipboardEvent::Unavailable(format) => {
                 log::debug!("clipboard format {format:#x} turned out to be unavailable");
             }
         }
         Ok(())
+    }
+
+    /// The client copied files; fetch them so the session can paste them.
+    ///
+    /// They are staged as real local files because an X11 selection owner
+    /// must answer a paste immediately and cannot wait for a round trip.
+    fn stage_client_files(&mut self, files: Vec<lynxrdp_proto::FileEntry>) {
+        if self.clipboard.is_none() || files.is_empty() {
+            return;
+        }
+        // A new copy supersedes any half-staged one.
+        self.staging_downloads.clear();
+        self.staging_batch.clear();
+        let dir = self
+            .staging_dir
+            .join(format!("{}", self.transfers.next_id()));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            log::warn!("cannot create the clipboard staging directory: {e}");
+            return;
+        }
+        let mut requests = Vec::new();
+        for f in &files {
+            let Some(rel) = safe_relative_path(&f.path) else {
+                continue;
+            };
+            let name = rel.rsplit('/').next().unwrap_or("file").to_string();
+            let id = self.transfers.next_id();
+            self.transfers.expect(id);
+            self.staging_downloads.insert(id, dir.join(&name));
+            requests.push(Message::FileRequest {
+                id,
+                path: f.path.clone(),
+            });
+        }
+        log::debug!(
+            "clipboard: staging {} file(s) from the client",
+            requests.len()
+        );
+        self.send_to_client(requests);
     }
 
     /// Answer a client's request to download a file from the session.
@@ -501,6 +599,7 @@ impl Core {
     fn handle_transfer_message(&mut self, msg: &Message) -> bool {
         let mut policy = SessionTransferPolicy {
             upload_dir: self.upload_dir.clone(),
+            staging: self.staging_downloads.clone(),
         };
         let Some(outcome) = self.transfers.handle(msg, &mut policy) else {
             return false;
@@ -532,7 +631,21 @@ impl Core {
                     text: format!("Received {}", done.name),
                 }]);
             }
-            TransferPurpose::FileDownload => {}
+            TransferPurpose::FileDownload => {
+                if let Some(path) = self.staging_downloads.remove(&done.id) {
+                    self.staging_batch.push(path);
+                }
+                if self.staging_downloads.is_empty() && !self.staging_batch.is_empty() {
+                    let files = std::mem::take(&mut self.staging_batch);
+                    log::debug!(
+                        "clipboard: offering {} staged file(s) to the session",
+                        files.len()
+                    );
+                    if let Some(cb) = self.clipboard.as_mut() {
+                        cb.set_files(files)?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -768,6 +881,7 @@ impl Core {
                 }
             }
             Message::FileRequest { id, path } => self.on_file_request(id, &path),
+            Message::FileList { files, .. } => self.stage_client_files(files),
             Message::RefreshRequest => {
                 if let Some(c) = self.client.as_mut() {
                     c.full_refresh = true;

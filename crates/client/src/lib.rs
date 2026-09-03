@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod connection;
+pub mod fileclip;
 pub mod imageclip;
 pub mod keymap;
 pub mod tunnel;

@@ -83,6 +83,9 @@ pub enum ClientEvent {
     Clipboard(String),
     /// A clipboard image (PNG bytes) from the remote session.
     ClipboardImage(Vec<u8>),
+    /// The session copied files. Fetch them with
+    /// [`Client::request_file`] to put them on the local clipboard.
+    ClipboardFiles(Vec<lynxrdp_proto::FileEntry>),
     /// A file finished downloading to this path.
     FileDownloaded {
         /// Where it was written locally.
@@ -167,6 +170,9 @@ pub struct Client {
     downloads: HashMap<u64, PathBuf>,
     /// An image copied locally, held until the session asks for it.
     pending_image: Option<Vec<u8>>,
+    /// Files this client offered on the clipboard, by the path it advertised.
+    /// The session may only read files that appear here.
+    offered_files: HashMap<String, PathBuf>,
 }
 
 impl std::fmt::Debug for Client {
@@ -304,6 +310,7 @@ impl Client {
             transfers: TransferManager::new(true),
             downloads: HashMap::new(),
             pending_image: None,
+            offered_files: HashMap::new(),
         })
     }
 
@@ -412,6 +419,45 @@ impl Client {
         self.pending_image = Some(png);
         self.send(&Message::ClipboardOffer {
             formats: clipboard_format::PNG,
+        })
+    }
+
+    /// Offer files copied locally to the session.
+    ///
+    /// Only these paths become readable by the session, and only until the
+    /// next clipboard copy replaces them.
+    pub fn offer_clipboard_files(&mut self, paths: &[PathBuf]) -> Result<()> {
+        if self.info.features & features::CLIPBOARD_FILES == 0 {
+            return Ok(());
+        }
+        let mut files = Vec::new();
+        let mut offered = HashMap::new();
+        for p in paths {
+            let meta = match std::fs::metadata(p) {
+                Ok(m) if m.is_file() => m,
+                // Directories would need recursive listing; skip rather than
+                // offering something we cannot deliver.
+                Ok(_) => continue,
+                Err(e) => {
+                    log::debug!("skipping {}: {e}", p.display());
+                    continue;
+                }
+            };
+            let key = p.to_string_lossy().into_owned();
+            files.push(lynxrdp_proto::FileEntry {
+                path: key.clone(),
+                size: meta.len(),
+            });
+            offered.insert(key, p.clone());
+        }
+        if files.is_empty() {
+            return Ok(());
+        }
+        self.offered_files = offered;
+        let id = self.transfers.next_id();
+        self.send(&Message::FileList { id, files })?;
+        self.send(&Message::ClipboardOffer {
+            formats: clipboard_format::FILES,
         })
     }
 
@@ -592,14 +638,61 @@ impl Client {
             }
             Message::CursorPosition { x, y } => Some(ClientEvent::CursorPosition(x, y)),
             Message::ClipboardText { text } => Some(ClientEvent::Clipboard(text)),
+            Message::FileList { files, .. } => Some(ClientEvent::ClipboardFiles(files)),
+            Message::FileRequest { id, path } => {
+                // Serve only what this client put on the clipboard: the
+                // session must not be able to read arbitrary local files.
+                match self.offered_files.get(&path).cloned() {
+                    Some(local) => match std::fs::File::open(&local)
+                        .and_then(|f| f.metadata().map(|m| (f, m.len())))
+                    {
+                        Ok((file, size)) => {
+                            let name = local
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.clone());
+                            let offer = self.transfers.offer_stream_with_id(
+                                id,
+                                TransferPurpose::FileDownload,
+                                name,
+                                size,
+                                Box::new(file),
+                            );
+                            self.send(&offer)?;
+                        }
+                        Err(e) => self.send(&Message::TransferEnd {
+                            id,
+                            ok: false,
+                            message: format!("{}: {e}", local.display()),
+                        })?,
+                    },
+                    None => {
+                        log::warn!("session asked for {path:?}, which was not offered");
+                        self.send(&Message::TransferEnd {
+                            id,
+                            ok: false,
+                            message: "not offered on the clipboard".into(),
+                        })?;
+                    }
+                }
+                None
+            }
             Message::ClipboardOffer { formats } => {
-                // The session copied something; fetch an image only if we
-                // asked for image support in the first place.
+                // The session copied something; ask for the formats we can
+                // actually use. Both are fetched on demand rather than
+                // pushed, so a copy the user never pastes costs nothing.
                 if formats & clipboard_format::PNG != 0
                     && self.info.features & features::CLIPBOARD_IMAGE != 0
                 {
                     self.send(&Message::ClipboardRequest {
                         format: clipboard_format::PNG,
+                    })?;
+                }
+                if formats & clipboard_format::FILES != 0
+                    && self.info.features & features::CLIPBOARD_FILES != 0
+                {
+                    self.send(&Message::ClipboardRequest {
+                        format: clipboard_format::FILES,
                     })?;
                 }
                 None

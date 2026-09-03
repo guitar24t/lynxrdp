@@ -27,6 +27,7 @@ pub mod image;
 pub mod keysym;
 pub mod message;
 pub mod transfer;
+pub mod urilist;
 pub mod wire;
 
 /// Protocol version spoken by this build. Bumped on incompatible changes.

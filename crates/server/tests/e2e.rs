@@ -800,6 +800,109 @@ fn downloading_a_missing_file_fails_cleanly() {
 }
 
 #[test]
+fn clipboard_files_from_the_client_are_staged_for_the_session() {
+    require_xvfb!();
+    if !have("xclip") {
+        eprintln!("SKIP: xclip not installed");
+        return;
+    }
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+
+    let src = tempfile::tempdir().unwrap();
+    let a = src.path().join("alpha.txt");
+    let b = src.path().join("beta.bin");
+    std::fs::write(&a, b"alpha contents").unwrap();
+    std::fs::write(&b, vec![7u8; 5000]).unwrap();
+
+    c.offer_clipboard_files(&[a.clone(), b.clone()]).unwrap();
+
+    // The session should end up with a uri-list naming two staged files.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let staged = loop {
+        let _ = c.poll_event(Duration::from_millis(100));
+        let out = s.x(
+            "xclip",
+            &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
+        );
+        let list = String::from_utf8_lossy(&out.stdout).to_string();
+        let paths = lynxrdp_proto::urilist::parse(&list);
+        if paths.len() == 2 {
+            break paths;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session never saw the file list: {list:?}"
+        );
+    };
+
+    // The staged files must be real, complete copies the session can open.
+    let mut names: Vec<String> = staged
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["alpha.txt", "beta.bin"]);
+    for p in &staged {
+        let content = std::fs::read(p).unwrap();
+        if p.ends_with("alpha.txt") {
+            assert_eq!(content, b"alpha contents");
+        } else {
+            assert_eq!(content, vec![7u8; 5000]);
+        }
+    }
+}
+
+#[test]
+fn clipboard_files_copied_in_the_session_are_offered_to_the_client() {
+    require_xvfb!();
+    if !have("xclip") {
+        eprintln!("SKIP: xclip not installed");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("shared.txt");
+    std::fs::write(&f, b"from the session").unwrap();
+    let list = lynxrdp_proto::urilist::build(std::slice::from_ref(&f));
+
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+
+    // xclip owns the selection, offering a uri-list, for as long as it runs.
+    let mut owner = Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "text/uri-list", "-i"])
+        .env("DISPLAY", &s.display)
+        .env("XAUTHORITY", s.xauth())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    owner
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(list.as_bytes())
+        .unwrap();
+
+    let mut got: Option<Vec<lynxrdp_proto::FileEntry>> = None;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && got.is_none() {
+        if let Ok(Some(ClientEvent::ClipboardFiles(files))) =
+            c.poll_event(Duration::from_millis(200))
+        {
+            got = Some(files);
+        }
+    }
+    let _ = owner.kill();
+    let _ = owner.wait();
+
+    let files = got.expect("client never received the file list");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, f.to_string_lossy());
+    assert_eq!(files[0].size, b"from the session".len() as u64);
+}
+
+#[test]
 fn exit_on_disconnect_ends_session() {
     require_xvfb!();
     let mut s = Session::start(320, 240, "none", &["--exit-on-disconnect"]);

@@ -70,6 +70,10 @@ pub struct App {
     last_image: Option<u64>,
     /// Uploads started by dropping files on the window: (transfer id, name).
     uploads: Vec<(u64, String)>,
+    /// Clipboard files downloaded so far in the current batch.
+    clipboard_files: Vec<std::path::PathBuf>,
+    /// How many clipboard files are still downloading.
+    clipboard_pending: usize,
     last_clipboard_poll: Instant,
     last_ping: Instant,
     rtt: Option<Duration>,
@@ -112,6 +116,8 @@ impl App {
             last_clipboard: None,
             last_image: None,
             uploads: Vec::new(),
+            clipboard_files: Vec::new(),
+            clipboard_pending: 0,
             last_clipboard_poll: Instant::now(),
             last_ping: Instant::now(),
             rtt: None,
@@ -272,8 +278,10 @@ impl App {
                         }
                     }
                     ClientEvent::ClipboardImage(png) => self.on_remote_image(png),
+                    ClientEvent::ClipboardFiles(files) => self.on_remote_files(files),
                     ClientEvent::FileDownloaded { path, name } => {
                         log::info!("downloaded {name} to {}", path.display());
+                        self.on_clipboard_file_ready(path);
                     }
                     ClientEvent::FileUploaded { name } => {
                         log::info!("uploaded {name}");
@@ -371,6 +379,61 @@ impl App {
             }
         }
         self.update_title();
+    }
+
+    /// The session copied files: download them, then offer them locally.
+    fn on_remote_files(&mut self, files: Vec<lynxrdp_proto::FileEntry>) {
+        if files.is_empty() {
+            return;
+        }
+        let dir = match clipboard_staging_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("cannot prepare the clipboard staging directory: {e:#}");
+                return;
+            }
+        };
+        self.clipboard_files.clear();
+        self.clipboard_pending = 0;
+        for f in &files {
+            let name = f.path.rsplit(['/', '\\']).next().unwrap_or("file");
+            let Some(safe) = lynxrdp_proto::transfer::safe_relative_path(name) else {
+                continue;
+            };
+            let dest = dir.join(&safe);
+            match self.client.request_file(&f.path, dest) {
+                Ok(_) => self.clipboard_pending += 1,
+                Err(e) => log::warn!("cannot fetch {}: {e:#}", f.path),
+            }
+        }
+        log::info!(
+            "fetching {} file(s) copied in the session",
+            self.clipboard_pending
+        );
+    }
+
+    /// One staged clipboard file arrived; publish once the batch is complete.
+    fn on_clipboard_file_ready(&mut self, path: std::path::PathBuf) {
+        if self.clipboard_pending == 0 {
+            return;
+        }
+        self.clipboard_files.push(path);
+        self.clipboard_pending -= 1;
+        if self.clipboard_pending > 0 {
+            return;
+        }
+        let files = std::mem::take(&mut self.clipboard_files);
+        match crate::fileclip::write_files(&files) {
+            Ok(()) => log::info!("{} file(s) are on the clipboard", files.len()),
+            Err(e) => {
+                // The files are still on disk, so say where rather than
+                // leaving the user with nothing.
+                log::warn!("could not put the files on the clipboard: {e:#}");
+                for f in &files {
+                    log::info!("downloaded to {}", f.display());
+                }
+            }
+        }
     }
 
     /// Forget an upload that finished or failed.
@@ -674,6 +737,15 @@ impl ApplicationHandler<Wake> for App {
         self.client
             .disconnect(self.exit_reason.as_deref().unwrap_or("client exiting"));
     }
+}
+
+/// Where files copied in the session are downloaded before being offered on
+/// the local clipboard. A file manager pasting them reads them from here, so
+/// they outlive the paste rather than living in a directory we delete.
+pub fn clipboard_staging_dir() -> anyhow::Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(format!("lynxrdp-clipboard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// Largest number of files one drop may upload, so dropping a huge tree

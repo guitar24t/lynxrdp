@@ -49,6 +49,8 @@ struct Atoms {
     incr: xproto::Atom,
     timestamp: xproto::Atom,
     png: xproto::Atom,
+    uri_list: xproto::Atom,
+    gnome_copied: xproto::Atom,
     prop: xproto::Atom,
 }
 
@@ -76,6 +78,8 @@ pub enum ClipboardEvent {
     Text(String),
     /// A PNG image produced in answer to [`Clipboard::request_format`].
     Image(Vec<u8>),
+    /// Files copied inside the session, as local paths.
+    Files(Vec<std::path::PathBuf>),
     /// A requested format turned out to be unavailable after all.
     Unavailable(u32),
 }
@@ -89,6 +93,8 @@ pub struct Clipboard {
     owned_text: Option<String>,
     /// PNG we are currently offering to the session, if any.
     owned_png: Option<Vec<u8>>,
+    /// Staged files we are currently offering to the session, if any.
+    owned_files: Option<Vec<std::path::PathBuf>>,
     fetch: Option<Fetch>,
     /// Formats the current session-side owner advertised.
     available: u32,
@@ -127,6 +133,9 @@ impl Clipboard {
             incr: display.atom("INCR")?,
             timestamp: display.atom("TIMESTAMP")?,
             png: display.atom("image/png")?,
+            uri_list: display.atom("text/uri-list")?,
+            // Nautilus and friends also look for this one when pasting.
+            gnome_copied: display.atom("x-special/gnome-copied-files")?,
             prop: display.atom("LYNXRDP_CLIP")?,
         };
         xfixes::select_selection_input(
@@ -146,6 +155,7 @@ impl Clipboard {
             atoms,
             owned_text: None,
             owned_png: None,
+            owned_files: None,
             fetch: None,
             available: 0,
             last_text: None,
@@ -161,8 +171,9 @@ impl Clipboard {
         }
         self.last_text = Some(text.clone());
         self.owned_text = Some(text);
-        // Replacing the clipboard drops any image we were offering.
+        // Replacing the clipboard drops anything else we were offering.
         self.owned_png = None;
+        self.owned_files = None;
         self.acquire()
     }
 
@@ -174,6 +185,22 @@ impl Clipboard {
         }
         self.owned_png = Some(png);
         self.owned_text = None;
+        self.owned_files = None;
+        self.acquire()
+    }
+
+    /// Offer staged files to applications in the session.
+    ///
+    /// The paths must already exist locally: an X11 selection owner has to be
+    /// able to answer a paste immediately, so the files are staged before
+    /// they are offered rather than fetched on demand.
+    pub fn set_files(&mut self, paths: Vec<std::path::PathBuf>) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.owned_files = Some(paths);
+        self.owned_text = None;
+        self.owned_png = None;
         self.acquire()
     }
 
@@ -189,6 +216,7 @@ impl Clipboard {
             log::warn!("could not acquire CLIPBOARD ownership");
             self.owned_text = None;
             self.owned_png = None;
+            self.owned_files = None;
             return Ok(());
         }
         conn.flush()?;
@@ -197,7 +225,7 @@ impl Clipboard {
 
     /// Whether we currently own the selection.
     pub fn owns_selection(&self) -> bool {
-        self.owned_text.is_some() || self.owned_png.is_some()
+        self.owned_text.is_some() || self.owned_png.is_some() || self.owned_files.is_some()
     }
 
     /// Formats the session currently offers.
@@ -219,6 +247,7 @@ impl Clipboard {
         }
         let target = match format {
             f if f == clipboard_format::PNG => self.atoms.png,
+            f if f == clipboard_format::FILES => self.atoms.uri_list,
             f if f == clipboard_format::TEXT => self.atoms.utf8_string,
             _ => return Ok(()),
         };
@@ -261,6 +290,7 @@ impl Clipboard {
             {
                 self.owned_text = None;
                 self.owned_png = None;
+                self.owned_files = None;
                 Ok(Vec::new())
             }
             _ => Ok(Vec::new()),
@@ -353,6 +383,9 @@ impl Clipboard {
         if has(self.atoms.png) {
             formats |= clipboard_format::PNG;
         }
+        if has(self.atoms.uri_list) || has(self.atoms.gnome_copied) {
+            formats |= clipboard_format::FILES;
+        }
         self.available = formats;
         let mut events = vec![ClipboardEvent::Formats(formats)];
         // Text is small enough to be worth having before the user pastes.
@@ -415,6 +448,14 @@ impl Clipboard {
     }
 
     fn finish(&mut self, format: u32, data: Vec<u8>) -> Vec<ClipboardEvent> {
+        if format == clipboard_format::FILES {
+            let list = String::from_utf8_lossy(&data);
+            let paths = lynxrdp_proto::urilist::parse(&list);
+            if paths.is_empty() {
+                return vec![ClipboardEvent::Unavailable(format)];
+            }
+            return vec![ClipboardEvent::Files(paths)];
+        }
         if format == clipboard_format::PNG {
             if data.is_empty() || data.len() > MAX_CLIPBOARD_IMAGE_BYTES {
                 return vec![ClipboardEvent::Unavailable(format)];
@@ -472,6 +513,10 @@ impl Clipboard {
             if self.owned_png.is_some() {
                 list.push(self.atoms.png);
             }
+            if self.owned_files.is_some() {
+                list.push(self.atoms.uri_list);
+                list.push(self.atoms.gnome_copied);
+            }
             conn.change_property32(
                 PropMode::REPLACE,
                 e.requestor,
@@ -488,6 +533,26 @@ impl Clipboard {
                 property,
                 AtomEnum::INTEGER,
                 &[0u32],
+            )?;
+            return Ok(true);
+        }
+        if e.target == self.atoms.uri_list || e.target == self.atoms.gnome_copied {
+            let Some(files) = self.owned_files.as_ref() else {
+                return Ok(false);
+            };
+            let list = lynxrdp_proto::urilist::build(files);
+            // GNOME's variant is the same list prefixed with the operation.
+            let payload = if e.target == self.atoms.gnome_copied {
+                format!("copy\n{}", list.replace("\r\n", "\n"))
+            } else {
+                list
+            };
+            conn.change_property8(
+                PropMode::REPLACE,
+                e.requestor,
+                property,
+                e.target,
+                payload.as_bytes(),
             )?;
             return Ok(true);
         }
