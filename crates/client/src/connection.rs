@@ -444,12 +444,37 @@ impl Client {
             "the server did not enable file transfer"
         );
         let id = self.transfers.next_id();
+        self.transfers.expect(id);
         self.downloads.insert(id, local);
         self.send(&Message::FileRequest {
             id,
             path: remote.to_string(),
         })?;
         Ok(id)
+    }
+
+    /// Drive the connection until transfer `id` finishes.
+    ///
+    /// Returns the local path for a completed download. Used by the
+    /// command line, which has no event loop of its own.
+    pub fn run_transfer(&mut self, id: u64, timeout: Duration) -> Result<Option<PathBuf>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("transfer timed out");
+            }
+            match self.poll_event(remaining)? {
+                Some(ClientEvent::FileUploaded { .. }) => return Ok(None),
+                Some(ClientEvent::FileDownloaded { path, .. }) => return Ok(Some(path)),
+                Some(ClientEvent::TransferFailed { id: failed, reason }) if failed == id => {
+                    bail!("{reason}")
+                }
+                Some(ClientEvent::Disconnected(reason)) => bail!("disconnected: {reason}"),
+                Some(_) => {}
+                None => bail!("transfer timed out"),
+            }
+        }
     }
 
     /// Progress of a transfer, as (done, total).
@@ -503,6 +528,11 @@ impl Client {
         if let Some((id, reason)) = outcome.failed.into_iter().next() {
             self.downloads.remove(&id);
             return Some(Ok(Some(ClientEvent::TransferFailed { id, reason })));
+        }
+        if let Some((_, purpose, name)) = outcome.sent.into_iter().next() {
+            if purpose == TransferPurpose::FileUpload {
+                return Some(Ok(Some(ClientEvent::FileUploaded { name })));
+            }
         }
         for done in outcome.completed {
             match self.on_completed(done) {

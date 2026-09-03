@@ -625,7 +625,7 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 use crate::message::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Where the bytes of an incoming transfer should go.
 pub enum Sink {
@@ -694,6 +694,8 @@ pub struct Outcome {
     pub completed: Vec<Completed>,
     /// Transfers that failed, with a reason (either direction).
     pub failed: Vec<(u64, String)>,
+    /// Outgoing transfers the peer confirmed it received in full.
+    pub sent: Vec<(u64, TransferPurpose, String)>,
 }
 
 struct Outgoing {
@@ -717,6 +719,10 @@ pub struct TransferManager {
     ids: TransferIds,
     outgoing: HashMap<u64, Outgoing>,
     incoming: HashMap<u64, Incoming>,
+    /// Identifiers we asked the peer to fill, before any offer arrives. A
+    /// refusal names one of these, and without them the failure would have
+    /// nothing to resolve against and the requester would wait forever.
+    pending: HashSet<u64>,
     max_size: u64,
 }
 
@@ -739,6 +745,7 @@ impl TransferManager {
             ids: TransferIds::new(client_side),
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
+            pending: HashSet::new(),
             max_size: MAX_TRANSFER_SIZE,
         }
     }
@@ -756,6 +763,12 @@ impl TransferManager {
     /// Allocate an identifier, for a request the peer will answer.
     pub fn next_id(&mut self) -> u64 {
         self.ids.allocate()
+    }
+
+    /// Note that we have asked the peer for `id`, so that a refusal is
+    /// reported rather than silently ignored.
+    pub fn expect(&mut self, id: u64) {
+        self.pending.insert(id);
     }
 
     /// Offer a blob held in memory. Returns the offer to send.
@@ -804,7 +817,9 @@ impl TransferManager {
 
     /// Abandon a transfer in either direction.
     pub fn cancel(&mut self, id: u64, reason: &str) -> Option<Message> {
-        let known = self.outgoing.remove(&id).is_some() | self.incoming.remove(&id).is_some();
+        let known = self.outgoing.remove(&id).is_some()
+            | self.incoming.remove(&id).is_some()
+            | self.pending.remove(&id);
         known.then(|| Message::TransferEnd {
             id,
             ok: false,
@@ -831,6 +846,7 @@ impl TransferManager {
                     });
                     return Some(out);
                 }
+                self.pending.remove(id);
                 match policy.accept(*id, *purpose, name, *size) {
                     Ok(sink) => {
                         self.incoming.insert(
@@ -905,8 +921,14 @@ impl TransferManager {
             }
             Message::TransferEnd { id, ok, message } => {
                 let was_incoming = self.incoming.remove(id).is_some();
-                let was_outgoing = self.outgoing.remove(id).is_some();
-                if !*ok && (was_incoming || was_outgoing) {
+                let was_pending = self.pending.remove(id);
+                let outgoing = self.outgoing.remove(id);
+                if *ok {
+                    // The peer confirmed it received everything we sent.
+                    if let Some(o) = outgoing {
+                        out.sent.push((*id, o.purpose, o.name));
+                    }
+                } else if was_incoming || was_pending || outgoing.is_some() {
                     out.failed.push((*id, message.clone()));
                 }
             }
@@ -973,9 +995,9 @@ impl TransferManager {
                 }
             }
         }
-        if o.sender.is_complete() {
-            self.outgoing.remove(&id);
-        }
+        // The record stays until the peer confirms with TransferEnd: that is
+        // what tells us the bytes actually landed, and lets a late failure be
+        // reported against the right transfer.
     }
 
     /// Describe a transfer in flight: its purpose, name and progress.
@@ -1071,6 +1093,42 @@ mod manager_tests {
     }
 
     #[test]
+    fn the_sender_learns_when_the_peer_has_it_all() {
+        let mut client = TransferManager::new(true);
+        let mut server = TransferManager::new(false);
+        let offer = client.offer_bytes(
+            TransferPurpose::FileUpload,
+            "report.pdf".into(),
+            vec![5; 5000],
+        );
+        let Message::TransferOffer { id, .. } = offer.clone() else {
+            unreachable!()
+        };
+        let mut policy = MemoryPolicy;
+        // Drive both ends until they settle, collecting what the client saw.
+        let mut queue = vec![(offer, true)];
+        let mut sent = Vec::new();
+        let mut guard = 0;
+        while let Some((msg, to_server)) = queue.pop() {
+            guard += 1;
+            assert!(guard < 10_000);
+            let target = if to_server { &mut server } else { &mut client };
+            if let Some(out) = target.handle(&msg, &mut policy) {
+                if !to_server {
+                    sent.extend(out.sent);
+                }
+                for reply in out.replies.into_iter().rev() {
+                    queue.push((reply, !to_server));
+                }
+            }
+        }
+        assert_eq!(sent.len(), 1, "upload completion was not reported");
+        assert_eq!(sent[0].0, id);
+        assert_eq!(sent[0].1, TransferPurpose::FileUpload);
+        assert_eq!(sent[0].2, "report.pdf");
+    }
+
+    #[test]
     fn an_empty_blob_completes_without_chunks() {
         let mut client = TransferManager::new(true);
         let mut server = TransferManager::new(false);
@@ -1150,6 +1208,41 @@ mod manager_tests {
         ));
         assert_eq!(out.failed.len(), 1);
         assert_eq!(server.in_flight(), (0, 0));
+    }
+
+    #[test]
+    fn a_refused_request_is_reported_to_the_requester() {
+        // The peer cannot produce what we asked for and answers with a bare
+        // TransferEnd. Without expect(), that would resolve against nothing
+        // and the requester would wait forever.
+        let mut client = TransferManager::new(true);
+        let id = client.next_id();
+        client.expect(id);
+        let mut policy = MemoryPolicy;
+        let out = client
+            .handle(
+                &Message::TransferEnd {
+                    id,
+                    ok: false,
+                    message: "/nope.txt: No such file or directory".into(),
+                },
+                &mut policy,
+            )
+            .unwrap();
+        assert_eq!(out.failed.len(), 1);
+        assert!(out.failed[0].1.contains("No such file"), "{:?}", out.failed);
+        // A duplicate is not reported twice.
+        let again = client
+            .handle(
+                &Message::TransferEnd {
+                    id,
+                    ok: false,
+                    message: "again".into(),
+                },
+                &mut policy,
+            )
+            .unwrap();
+        assert!(again.failed.is_empty());
     }
 
     #[test]

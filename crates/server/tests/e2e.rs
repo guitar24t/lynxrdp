@@ -44,12 +44,14 @@ struct Session {
     port: u16,
     display: String,
     runtime_dir: tempfile::TempDir,
+    upload_dir: tempfile::TempDir,
 }
 
 impl Session {
     fn start(width: u32, height: u32, startwm: &str, extra: &[&str]) -> Self {
         let port = free_port();
         let runtime_dir = tempfile::tempdir().unwrap();
+        let upload_dir = tempfile::tempdir().unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_lynxrdp-session"));
         cmd.arg("--listen")
             .arg(format!("127.0.0.1:{port}"))
@@ -65,6 +67,8 @@ impl Session {
             .arg(startwm)
             .arg("--runtime-dir")
             .arg(runtime_dir.path())
+            .arg("--upload-dir")
+            .arg(upload_dir.path())
             .arg("--print-display")
             .arg("--session-id")
             .arg("77")
@@ -94,6 +98,7 @@ impl Session {
             port,
             display,
             runtime_dir,
+            upload_dir,
         }
     }
 
@@ -700,6 +705,98 @@ fn clipboard_image_from_the_session_reaches_the_client() {
         Some(&png[..]),
         "client did not receive the image"
     );
+}
+
+#[test]
+fn a_file_uploads_into_the_session() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+
+    let src = tempfile::tempdir().unwrap();
+    let local = src.path().join("notes.txt");
+    // Large enough to span several chunks and exercise the sliding window.
+    let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&local, &content).unwrap();
+
+    let id = c.send_file(&local, "notes.txt").unwrap();
+    c.run_transfer(id, Duration::from_secs(30)).unwrap();
+
+    let landed = s.upload_dir.path().join("notes.txt");
+    assert_eq!(std::fs::read(&landed).unwrap(), content);
+}
+
+#[test]
+fn an_upload_may_not_escape_the_upload_directory() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+
+    let src = tempfile::tempdir().unwrap();
+    let local = src.path().join("evil.txt");
+    std::fs::write(&local, b"should not land outside").unwrap();
+
+    // The session must refuse a destination that climbs out of the directory.
+    let id = c.send_file(&local, "../../escaped.txt").unwrap();
+    let err = c.run_transfer(id, Duration::from_secs(15)).unwrap_err();
+    assert!(err.to_string().contains("unsafe"), "{err}");
+
+    let escaped = s.upload_dir.path().parent().unwrap().join("escaped.txt");
+    assert!(
+        !escaped.exists(),
+        "the file escaped to {}",
+        escaped.display()
+    );
+}
+
+#[test]
+fn an_upload_into_a_subdirectory_creates_it() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+    let src = tempfile::tempdir().unwrap();
+    let local = src.path().join("a.bin");
+    std::fs::write(&local, b"nested").unwrap();
+    let id = c.send_file(&local, "deep/nested/a.bin").unwrap();
+    c.run_transfer(id, Duration::from_secs(30)).unwrap();
+    assert_eq!(
+        std::fs::read(s.upload_dir.path().join("deep/nested/a.bin")).unwrap(),
+        b"nested"
+    );
+}
+
+#[test]
+fn a_file_downloads_out_of_the_session() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = remote_dir.path().join("report.bin");
+    let content: Vec<u8> = (0..200_000u32).map(|i| (i % 97) as u8).collect();
+    std::fs::write(&remote, &content).unwrap();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let dest = out_dir.path().join("report.bin");
+    let id = c
+        .request_file(remote.to_str().unwrap(), dest.clone())
+        .unwrap();
+    let got = c.run_transfer(id, Duration::from_secs(30)).unwrap();
+    assert_eq!(got.as_deref(), Some(dest.as_path()));
+    assert_eq!(std::fs::read(&dest).unwrap(), content);
+}
+
+#[test]
+fn downloading_a_missing_file_fails_cleanly() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+    let out = tempfile::tempdir().unwrap();
+    let id = c
+        .request_file("/definitely/not/here.txt", out.path().join("x"))
+        .unwrap();
+    let err = c.run_transfer(id, Duration::from_secs(15)).unwrap_err();
+    assert!(err.to_string().contains("here.txt"), "{err}");
 }
 
 #[test]

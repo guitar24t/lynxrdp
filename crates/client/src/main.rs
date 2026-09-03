@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use lynxrdp_client::app::{App, AppOptions};
 use lynxrdp_client::connection::{Client, ConnectOptions};
 use lynxrdp_client::tunnel::{parse_destination, RemoteTarget, Tunnel, TunnelConfig};
@@ -14,22 +14,25 @@ use lynxrdp_client::tunnel::{parse_destination, RemoteTarget, Tunnel, TunnelConf
 #[derive(Parser, Debug)]
 #[command(name = "lynxrdp", version, about, long_about = None)]
 struct Args {
+    /// Transfer files instead of opening a desktop window.
+    #[command(subcommand)]
+    command: Option<Command>,
     /// SSH destination: [user@]host[:port] or a ~/.ssh/config alias.
     destination: Option<String>,
     /// SSH port (overrides a port given in the destination).
-    #[arg(short = 'p', long)]
+    #[arg(global = true, short = 'p', long)]
     port: Option<u16>,
     /// SSH identity file.
-    #[arg(short = 'i', long)]
+    #[arg(global = true, short = 'i', long)]
     identity: Option<PathBuf>,
     /// Extra ssh -o option (repeatable), e.g. -o ProxyJump=bastion
-    #[arg(short = 'o', long = "ssh-option")]
+    #[arg(global = true, short = 'o', long = "ssh-option")]
     ssh_options: Vec<String>,
     /// Path of the ssh executable.
-    #[arg(long, default_value = "ssh")]
+    #[arg(global = true, long, default_value = "ssh")]
     ssh: String,
     /// LynxRDP port on the remote host's loopback interface.
-    #[arg(long, default_value_t = lynxrdp_proto::DEFAULT_PORT)]
+    #[arg(global = true, long, default_value_t = lynxrdp_proto::DEFAULT_PORT)]
     remote_port: u16,
     /// Forward to a Unix socket on the remote host instead of a TCP port.
     #[arg(long)]
@@ -58,6 +61,32 @@ struct Args {
     tunnel_timeout: u64,
 }
 
+/// File transfer subcommands. Each opens the same SSH tunnel the desktop
+/// client uses and talks to the user's existing session.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Copy local files into the session.
+    Send {
+        /// SSH destination: [user@]host[:port].
+        destination: String,
+        /// Files to upload.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Destination directory relative to the session's upload directory.
+        #[arg(long)]
+        into: Option<String>,
+    },
+    /// Copy a file out of the session.
+    Get {
+        /// SSH destination: [user@]host[:port].
+        destination: String,
+        /// Path to read inside the session.
+        remote: String,
+        /// Where to write it locally (default: the file's name here).
+        local: Option<PathBuf>,
+    },
+}
+
 fn parse_size(s: &str) -> Result<(u16, u16), String> {
     let (w, h) = s
         .split_once('x')
@@ -82,6 +111,9 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    if let Some(command) = &args.command {
+        return run_transfer_command(&args, command);
+    }
     let (addr, _tunnel) = match (&args.connect, &args.destination) {
         (Some(addr), _) => {
             if !addr.ip().is_loopback() {
@@ -141,4 +173,84 @@ fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Open a tunnel and a connection to the destination, without a window.
+fn connect_headless(args: &Args, destination: &str) -> Result<(Client, Option<Tunnel>)> {
+    let (dest, port_in_dest) = parse_destination(destination)?;
+    let cfg = TunnelConfig {
+        destination: dest,
+        ssh_port: args.port.or(port_in_dest),
+        identity: args.identity.clone(),
+        options: args.ssh_options.clone(),
+        remote: match &args.remote_socket {
+            Some(p) => RemoteTarget::Socket(p.clone()),
+            None => RemoteTarget::Port(args.remote_port),
+        },
+        local_port: args.local_port,
+        ssh_program: args.ssh.clone(),
+        extra_args: Vec::new(),
+    };
+    let tunnel = Tunnel::open(&cfg, Duration::from_secs(args.tunnel_timeout))?;
+    let opts = ConnectOptions::default();
+    let client = Client::connect(tunnel.local_addr(), &opts, None)
+        .context("connecting to the LynxRDP server")?;
+    Ok((client, Some(tunnel)))
+}
+
+/// How long one file transfer may take before giving up.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3600);
+
+fn run_transfer_command(args: &Args, command: &Command) -> Result<()> {
+    match command {
+        Command::Send {
+            destination,
+            files,
+            into,
+        } => {
+            for f in files {
+                if !f.is_file() {
+                    bail!("{} is not a regular file", f.display());
+                }
+            }
+            let (mut client, _tunnel) = connect_headless(args, destination)?;
+            for local in files {
+                let name = local
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .ok_or_else(|| anyhow::anyhow!("{} has no file name", local.display()))?;
+                let dest = match into {
+                    Some(dir) => format!("{}/{name}", dir.trim_end_matches('/')),
+                    None => name.clone(),
+                };
+                let size = std::fs::metadata(local)?.len();
+                let id = client.send_file(local, &dest)?;
+                client.run_transfer(id, TRANSFER_TIMEOUT)?;
+                println!("sent {} ({size} bytes) as {dest}", local.display());
+            }
+            client.disconnect("transfer complete");
+            Ok(())
+        }
+        Command::Get {
+            destination,
+            remote,
+            local,
+        } => {
+            let dest = match local {
+                Some(p) if p.is_dir() => {
+                    let name = remote.rsplit('/').next().unwrap_or("download");
+                    p.join(name)
+                }
+                Some(p) => p.clone(),
+                None => PathBuf::from(remote.rsplit('/').next().unwrap_or("download")),
+            };
+            let (mut client, _tunnel) = connect_headless(args, destination)?;
+            let id = client.request_file(remote, dest.clone())?;
+            client.run_transfer(id, TRANSFER_TIMEOUT)?;
+            let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+            println!("received {remote} ({size} bytes) into {}", dest.display());
+            client.disconnect("transfer complete");
+            Ok(())
+        }
+    }
 }
