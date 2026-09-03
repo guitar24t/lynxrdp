@@ -330,8 +330,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let port = pick_free_port().unwrap();
-        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        // Bind first and read the port back from the listener we are holding.
+        // Asking for a free port and then re-binding it leaves a window where
+        // the port can be taken, which is exactly what failed on macOS.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 if stream.is_err() {
