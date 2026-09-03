@@ -955,9 +955,13 @@ dependencies = [
  "env_logger",
  "log",
  "lynxrdp-proto",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "png 0.17.16",
  "softbuffer",
  "tempfile",
+ "windows-sys 0.59.0",
  "winit",
  "x11rb",
 ]

@@ -42,7 +42,8 @@ your SSH credentials.
   no scaling, no blurry text.
 * **Clipboard sync** in both directions: text, images (as lossless PNG,
   fetched only when the other side asks, so copying an image you never
-  paste costs nothing), and files copied in the session.
+  paste costs nothing), and files copied in the session — those paste into
+  Explorer, Finder and Linux file managers alike.
 * **File transfer.** Drop files or folders on the window to upload them,
   or use `lynxrdp send host ./file` and `lynxrdp get host ~/file`. Both
   reuse the same SSH tunnel; transfers are chunked and windowed so a large
