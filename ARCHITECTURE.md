@@ -111,6 +111,22 @@ GUI and by the tests. `app.rs` is a winit `ApplicationHandler` on top of it.
 and waits for the local port to accept connections (which OpenSSH only does
 after authentication succeeded).
 
+The binary has two entry points and one process model. Started with a
+destination it opens a session window directly; started with no arguments it
+opens the connection manager (`launcher.rs`, an egui window over
+`profiles.rs`), and **connecting re-invokes the same executable as a child
+process** (`launch.rs`).
+
+That split is forced and then useful. Forced, because a process may hold only
+one winit event loop, and the launcher already holds one — a session cannot
+open its window in the launcher's process. Useful, because several sessions
+can then run at once, a session that dies cannot take the manager with it,
+and the argument list a saved connection produces is exactly what a user
+could have typed, so the GUI and the command line cannot drift apart.
+
+`profiles.rs` holds no credentials of any kind. SSH owns authentication, and
+a second, weaker copy of it on disk would be a liability with no benefit.
+
 ## Monitoring reports
 
 `crates/server/src/reporting.rs` is optional and off by default. When it is

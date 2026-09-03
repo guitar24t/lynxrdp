@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=LynxRDP
+GenericName=Remote Desktop Client
+Comment=Connect to a LynxRDP desktop over SSH
+Exec=lynxrdp
+Icon=lynxrdp
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;rdp;ssh;vnc;
+# Matches the WM_CLASS both the launcher and its session windows set, so the
+# running windows attach to this entry rather than to a generic icon.
+StartupWMClass=lynxrdp
+StartupNotify=true

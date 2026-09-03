@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- LynxRDP application mark: a lynx head, tufted ears and ruff.
+       Kept to flat shapes with one gradient so it stays legible at 16px. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#12a3cb"/>
+      <stop offset="1" stop-color="#0a4761"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <path fill="#f6fafc" d="
+    M 118 198 L 78 62 L 188 148
+    C 220 130 292 130 324 148
+    L 434 62 L 394 198
+    C 408 250 406 292 392 326
+    L 438 350 L 376 366 L 392 404 L 330 402
+    C 306 428 282 442 256 444
+    C 230 442 206 428 182 402
+    L 120 404 L 136 366 L 74 350 L 120 326
+    C 106 292 104 250 118 198 Z"/>
+  <path fill="#12a3cb" d="M 133 186 L 112 108 L 184 170 Z"/>
+  <path fill="#12a3cb" d="M 379 186 L 400 108 L 328 170 Z"/>
+  <ellipse cx="194" cy="258" rx="31" ry="21" fill="#0a3a4f" transform="rotate(-10 194 258)"/>
+  <ellipse cx="318" cy="258" rx="31" ry="21" fill="#0a3a4f" transform="rotate(10 318 258)"/>
+  <path fill="#0a3a4f" d="M 234 320 L 278 320 L 256 344 Z"/>
+</svg>
