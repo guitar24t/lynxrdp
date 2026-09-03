@@ -177,6 +177,22 @@ impl App {
         if self.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
+        // The same WM_CLASS the launcher uses, so a session window groups
+        // with it and picks up the .desktop entry's icon and name.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            attrs = WindowAttributesExtX11::with_name(attrs, crate::APP_ID, crate::APP_ID);
+            attrs = WindowAttributesExtWayland::with_name(attrs, crate::APP_ID, crate::APP_ID);
+        }
+        if let Some(icon) = crate::icon::load() {
+            // `from_rgba` only fails on a length mismatch, which `load` has
+            // already ruled out; either way a missing icon is not fatal.
+            attrs = attrs.with_window_icon(
+                winit::window::Icon::from_rgba(icon.rgba, icon.width, icon.height).ok(),
+            );
+        }
         let window = Arc::new(event_loop.create_window(attrs).context("creating window")?);
         let context = softbuffer::Context::new(window.clone())
             .map_err(|e| anyhow::anyhow!("softbuffer context: {e}"))?;

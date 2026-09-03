@@ -18,6 +18,34 @@ contents:
     dst: /usr/bin/lynxrdp
     file_info:
       mode: 0755
+  # Desktop integration: the entry puts LynxRDP in the applications menu, and
+  # the icons let the menu, the dock and the window manager draw it. The theme
+  # is only rescanned when the cache is touched, which postinstall does.
+  - src: packaging/lynxrdp.desktop
+    dst: /usr/share/applications/lynxrdp.desktop
+  - src: assets/icons/hicolor/16x16/apps/lynxrdp.png
+    dst: /usr/share/icons/hicolor/16x16/apps/lynxrdp.png
+  - src: assets/icons/hicolor/22x22/apps/lynxrdp.png
+    dst: /usr/share/icons/hicolor/22x22/apps/lynxrdp.png
+  - src: assets/icons/hicolor/24x24/apps/lynxrdp.png
+    dst: /usr/share/icons/hicolor/24x24/apps/lynxrdp.png
+  - src: assets/icons/hicolor/32x32/apps/lynxrdp.png
+    dst: /usr/share/icons/hicolor/32x32/apps/lynxrdp.png
+  - src: assets/icons/hicolor/48x48/apps/lynxrdp.png
+    dst: /usr/share/icons/hicolor/48x48/apps/lynxrdp.png
+  - src: assets/icons/hicolor/64x64/apps/lynxrdp.png
+    dst: /usr/share/icons/hicolor/64x64/apps/lynxrdp.png
+  - src: assets/icons/hicolor/128x128/apps/lynxrdp.png
+    dst: /usr/share/icons/hicolor/128x128/apps/lynxrdp.png
+  - src: assets/icons/hicolor/256x256/apps/lynxrdp.png
+    dst: /usr/share/icons/hicolor/256x256/apps/lynxrdp.png
+  - src: assets/icons/hicolor/512x512/apps/lynxrdp.png
+    dst: /usr/share/icons/hicolor/512x512/apps/lynxrdp.png
+  - src: assets/icons/hicolor/scalable/apps/lynxrdp.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/lynxrdp.svg
+scripts:
+  postinstall: packaging/scripts/client-postinstall.sh
+  postremove: packaging/scripts/client-postremove.sh
 overrides:
   deb:
     depends:

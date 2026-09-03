@@ -42,6 +42,21 @@ jobs:
       - run: cargo build --release -p lynxrdp-client --target ${{ matrix.target }}
       - shell: bash
         run: packaging/package-client.sh "${{ matrix.target }}" "${{ matrix.name }}" "${{ matrix.bin }}"
+      - name: Windows installer
+        if: startsWith(matrix.name, 'windows-')
+        shell: bash
+        run: |
+          # NSIS is preinstalled on the windows runners, but not on PATH.
+          export PATH="$PATH:/c/Program Files (x86)/NSIS"
+          packaging/make-setup-exe.sh \
+            "target/${{ matrix.target }}/release/lynxrdp.exe" dist
+      - name: macOS disk image
+        if: startsWith(matrix.name, 'macos-')
+        shell: bash
+        run: |
+          packaging/make-app-bundle.sh \
+            "target/${{ matrix.target }}/release/lynxrdp" stage
+          packaging/make-dmg.sh stage/LynxRDP.app dist "${{ matrix.name }}"
       - uses: actions/upload-artifact@v4
         with:
           name: lynxrdp-client-${{ matrix.name }}

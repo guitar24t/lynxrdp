@@ -5,11 +5,22 @@
 //! top of it, and [`tunnel`] manages the SSH port forward through which the
 //! client reaches the server.
 
+/// Window class and desktop-entry identity.
+///
+/// Must stay equal to `StartupWMClass` in `packaging/lynxrdp.desktop`: that is
+/// what lets a Linux desktop match a running window to its launcher icon.
+pub const APP_ID: &str = "lynxrdp";
+
 pub mod app;
 pub mod connection;
+pub mod console;
 pub mod fileclip;
+pub mod icon;
 pub mod imageclip;
 pub mod keymap;
+pub mod launch;
+pub mod launcher;
+pub mod profiles;
 pub mod tunnel;
 
 /// Name reported to the server.

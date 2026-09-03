@@ -48,6 +48,10 @@ your SSH credentials.
   or use `lynxrdp send host ./file` and `lynxrdp get host ~/file`. Both
   reuse the same SSH tunnel; transfers are chunked and windowed so a large
   file never stalls the interactive screen stream.
+* **A desktop application, not just a command.** The client opens a
+  connection manager with saved connections, and installs like any other
+  program: a Start Menu entry on Windows, `LynxRDP.app` on macOS, an
+  applications-menu entry on Linux. Every command line option is still there.
 * **Pure Rust, tiny dependency surface.** No C libraries are linked at build
   time. The X server (Xvfb) and `libpam` are used at runtime.
 * **Runs without root too.** `lynxrdp-session --listen 127.0.0.1:3390` serves
@@ -96,19 +100,76 @@ sudo lynxrdpd --dump-config    # prints the effective configuration
 
 ## Installing the client
 
-Download the archive for your platform from the releases page and put the
-`lynxrdp` binary somewhere on your `PATH`. Prebuilt archives cover Windows
-x86_64, macOS on Apple Silicon, and Linux x86_64 and aarch64. Intel Macs have
-no prebuilt archive — `cargo build --release -p lynxrdp-client` still targets
-them. You need an OpenSSH client:
+The client is a desktop application. Every platform has an installer on the
+releases page:
+
+| Platform | Download | Installs |
+| --- | --- | --- |
+| Windows 10/11 (x86_64) | `lynxrdp-<version>-windows-x86_64-setup.exe` | Program Files, Start Menu, optional desktop shortcut |
+| macOS (Apple Silicon) | `lynxrdp-<version>-macos-aarch64.dmg` | drag `LynxRDP.app` to Applications |
+| Debian / Ubuntu | `lynxrdp-client_<version>_<arch>.deb` | `/usr/bin/lynxrdp` plus an applications-menu entry |
+| RHEL / Fedora | `lynxrdp-client-<version>.<arch>.rpm` | the same |
+
+Plain archives are published too, for anyone who wants only the binary. The
+macOS archive contains `LynxRDP.app`, with a `lynxrdp` symlink beside it for
+command line use.
+
+Intel Macs have no prebuilt download; `cargo build --release -p lynxrdp-client`
+still targets them.
+
+### The installers are not signed
+
+There is no Apple Developer certificate and no Windows code-signing
+certificate behind this project, so both systems will object the first time:
+
+* **Windows** shows *"Windows protected your PC"*. Click **More info**, then
+  **Run anyway**. The UAC prompt afterwards says *Unknown publisher*, which
+  is the same fact stated twice.
+* **macOS** refuses the first launch outright. Right-click (or Control-click)
+  `LynxRDP.app` and choose **Open**, then **Open** again in the dialog. That
+  registers your consent; ordinary double-clicks work from then on. Under
+  macOS 15 the button may instead be under *System Settings → Privacy &
+  Security → Open Anyway*.
+
+Every release also publishes `SHA256SUMS`, which is the check that actually
+tells you the download is intact.
+
+### You also need an OpenSSH client
 
 * **Windows 10/11**: ships with OpenSSH (`ssh.exe`). Enable it under
   *Settings → Apps → Optional features* if it is missing.
 * **macOS**: included.
 * **Linux**: `openssh-client` / `openssh-clients`, plus `libxkbcommon-x11`
-  (`.deb`/`.rpm` client packages declare these).
+  (the `.deb`/`.rpm` client packages declare these).
 
 ## Connecting
+
+### From the connection manager
+
+Open LynxRDP from the Start Menu, Applications or your desktop's menu — or
+run `lynxrdp` with no arguments — and you get the connection manager: a list
+of saved connections with **Connect**, **New**, **Edit** and **Delete**.
+Double-clicking a connection opens it.
+
+A saved connection holds the host, user, SSH port, identity file, extra
+`ssh -o` options, screen size, and the fullscreen, dynamic-resize and
+clipboard switches. **It never holds a password or a passphrase**: SSH
+already owns authentication, and there is nothing here worth a second,
+weaker copy of it.
+
+They live in one editable TOML file:
+
+| Platform | Path |
+| --- | --- |
+| Linux | `~/.config/lynxrdp/connections.toml` (or `$XDG_CONFIG_HOME`) |
+| macOS | `~/Library/Application Support/LynxRDP/connections.toml` |
+| Windows | `%APPDATA%\LynxRDP\connections.toml` |
+
+Each session opens as its own process, so several can run at once and one
+crashing cannot take the manager with it. Closing the manager leaves running
+sessions alone.
+
+### From the command line
 
 ```sh
 lynxrdp user@server.example.org
@@ -118,6 +179,12 @@ That is all. The client runs `ssh -N -L <local>:127.0.0.1:3390 user@server`,
 waits for the tunnel, connects through it and opens a window. Your SSH
 keys, agent, `~/.ssh/config` aliases, jump hosts and multi-factor prompts
 work exactly as for a shell login.
+
+On Windows the client is a GUI application, so opening it from Explorer never
+flashes up a console. Typed at a prompt it still prints normally — it
+reattaches to the terminal it was started from — but `cmd.exe` returns to the
+prompt without waiting for it to finish, which is inherent to a windowed
+program rather than something the client chooses.
 
 Useful options:
 
@@ -178,7 +245,24 @@ Packages (needs [nfpm](https://nfpm.goreleaser.com/)):
 
 ```sh
 packaging/package-server.sh amd64      # dist/*.deb, dist/*.rpm
+packaging/package-client.sh x86_64-unknown-linux-gnu linux-x86_64 lynxrdp
 ```
+
+Installers:
+
+```sh
+# Windows, needs makensis (NSIS); works on Linux too.
+packaging/make-setup-exe.sh target/release/lynxrdp.exe dist
+
+# macOS, needs a Mac.
+packaging/make-app-bundle.sh target/release/lynxrdp stage
+packaging/make-dmg.sh stage/LynxRDP.app dist
+```
+
+The application icon is committed in every form the packages need, so a
+normal build rasterises nothing. After changing `assets/lynxrdp.svg`, run
+`assets/generate-icons.sh` (needs `librsvg2-bin`, `icoutils`, `icnsutils`)
+and commit what it produces.
 
 If those packages are meant to run on RHEL 9, build the binaries against its
 glibc rather than your own. glibc is backward compatible but not forward, so
@@ -231,7 +315,8 @@ cd tools/lynxrdp-monitor && pip install -r requirements.txt && ./lynxrdp-monitor
 | `crates/proto` | Wire protocol, framing, tile codec, copy detection, keysyms. Shared by both sides. |
 | `crates/server` | `lynxrdpd` (daemon) and `lynxrdp-session` (per-user session). Linux only. |
 | `crates/client` | `lynxrdp` GUI client and the headless client library. |
-| `packaging/` | nfpm configs, systemd unit, PAM files, `startwm.sh`, scripts. |
+| `packaging/` | nfpm configs, systemd unit, PAM files, `startwm.sh`, the NSIS installer, the macOS bundle and disk image scripts. |
+| `assets/` | The application icon: one SVG and the PNG, `.ico` and `.icns` forms generated from it. |
 | `tools/lynxrdp-monitor` | PySide6 viewer for the optional heartbeat reports. |
 | `.github/workflows` | CI (lint, tests, multi-OS client builds, packages) and releases. |
 

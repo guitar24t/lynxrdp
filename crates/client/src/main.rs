@@ -1,4 +1,14 @@
-//! `lynxrdp` command line client.
+//! `lynxrdp`: the desktop client and its command line.
+//!
+//! Started with no arguments it opens the connection manager; with a
+//! destination it opens a session directly. Both are the same binary, and the
+//! launcher starts sessions by re-invoking it.
+
+// Built for the Windows GUI subsystem so that opening the launcher from
+// Explorer does not flash up a console. The command line keeps working:
+// `console::attach_to_parent` rejoins the terminal we were typed into. On
+// every other platform this attribute does nothing.
+#![windows_subsystem = "windows"]
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -100,6 +110,8 @@ fn parse_size(s: &str) -> Result<(u16, u16), String> {
 }
 
 fn main() {
+    // Before the logger: it writes to stderr, which does not exist yet.
+    lynxrdp_client::console::attach_to_parent();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
@@ -141,7 +153,14 @@ fn run() -> Result<()> {
             let tunnel = Tunnel::open(&cfg, Duration::from_secs(args.tunnel_timeout))?;
             (tunnel.local_addr(), Some(tunnel))
         }
-        (None, None) => bail!("usage: lynxrdp [user@]host  (see --help)"),
+        (None, None) => {
+            // No arguments is not a usage error any more: this is a desktop
+            // application, so show the connection manager. The CLI is still
+            // there for anyone who wants it, and for the sessions this
+            // launches, which are this same binary with a destination.
+            let path = lynxrdp_client::launcher::default_path()?;
+            return lynxrdp_client::launcher::run(path);
+        }
     };
 
     let (waker, slot) = lynxrdp_client::app::make_waker();
