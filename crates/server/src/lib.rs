@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod fdpass;
 pub mod handoff;
 pub mod peer;
+pub mod reporting;
 pub mod session;
 pub mod x11;
 pub mod xauth;

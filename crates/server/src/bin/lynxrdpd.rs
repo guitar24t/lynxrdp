@@ -21,6 +21,7 @@ use lynxrdp_server::daemon::manager::SessionManager;
 use lynxrdp_server::daemon::supervisor::{self, SupervisorArgs};
 use lynxrdp_server::daemon::{decide, poll_listeners, send_rejection, Decision};
 use lynxrdp_server::peer;
+use lynxrdp_server::reporting::Reporter;
 
 /// LynxRDP daemon.
 #[derive(Parser, Debug)]
@@ -149,8 +150,23 @@ fn run() -> Result<i32> {
         u.set_nonblocking(true)?;
     }
 
+    // Optional heartbeats to a monitoring server. Outbound only, on its own
+    // thread, and dropped (which stops it) when this function returns.
+    let reporter = match Reporter::start(&cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            // A bad destination is a configuration error worth shouting about,
+            // but it must not stop the daemon serving sessions.
+            log::error!("reporting is enabled but could not start: {e:#}");
+            None
+        }
+    };
+
     while !SHUTDOWN.load(Ordering::SeqCst) {
         manager.reap();
+        if let Some(r) = &reporter {
+            r.set_sessions(manager.count());
+        }
         let ready = match poll_listeners(&fds, Duration::from_secs(1)) {
             Ok(r) => r,
             Err(e) => {

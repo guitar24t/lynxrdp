@@ -81,12 +81,47 @@ your own code as you. The boundary these rules defend is the *client's*
 filesystem against a server that turns out to be hostile, and the server's
 upload directory against a malformed name.
 
+## Monitoring reports
+
+The optional `[reporting]` section is the only part of LynxRDP that speaks to the network of its
+own accord, and it is off unless you switch it on. What it does and does not
+change:
+
+* **It opens nothing.** The daemon only sends. No socket is bound to a
+  wildcard address, no reply is read, and the loopback-only rule above is
+  untouched. Enabling reporting does not make the host reachable in any way
+  it was not already.
+* **It does disclose.** Each interval the hostname, the address the host
+  would be reached on, the LynxRDP version and the number of running sessions
+  go out in the clear as a UDP datagram. Anyone on the path can read that,
+  and it is a tidy map of your estate. Keep it on a management network or a
+  VPN rather than pointing it across the public internet.
+* **Nothing authenticates it.** There is no signature, so anyone who can
+  reach the monitoring port can invent a host, and a real report can be
+  forged or suppressed. The viewer shows claims, not facts. Do not make an
+  access decision from that list. (An HMAC over the payload would fix this
+  and is deliberately not implemented yet; it would need a shared key
+  distributed to every server, which is a bigger change than this feature
+  warranted.)
+* **It is not a control channel.** Reports flow one way. Nothing the
+  monitoring server sends can reach the daemon, because the daemon never
+  reads from the socket.
+
+The viewer treats every datagram as hostile input: size-capped, strictly
+parsed, and stripped of control characters before anything reaches a widget,
+so a malformed or malicious report cannot corrupt its display.
+
+If you do not need any of this, leave `reporting.enabled = false`, which is
+the default, and the code never runs.
+
 ## Hardening tips
 
 * Keep `PermitOpen` in `sshd_config` at its default or restrict it to
   `127.0.0.1:3390` for LynxRDP-only accounts.
 * Use `access.allow_groups = ["lynxrdp"]` to limit who can start desktops.
 * Set `session.idle_timeout_secs` so abandoned sessions do not linger.
+* If `reporting` is on, restrict the monitoring port to the management
+  network with a firewall rule; anyone who can reach it can pollute the view.
 * The daemon has no network exposure, so the remaining attack surface is
   SSH itself: use keys, disable password authentication, keep OpenSSH
   updated.

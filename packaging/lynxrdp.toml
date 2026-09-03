@@ -48,3 +48,22 @@ session_binary = "/usr/bin/lynxrdp-session"
 # Per-user session logs go to <log_dir>/<user>.log.
 #log_dir = "/var/log/lynxrdp"
 dpi = 96
+
+[reporting]
+# Heartbeats to a monitoring server, so an operator can see which machines
+# are up and what address to reach them on. Off by default.
+#
+# This is the only part of LynxRDP that talks to the network by itself. It
+# only ever sends: no port is opened here and nothing is read back, so the
+# loopback-only rule above still holds. What it does do is put this host's
+# name and address on the wire in the clear, once per interval, with no
+# authentication -- see SECURITY.md before crossing an untrusted network.
+#
+# tools/lynxrdp-monitor in the source tree is a viewer for these reports.
+enabled = false
+# Where to send them. IPv6 needs brackets: "[2001:db8::5]:9999".
+#destination = "monitor.example.org:9999"
+# Seconds between reports (5 to 86400).
+interval_secs = 60
+# Reported instead of the system hostname, if you name hosts differently.
+#node_name = "desk01"
