@@ -5,3 +5,8 @@
 *.log
 .DS_Store
 /crates/*/target
+
+# Python (tools/lynxrdp-monitor)
+__pycache__/
+*.py[cod]
+.pytest_cache/

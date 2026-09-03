@@ -111,6 +111,33 @@ GUI and by the tests. `app.rs` is a winit `ApplicationHandler` on top of it.
 and waits for the local port to accept connections (which OpenSSH only does
 after authentication succeeded).
 
+## Monitoring reports
+
+`crates/server/src/reporting.rs` is optional and off by default. When it is
+on, the daemon sends one JSON datagram per interval to a monitoring server.
+
+It runs on its own thread rather than in the accept loop, for one reason:
+resolving a name can block for seconds and the accept loop cannot afford to
+wait. The thread reads the live session count through an `AtomicUsize`, so it
+never contends with connection handling.
+
+The source address in the report is not guessed. The thread connects a UDP
+socket to the destination and asks the kernel what local address it chose,
+which is the address the monitoring server will actually see -- correct on a
+multi-homed host, where picking the "first" interface would not be.
+
+UDP is deliberate: a monitoring server that is down, slow or absent must cost
+the daemon nothing, and a lost report costs one interval of staleness.
+
+`reporting/seal.rs` wraps each datagram in ChaCha20-Poly1305 under a key
+derived from baked-in constants, mirrored by the viewer's `crypto.py`. The
+two are pinned to each other by a known-answer test on the derived key on
+both sides, plus a datagram captured from a real server that the Python tests
+must be able to open -- drift between the implementations fails a test rather
+than silencing every deployed viewer at once. The format carries a magic and
+a version byte, authenticated as associated data, so a later change to the
+scheme need not be a flag day.
+
 ## Testing strategy
 
 * Pure logic (codec, framing, key mapping, `/proc/net/tcp` parsing, access

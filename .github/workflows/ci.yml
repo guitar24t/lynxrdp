@@ -98,6 +98,33 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  monitor:
+    name: Monitor viewer (Python)
+    needs: [lint]
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: tools/lynxrdp-monitor
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install --quiet -r requirements.txt pytest
+      - name: Qt runtime libraries
+        # PySide6 wheels link these but do not ship them.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libegl1 libgl1 libxkbcommon-x11-0 \
+            libdbus-1-3 libfontconfig1
+      - name: Tests
+        # The GUI tests drive a real window under Qt's offscreen platform, so
+        # no display is needed.
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests/ -q
+
   package-server:
     name: Server packages (${{ matrix.name }})
     needs: [lint]

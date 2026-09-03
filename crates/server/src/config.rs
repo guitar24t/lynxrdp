@@ -19,6 +19,8 @@ pub struct Config {
     pub access: AccessConfig,
     /// Per-user session settings.
     pub session: SessionConfig,
+    /// Optional heartbeat reports to a monitoring server.
+    pub reporting: ReportingConfig,
 }
 
 /// Where the daemon listens.
@@ -47,6 +49,39 @@ pub struct AccessConfig {
     pub allow_groups: Vec<String>,
     /// These user names are always refused.
     pub deny_users: Vec<String>,
+}
+
+/// Heartbeat reports to a monitoring server.
+///
+/// This is the one part of LynxRDP that talks to the network on its own, so
+/// it is off unless switched on. The daemon only ever *sends*: no port is
+/// opened and nothing is accepted in reply, so enabling it does not widen
+/// the attack surface of the host. What it does do is put the hostname and
+/// address of this machine on the wire in the clear, once per interval --
+/// see SECURITY.md before pointing it across an untrusted network.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReportingConfig {
+    /// Whether to send reports at all.
+    pub enabled: bool,
+    /// Where to send them, as `host:port`. The host may be a name or an
+    /// address; names are resolved once when the reporter starts.
+    pub destination: String,
+    /// Seconds between reports.
+    pub interval_secs: u64,
+    /// Name to report instead of the system hostname.
+    pub node_name: Option<String>,
+}
+
+impl Default for ReportingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            destination: String::new(),
+            interval_secs: 60,
+            node_name: None,
+        }
+    }
 }
 
 /// Session settings (used by `lynxrdpd` when spawning `lynxrdp-session`).
@@ -186,6 +221,27 @@ impl Config {
         if s.dpi < 48 || s.dpi > 480 {
             bail!("session.dpi must be between 48 and 480");
         }
+        let r = &self.reporting;
+        if r.enabled {
+            if r.destination.trim().is_empty() {
+                bail!("reporting.destination is required when reporting.enabled is true");
+            }
+            // Checked here rather than at first send so a typo is caught by
+            // `lynxrdpd --check` instead of failing silently once a minute.
+            crate::reporting::split_destination(&r.destination)
+                .with_context(|| format!("reporting.destination {:?}", r.destination))?;
+            if r.interval_secs < 5 {
+                bail!("reporting.interval_secs must be at least 5");
+            }
+            if r.interval_secs > 86400 {
+                bail!("reporting.interval_secs must be at most 86400 (a day)");
+            }
+            if let Some(name) = &r.node_name {
+                if name.trim().is_empty() {
+                    bail!("reporting.node_name must not be blank when set");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -228,6 +284,51 @@ mod tests {
     #[test]
     fn unknown_keys_rejected() {
         assert!(Config::from_toml("[listen]\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn reporting_is_off_by_default() {
+        let cfg = Config::default();
+        assert!(!cfg.reporting.enabled);
+        assert!(cfg.reporting.destination.is_empty());
+        // A blank destination is fine as long as reporting stays off.
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn reporting_needs_a_destination_when_enabled() {
+        let err = Config::from_toml("[reporting]\nenabled = true\n").unwrap_err();
+        assert!(err.to_string().contains("destination"), "{err:#}");
+    }
+
+    #[test]
+    fn reporting_destination_is_checked_at_load_time() {
+        // The point is that --check catches a typo, rather than the daemon
+        // failing quietly once per interval forever.
+        let err =
+            Config::from_toml("[reporting]\nenabled = true\ndestination = \"no-port-here\"\n")
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("host:port"), "{err:#}");
+    }
+
+    #[test]
+    fn reporting_interval_is_bounded() {
+        let base = "[reporting]\nenabled = true\ndestination = \"m:9\"\n";
+        assert!(Config::from_toml(&format!("{base}interval_secs = 4\n")).is_err());
+        assert!(Config::from_toml(&format!("{base}interval_secs = 5\n")).is_ok());
+        assert!(Config::from_toml(&format!("{base}interval_secs = 86400\n")).is_ok());
+        assert!(Config::from_toml(&format!("{base}interval_secs = 86401\n")).is_err());
+    }
+
+    #[test]
+    fn reporting_roundtrips_through_toml() {
+        let mut cfg = Config::default();
+        cfg.reporting.enabled = true;
+        cfg.reporting.destination = "monitor.example.org:9999".into();
+        cfg.reporting.interval_secs = 30;
+        cfg.reporting.node_name = Some("desk01".into());
+        cfg.validate().unwrap();
+        assert_eq!(Config::from_toml(&cfg.to_toml()).unwrap(), cfg);
     }
 
     #[test]

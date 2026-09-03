@@ -52,6 +52,9 @@ your SSH credentials.
   time. The X server (Xvfb) and `libpam` are used at runtime.
 * **Runs without root too.** `lynxrdp-session --listen 127.0.0.1:3390` serves
   your own session with the same security property, no daemon needed.
+* **Optional fleet view.** Servers can report their hostname and address to a
+  monitoring server on an interval, and `tools/lynxrdp-monitor` shows who is
+  up and copies an address to the clipboard. Off by default, outbound only.
 
 Supported server distributions: RHEL 9 (and derivatives), Ubuntu 24.04 and
 26.04, and in practice any Linux with systemd, Xvfb and PAM.
@@ -189,6 +192,38 @@ packaging/check-glibc-floor.sh target/release/lynxrdpd
 
 fails if a binary needs anything newer than the floor.
 
+## Watching a fleet
+
+Servers can send a heartbeat to a monitoring server so you can see which
+machines are up and what address to reach them on:
+
+```toml
+# /etc/lynxrdp/lynxrdp.toml
+[reporting]
+enabled = true
+destination = "monitor.example.org:9999"
+interval_secs = 60
+#node_name = "desk01"          # if you name hosts differently
+```
+
+Each interval the daemon sends one small datagram with its hostname, the
+address it would be reached on, the version and how many sessions are
+running. It only ever sends: no port is opened, so the loopback-only rule is
+unchanged.
+
+Reports are sealed with ChaCha20-Poly1305 so a packet capture does not read
+as a list of your hostnames. The key is baked into the software, so this is
+obfuscation rather than confidentiality — anyone holding the binary can
+recover the key. Keep reports on a management network; see
+[SECURITY.md](SECURITY.md) for exactly what that does and does not buy.
+
+[`tools/lynxrdp-monitor`](tools/lynxrdp-monitor) is a small PySide6 viewer
+that listens for them, lists the hosts and copies an address to the clipboard:
+
+```sh
+cd tools/lynxrdp-monitor && pip install -r requirements.txt && ./lynxrdp-monitor
+```
+
 ## Repository layout
 
 | Path | What |
@@ -197,6 +232,7 @@ fails if a binary needs anything newer than the floor.
 | `crates/server` | `lynxrdpd` (daemon) and `lynxrdp-session` (per-user session). Linux only. |
 | `crates/client` | `lynxrdp` GUI client and the headless client library. |
 | `packaging/` | nfpm configs, systemd unit, PAM files, `startwm.sh`, scripts. |
+| `tools/lynxrdp-monitor` | PySide6 viewer for the optional heartbeat reports. |
 | `.github/workflows` | CI (lint, tests, multi-OS client builds, packages) and releases. |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for how it works and
