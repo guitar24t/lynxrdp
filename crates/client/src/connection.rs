@@ -186,9 +186,10 @@ impl Client {
                 loop {
                     match read_message(&mut reader) {
                         Ok(msg) => {
-                            if let Message::ScreenUpdate { tiles, .. } = &msg {
+                            if let Message::ScreenUpdate { copies, tiles, .. } = &msg {
                                 let n: usize = tiles.iter().map(|t| t.data.len() + 13).sum();
-                                *counter.lock().unwrap() += n as u64 + 16;
+                                *counter.lock().unwrap() +=
+                                    n as u64 + 16 + (copies.len() * 12) as u64;
                             }
                             if tx.send(msg).is_err() {
                                 break;
@@ -357,10 +358,14 @@ impl Client {
 
     fn handle(&mut self, msg: Message) -> Result<Option<ClientEvent>> {
         Ok(match msg {
-            Message::ScreenUpdate { frame_id, tiles } => {
+            Message::ScreenUpdate {
+                frame_id,
+                copies,
+                tiles,
+            } => {
                 let dirty = self
                     .decoder
-                    .apply(&tiles)
+                    .apply_frame(&copies, &tiles)
                     .context("applying screen update")?;
                 self.frames_received += 1;
                 // Acknowledge as soon as the frame is decoded; painting is
@@ -507,6 +512,7 @@ mod tests {
             hello(100, 50),
             Message::ScreenUpdate {
                 frame_id: 1,
+                copies: vec![],
                 tiles: vec![TileUpdate {
                     rect: Rect::new(10, 10, 5, 5),
                     encoding: TileEncoding::Solid,

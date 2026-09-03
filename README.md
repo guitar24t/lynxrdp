@@ -30,8 +30,14 @@ your SSH credentials.
   desktop keeps running. Sessions also survive daemon restarts and package
   upgrades.
 * **Low latency by design.** Damage tracking, shared-memory capture, tile
-  diffing with LZ4, local cursor rendering, ack-based flow control that
-  never lets stale frames queue up, `TCP_NODELAY` everywhere.
+  diffing, local cursor rendering, ack-based flow control that never lets
+  stale frames queue up, `TCP_NODELAY` everywhere.
+* **A codec built for text, not video.** Lossless, so glyph edges stay
+  sharp and the client's screen is bit-identical to the server's. Scrolling
+  is sent as a copy rectangle rather than re-encoded (measured 40x smaller
+  for line-by-line scrolling), tiles of flat colour become a palette with
+  1–8 bit indices, and payloads are compressed with whichever of LZ4 or
+  Zstd is smaller. An idle screen costs zero bytes.
 * **Dynamic resolution.** Resize the window and the remote screen follows;
   no scaling, no blurry text.
 * **Clipboard sync** (text) in both directions.
@@ -165,7 +171,7 @@ packaging/package-server.sh amd64      # dist/*.deb, dist/*.rpm
 
 | Path | What |
 | --- | --- |
-| `crates/proto` | Wire protocol, framing, tile codec, keysyms. Shared by both sides. |
+| `crates/proto` | Wire protocol, framing, tile codec, copy detection, keysyms. Shared by both sides. |
 | `crates/server` | `lynxrdpd` (daemon) and `lynxrdp-session` (per-user session). Linux only. |
 | `crates/client` | `lynxrdp` GUI client and the headless client library. |
 | `packaging/` | nfpm configs, systemd unit, PAM files, `startwm.sh`, scripts. |

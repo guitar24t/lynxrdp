@@ -20,7 +20,7 @@
 //! changes in the meantime, so a slow link never builds up a queue of stale
 //! frames — that is what keeps interaction latency low.
 
-use crate::codec::{TileEncoding, TileUpdate};
+use crate::codec::{CopyRect, TileEncoding, TileUpdate};
 use crate::image::Rect;
 use crate::wire::{DecodeError, Reader, Writer};
 
@@ -249,10 +249,13 @@ pub enum Message {
     },
     /// The client asks for a full screen retransmission.
     RefreshRequest,
-    /// A batch of changed screen tiles.
+    /// A batch of screen changes: regions moved from elsewhere in the
+    /// previous frame, then freshly encoded tiles.
     ScreenUpdate {
         /// Monotonic frame identifier.
         frame_id: u64,
+        /// Regions copied from the previous frame. Applied before `tiles`.
+        copies: Vec<CopyRect>,
         /// Changed rectangles.
         tiles: Vec<TileUpdate>,
     },
@@ -285,6 +288,8 @@ pub enum Message {
 
 /// Maximum number of tiles accepted in one screen update.
 pub const MAX_TILES_PER_UPDATE: usize = 65_536;
+/// Maximum number of copy rectangles accepted in one screen update.
+pub const MAX_COPIES_PER_UPDATE: usize = 4_096;
 /// Maximum cursor dimension accepted.
 pub const MAX_CURSOR_DIM: u16 = 256;
 
@@ -323,8 +328,8 @@ impl Message {
 
     fn size_hint(&self) -> usize {
         match self {
-            Message::ScreenUpdate { tiles, .. } => {
-                16 + tiles.iter().map(|t| t.data.len() + 16).sum::<usize>()
+            Message::ScreenUpdate { copies, tiles, .. } => {
+                16 + copies.len() * 12 + tiles.iter().map(|t| t.data.len() + 16).sum::<usize>()
             }
             Message::CursorShape { cursor } => 16 + cursor.argb.len() * 4,
             Message::ClipboardText { text } => 8 + text.len(),
@@ -395,8 +400,21 @@ impl Message {
             Message::Ping { nonce } | Message::Pong { nonce } => w.u64(*nonce),
             Message::Disconnect { reason } => w.string(reason),
             Message::RefreshRequest => {}
-            Message::ScreenUpdate { frame_id, tiles } => {
+            Message::ScreenUpdate {
+                frame_id,
+                copies,
+                tiles,
+            } => {
                 w.u64(*frame_id);
+                w.u32(copies.len() as u32);
+                for c in copies {
+                    w.u16(c.src_x as u16);
+                    w.u16(c.src_y as u16);
+                    w.u16(c.dest.x as u16);
+                    w.u16(c.dest.y as u16);
+                    w.u16(c.dest.width as u16);
+                    w.u16(c.dest.height as u16);
+                }
                 w.u32(tiles.len() as u32);
                 for t in tiles {
                     w.u16(t.rect.x as u16);
@@ -484,6 +502,33 @@ impl Message {
             Kind::RefreshRequest => Message::RefreshRequest,
             Kind::ScreenUpdate => {
                 let frame_id = r.u64()?;
+                let n_copies = r.u32()? as usize;
+                if n_copies > MAX_COPIES_PER_UPDATE {
+                    return Err(DecodeError::LengthTooLarge(n_copies));
+                }
+                if n_copies.saturating_mul(12) > r.remaining() {
+                    return Err(DecodeError::UnexpectedEof {
+                        needed: n_copies * 12,
+                        remaining: r.remaining(),
+                    });
+                }
+                let mut copies = Vec::with_capacity(n_copies);
+                for _ in 0..n_copies {
+                    let src_x = u32::from(r.u16()?);
+                    let src_y = u32::from(r.u16()?);
+                    let x = u32::from(r.u16()?);
+                    let y = u32::from(r.u16()?);
+                    let width = u32::from(r.u16()?);
+                    let height = u32::from(r.u16()?);
+                    if width == 0 || height == 0 {
+                        return Err(DecodeError::InvalidValue("copy size"));
+                    }
+                    copies.push(CopyRect {
+                        src_x,
+                        src_y,
+                        dest: Rect::new(x, y, width, height),
+                    });
+                }
                 let n = r.u32()? as usize;
                 if n > MAX_TILES_PER_UPDATE {
                     return Err(DecodeError::LengthTooLarge(n));
@@ -512,7 +557,11 @@ impl Message {
                         data,
                     });
                 }
-                Message::ScreenUpdate { frame_id, tiles }
+                Message::ScreenUpdate {
+                    frame_id,
+                    copies,
+                    tiles,
+                }
             }
             Kind::ScreenResized => Message::ScreenResized {
                 width: r.u16()?,
@@ -608,6 +657,18 @@ mod tests {
             Message::RefreshRequest,
             Message::ScreenUpdate {
                 frame_id: 3,
+                copies: vec![
+                    CopyRect {
+                        src_x: 0,
+                        src_y: 40,
+                        dest: Rect::new(0, 0, 320, 200),
+                    },
+                    CopyRect {
+                        src_x: 5,
+                        src_y: 5,
+                        dest: Rect::new(9, 9, 1, 1),
+                    },
+                ],
                 tiles: vec![
                     TileUpdate {
                         rect: Rect::new(0, 0, 2, 2),
@@ -682,9 +743,47 @@ mod tests {
     }
 
     #[test]
+    fn zero_sized_copy_rejected() {
+        let m = Message::ScreenUpdate {
+            frame_id: 1,
+            copies: vec![CopyRect {
+                src_x: 0,
+                src_y: 0,
+                dest: Rect::new(0, 0, 4, 0),
+            }],
+            tiles: vec![],
+        };
+        assert_eq!(
+            Message::decode(&m.encode()),
+            Err(DecodeError::InvalidValue("copy size"))
+        );
+    }
+
+    #[test]
+    fn absurd_copy_count_rejected() {
+        let mut w = Writer::new();
+        w.u8(Kind::ScreenUpdate as u8);
+        w.u64(1);
+        w.u32(100_000);
+        assert!(matches!(
+            Message::decode(w.as_slice()),
+            Err(DecodeError::LengthTooLarge(_))
+        ));
+        let mut w = Writer::new();
+        w.u8(Kind::ScreenUpdate as u8);
+        w.u64(1);
+        w.u32(1_000);
+        assert!(matches!(
+            Message::decode(w.as_slice()),
+            Err(DecodeError::UnexpectedEof { .. })
+        ));
+    }
+
+    #[test]
     fn zero_sized_tile_rejected() {
         let m = Message::ScreenUpdate {
             frame_id: 1,
+            copies: vec![],
             tiles: vec![TileUpdate {
                 rect: Rect::new(0, 0, 0, 1),
                 encoding: TileEncoding::Solid,
@@ -702,11 +801,13 @@ mod tests {
         let mut w = Writer::new();
         w.u8(Kind::ScreenUpdate as u8);
         w.u64(1);
+        w.u32(0);
         w.u32(1_000_000);
         assert!(Message::decode(w.as_slice()).is_err());
         let mut w = Writer::new();
         w.u8(Kind::ScreenUpdate as u8);
         w.u64(1);
+        w.u32(0);
         w.u32(10_000);
         assert!(matches!(
             Message::decode(w.as_slice()),

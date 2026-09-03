@@ -39,10 +39,23 @@ Frame pipeline:
    (`XDamageSubtract` + `XFixesFetchRegion`), coalesced into tile-aligned
    rectangles, and captured with `XShmGetImage` (one request per
    rectangle, or the whole screen when damage is widespread).
-3. The encoder compares each 64×64 tile against the reference frame,
-   trims to the bounding box of changed pixels, and emits `Solid`, `Lz4`
-   or `Raw` tiles.
-4. The `ScreenUpdate` is queued to the writer thread. `max_in_flight`
+3. Before diffing, the encoder looks for a vertical translation between
+   the reference frame and the new one (row hashes propose a shift, then
+   the pixels are compared to confirm it). A match becomes a `CopyRect`:
+   the client moves pixels it already holds, so scrolling costs a dozen
+   bytes instead of a screenful.
+4. The encoder then compares each 64×64 tile against the reference frame
+   and trims to the bounding box of changed pixels. Each tile is stored
+   either as packed 24-bit RGB or, when it has at most 256 distinct
+   colours, as a palette plus 1/2/4/8-bit indices — whichever is smaller —
+   and then compressed with LZ4 or Zstd if that shrinks it further. A
+   single-colour tile short-circuits to three bytes.
+
+   The codec is lossless throughout: the client's framebuffer is always
+   bit-identical to the server's, which is what keeps text crisp and lets
+   the property tests assert exact round-trips.
+5. The copies and tiles are batched into one `ScreenUpdate`, which is
+   queued to the writer thread. `max_in_flight`
    (default 2) frames may be unacknowledged; further damage accumulates
    and is sent as one frame after the next ack. The client therefore never
    has a backlog of stale frames.

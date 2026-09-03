@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{after, never, select, Receiver, Sender};
-use lynxrdp_proto::codec::Encoder;
+use lynxrdp_proto::codec::{Encoder, FrameUpdate};
 use lynxrdp_proto::frame::frame_message;
 use lynxrdp_proto::message::{features, reject, CursorImage};
 use lynxrdp_proto::{Framebuffer, Message, Rect, PROTOCOL_VERSION, TILE_SIZE};
@@ -727,25 +727,33 @@ impl Core {
         for r in &rects {
             self.capture.capture_into(&mut self.screen, r)?;
         }
-        let tiles = self.encoder.encode_regions(&self.screen, &rects);
+        // A full refresh resets the reference frame, so there is no previous
+        // frame a copy could reference; skip scroll detection in that case.
+        let frame = self.encoder.encode_frame(&self.screen, &rects, !full);
         let Some(c) = self.client.as_mut() else {
             return Ok(());
         };
         c.full_refresh = false;
-        if tiles.is_empty() {
+        if frame.is_empty() {
             return Ok(());
         }
+        let FrameUpdate { copies, tiles } = frame;
         let frame_id = c.next_frame_id;
         c.next_frame_id += 1;
         let bytes: usize = tiles.iter().map(|t| t.data.len()).sum();
         log::trace!(
-            "frame {frame_id}: {} rects -> {} tiles, {} bytes, {:.2} ms",
+            "frame {frame_id}: {} rects -> {} copies + {} tiles, {} bytes, {:.2} ms",
             rects.len(),
+            copies.len(),
             tiles.len(),
             bytes,
             started.elapsed().as_secs_f64() * 1000.0
         );
-        if !c.send(&Message::ScreenUpdate { frame_id, tiles }) {
+        if !c.send(&Message::ScreenUpdate {
+            frame_id,
+            copies,
+            tiles,
+        }) {
             self.drop_client(None)?;
             return Ok(());
         }

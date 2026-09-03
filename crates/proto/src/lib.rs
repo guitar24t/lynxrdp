@@ -29,7 +29,7 @@ pub mod message;
 pub mod wire;
 
 /// Protocol version spoken by this build. Bumped on incompatible changes.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Default TCP port the server listens on (loopback only).
 pub const DEFAULT_PORT: u16 = 3390;
@@ -41,5 +41,6 @@ pub const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 /// Tile size in pixels used by the screen codec.
 pub const TILE_SIZE: u32 = 64;
 
+pub use codec::{CopyRect, FrameUpdate};
 pub use image::{Framebuffer, Rect};
 pub use message::Message;

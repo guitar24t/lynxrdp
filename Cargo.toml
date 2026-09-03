@@ -20,6 +20,7 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 lz4_flex = { version = "0.14", default-features = false, features = ["safe-encode", "safe-decode", "std"] }
+zstd = "0.13"
 proptest = "1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
