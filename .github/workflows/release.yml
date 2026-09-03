@@ -3,6 +3,14 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Lets a build be cut without pushing a tag, which matters where tag
+  # pushes are not available. The tag is created by the release step.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create for this release, e.g. v0.1.0-rc.1"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -84,8 +92,9 @@ jobs:
           files: release/*
           generate_release_notes: true
           draft: false
+          tag_name: ${{ inputs.tag || github.ref_name }}
           # Semver: a hyphen in the tag means a prerelease, so v0.1.0-rc.1 is
           # marked as one and v0.1.0 is not. The packages themselves keep the
           # Cargo.toml version, because an RPM Version field cannot contain a
           # hyphen and nfpm would have to mangle it.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
