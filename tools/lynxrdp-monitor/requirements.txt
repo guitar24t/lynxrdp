@@ -1,1 +1,5 @@
 PySide6>=6.5
+# Reports are sealed with ChaCha20-Poly1305; this provides it. Note that the
+# Debian-packaged python3-cryptography has been seen to fail on import in
+# minimal containers -- install from PyPI as here rather than relying on it.
+cryptography>=41

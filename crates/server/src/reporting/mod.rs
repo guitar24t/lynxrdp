@@ -16,7 +16,11 @@
 //!   accept loop cannot afford to. The thread reads the live session count
 //!   through an atomic, so it never takes a lock the accept loop holds.
 //!
-//! The payload is not authenticated or encrypted. See SECURITY.md.
+//! Datagrams are sealed with ChaCha20-Poly1305 under a key baked into the
+//! software (see [`seal`]), so a packet capture does not read as an inventory
+//! of hostnames. That key is not secret from anyone holding the binary, so
+//! this is obfuscation rather than confidentiality -- SECURITY.md is explicit
+//! about the difference.
 
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -26,10 +30,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
+pub mod seal;
+
 use crate::config::Config;
 
-/// Largest datagram we will build. Well under any sane MTU, so a report is
-/// never fragmented; the fields are all short and bounded.
+/// Largest *plaintext* report we will build. Sealing adds
+/// [`seal::HEADER_LEN`] + [`seal::TAG_LEN`] bytes on top, and the total stays
+/// well under any sane MTU, so a report is never fragmented.
 pub const MAX_REPORT_BYTES: usize = 1200;
 
 /// Longest hostname or node name we will report, in bytes.
@@ -297,7 +304,8 @@ fn send_once(
             body.len()
         );
     }
-    sock.send(body.as_bytes())
+    let datagram = seal::seal(body.as_bytes())?;
+    sock.send(&datagram)
         .with_context(|| format!("sending a report to {dest}"))?;
     Ok(())
 }

@@ -206,11 +206,16 @@ interval_secs = 60
 #node_name = "desk01"          # if you name hosts differently
 ```
 
-Each interval the daemon sends one small JSON datagram with its hostname,
-the address it would be reached on, the version and how many sessions are
+Each interval the daemon sends one small datagram with its hostname, the
+address it would be reached on, the version and how many sessions are
 running. It only ever sends: no port is opened, so the loopback-only rule is
-unchanged. The reports are not authenticated or encrypted, so keep them on a
-management network — see [SECURITY.md](SECURITY.md).
+unchanged.
+
+Reports are sealed with ChaCha20-Poly1305 so a packet capture does not read
+as a list of your hostnames. The key is baked into the software, so this is
+obfuscation rather than confidentiality — anyone holding the binary can
+recover the key. Keep reports on a management network; see
+[SECURITY.md](SECURITY.md) for exactly what that does and does not buy.
 
 [`tools/lynxrdp-monitor`](tools/lynxrdp-monitor) is a small PySide6 viewer
 that listens for them, lists the hosts and copies an address to the clipboard:

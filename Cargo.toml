@@ -27,6 +27,10 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
+# Obfuscation of monitoring reports. Pure Rust, so the "no C libraries"
+# property of the build is preserved.
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3

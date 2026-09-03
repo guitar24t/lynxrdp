@@ -129,6 +129,15 @@ multi-homed host, where picking the "first" interface would not be.
 UDP is deliberate: a monitoring server that is down, slow or absent must cost
 the daemon nothing, and a lost report costs one interval of staleness.
 
+`reporting/seal.rs` wraps each datagram in ChaCha20-Poly1305 under a key
+derived from baked-in constants, mirrored by the viewer's `crypto.py`. The
+two are pinned to each other by a known-answer test on the derived key on
+both sides, plus a datagram captured from a real server that the Python tests
+must be able to open -- drift between the implementations fails a test rather
+than silencing every deployed viewer at once. The format carries a magic and
+a version byte, authenticated as associated data, so a later change to the
+scheme need not be a flag day.
+
 ## Testing strategy
 
 * Pure logic (codec, framing, key mapping, `/proc/net/tcp` parsing, access

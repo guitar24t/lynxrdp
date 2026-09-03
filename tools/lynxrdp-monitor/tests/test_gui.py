@@ -23,6 +23,7 @@ from PySide6.QtGui import QGuiApplication  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from lynxrdp_monitor.app import COL_IP, COL_NODE, MonitorWindow  # noqa: E402
+from lynxrdp_monitor.crypto import seal  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -42,11 +43,16 @@ def window(qapp):
 
 
 def send(window: MonitorWindow, obj: dict) -> None:
-    """Send one datagram to the window's socket and let Qt deliver it."""
+    """Send one sealed datagram to the window's socket, as a server would."""
+    send_raw(window, seal(json.dumps(obj).encode()))
+
+
+def send_raw(window: MonitorWindow, data: bytes) -> None:
+    """Send raw bytes, for the cases that are deliberately not valid."""
     port = window.socket.localPort()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.sendto(json.dumps(obj).encode(), ("127.0.0.1", port))
+        sock.sendto(data, ("127.0.0.1", port))
     finally:
         sock.close()
     spin(150)
@@ -102,17 +108,31 @@ def test_several_hosts_each_get_a_row(window):
 
 def test_malformed_datagrams_do_not_disturb_the_table(window):
     send(window, report(ip="127.0.0.1"))
-    port = window.socket.localPort()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        for junk in (b"", b"garbage", b"[]", b"\xff\xfe\x00", b'{"node":""}'):
-            sock.sendto(junk, ("127.0.0.1", port))
-    finally:
-        sock.close()
-    spin(200)
+    for junk in (b"", b"garbage", b"[]", b"\xff\xfe\x00", b'{"node":""}'):
+        send_raw(window, junk)
     # The good row survives and nothing was added.
     assert window.table.rowCount() == 1
     assert window.table.item(0, COL_NODE).text() == "desk01"
+
+
+def test_unsealed_plaintext_is_ignored(window):
+    # Reports are sealed now, so a plaintext JSON report -- an old server, or
+    # someone guessing the format -- must not appear.
+    send_raw(window, json.dumps(report(node="plaintext-host")).encode())
+    assert window.table.rowCount() == 0
+
+
+def test_a_report_sealed_with_the_wrong_key_is_ignored(window):
+    # Same shape, wrong key: the tag check must reject it.
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+    from lynxrdp_monitor.crypto import FORMAT_VERSION, MAGIC, NONCE_LEN
+
+    wrong = ChaCha20Poly1305(bytes(32))
+    nonce = bytes(NONCE_LEN)
+    body = wrong.encrypt(nonce, json.dumps(report()).encode(), MAGIC + bytes([FORMAT_VERSION]))
+    send_raw(window, MAGIC + bytes([FORMAT_VERSION]) + nonce + body)
+    assert window.table.rowCount() == 0
 
 
 def test_copying_puts_the_address_on_the_clipboard(window):

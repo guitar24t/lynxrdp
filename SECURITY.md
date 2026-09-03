@@ -93,23 +93,39 @@ change:
   it was not already.
 * **It does disclose.** Each interval the hostname, the address the host
   would be reached on, the LynxRDP version and the number of running sessions
-  go out in the clear as a UDP datagram. Anyone on the path can read that,
-  and it is a tidy map of your estate. Keep it on a management network or a
-  VPN rather than pointing it across the public internet.
-* **Nothing authenticates it.** There is no signature, so anyone who can
-  reach the monitoring port can invent a host, and a real report can be
-  forged or suppressed. The viewer shows claims, not facts. Do not make an
-  access decision from that list. (An HMAC over the payload would fix this
-  and is deliberately not implemented yet; it would need a shared key
-  distributed to every server, which is a bigger change than this feature
-  warranted.)
+  leave the machine. They are sealed (see below), which stops a casual
+  capture reading them, but the traffic pattern itself still says a LynxRDP
+  host is here and talking to that collector. Keep it on a management network
+  or a VPN rather than pointing it across the public internet.
+* **Reports are obfuscated, not confidential.** Each datagram is sealed with
+  ChaCha20-Poly1305 under a key derived from constants compiled into
+  `lynxrdpd` and written in `crates/server/src/reporting/seal.rs`. That means
+  a packet capture no longer reads as a list of hostnames and addresses,
+  which is what this was added to prevent.
+
+  It does **not** mean the reports are secret. The key ships in the binary
+  and in this repository: anyone who can run `strings` on `lynxrdpd`, or read
+  the source, can recover it and then decrypt every report and forge
+  convincing ones. Treat the sealing as a lock on a garden gate -- it stops
+  the casual passer-by looking in, and stops nobody who wants in.
+
+  If reports ever need to withstand someone who has the software, the baked
+  constants must become a per-deployment key that is not in the repository.
+  The wire format carries a version byte so that change does not have to be a
+  flag day.
+* **So nothing meaningfully authenticates a report either.** Because the key
+  is not secret, a forged report is indistinguishable from a real one. The
+  viewer shows claims, not facts. Do not make an access decision from that
+  list.
 * **It is not a control channel.** Reports flow one way. Nothing the
   monitoring server sends can reach the daemon, because the daemon never
   reads from the socket.
 
-The viewer treats every datagram as hostile input: size-capped, strictly
-parsed, and stripped of control characters before anything reaches a widget,
-so a malformed or malicious report cannot corrupt its display.
+The viewer treats every datagram as hostile input. It is unsealed first --
+anything that fails the authentication tag is dropped without further
+inspection -- and what survives is then size-capped, strictly parsed, and
+stripped of control characters before it reaches a widget, so a malformed or
+malicious report cannot corrupt the display.
 
 If you do not need any of this, leave `reporting.enabled = false`, which is
 the default, and the code never runs.

@@ -3,6 +3,11 @@
 Listens on a UDP port, shows one row per host, and makes the address easy to
 copy so it can be pasted straight into an `ssh` or `lynxrdp` command.
 
+Reports arrive sealed (see `crypto.py`) and are unsealed before anything else
+looks at them. The key is baked into the software, so this keeps reports out
+of a casual packet capture but is not confidentiality against anyone holding
+the software -- see the project's SECURITY.md.
+
 `QUdpSocket` is used rather than a socket on a worker thread: it delivers
 datagrams through the Qt event loop, so there is no cross-thread handoff and
 no locking around the table.
@@ -31,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .crypto import unseal
 from .model import DEFAULT_STALE_AFTER, NodeStore, format_age, format_uptime, parse_report
 
 #: Port the viewer listens on unless told otherwise.
@@ -126,9 +132,14 @@ class MonitorWindow(QMainWindow):
             # form so it matches what the host reports about itself.
             if sender.startswith("::ffff:"):
                 sender = sender[len("::ffff:") :]
-            report = parse_report(data, source_ip=sender)
+            # Unseal first: anything that fails here is a scan, a stray, or
+            # a packet from software that does not share our key, and all
+            # three are equally uninteresting.
+            plaintext = unseal(data)
+            if plaintext is None:
+                continue
+            report = parse_report(plaintext, source_ip=sender)
             if report is None:
-                # Scans and strays are normal on an open UDP port.
                 continue
             self.store.update(report)
         self.refresh()

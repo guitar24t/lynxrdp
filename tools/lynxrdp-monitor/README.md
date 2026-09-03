@@ -59,11 +59,19 @@ naming problem worth seeing rather than hiding.
 
 ## What this is not
 
-Reports are **unauthenticated UDP**. Anyone who can reach this port can send
-one, and anything shown here is a claim, not a fact. Treat the list as a
+Reports are sealed with ChaCha20-Poly1305, so a packet capture does not read
+as a list of your hostnames. That is worth having, and it is all it is: the
+key is derived from constants compiled into both `lynxrdpd` and this viewer,
+so anyone holding either can recover it, decrypt every report and forge
+convincing ones.
+
+So anything shown here is a claim, not a fact. Treat the list as a
 convenience for finding your own machines, not as an inventory you would make
 a security decision from. Run it on a management network. See the project's
 `SECURITY.md`.
+
+Anything that does not decrypt — a scan, a stray, a plaintext report from an
+older server — is dropped without appearing.
 
 Nothing is stored: the list is built from what arrives while the viewer runs,
 and starts empty each time.
@@ -71,10 +79,17 @@ and starts empty each time.
 ## Tests
 
 ```sh
-pip install pytest PySide6
+pip install -r requirements.txt pytest
 python -m pytest tests/            # GUI tests run headless via QT_QPA_PLATFORM=offscreen
 ```
 
+`tests/test_crypto.py` covers the wire format, including a datagram captured
+from a real `lynxrdpd` so the Rust and Python sides are pinned to each other;
 `tests/test_model.py` covers parsing and bookkeeping and needs no Qt;
-`tests/test_gui.py` drives the real window, including that malformed
-datagrams cannot disturb it. Both run without a display.
+`tests/test_gui.py` drives the real window, including that malformed,
+plaintext and wrong-key datagrams cannot disturb it. All run without a
+display.
+
+To regenerate the captured datagram in `test_crypto.py` after a wire-format
+change, run a `lynxrdpd` with `[reporting]` pointed at a UDP port and hex
+encode the first datagram it sends.

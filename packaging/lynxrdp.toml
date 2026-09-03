@@ -55,9 +55,12 @@ dpi = 96
 #
 # This is the only part of LynxRDP that talks to the network by itself. It
 # only ever sends: no port is opened here and nothing is read back, so the
-# loopback-only rule above still holds. What it does do is put this host's
-# name and address on the wire in the clear, once per interval, with no
-# authentication -- see SECURITY.md before crossing an untrusted network.
+# loopback-only rule above still holds.
+#
+# Reports are sealed so a packet capture cannot read your hostnames, but the
+# key is compiled into the software and is therefore not secret from anyone
+# holding it. That is obfuscation, not confidentiality -- read SECURITY.md
+# before pointing this across an untrusted network.
 #
 # tools/lynxrdp-monitor in the source tree is a viewer for these reports.
 enabled = false
