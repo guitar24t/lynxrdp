@@ -84,3 +84,8 @@ jobs:
           files: release/*
           generate_release_notes: true
           draft: false
+          # Semver: a hyphen in the tag means a prerelease, so v0.1.0-rc.1 is
+          # marked as one and v0.1.0 is not. The packages themselves keep the
+          # Cargo.toml version, because an RPM Version field cannot contain a
+          # hyphen and nfpm would have to mangle it.
+          prerelease: ${{ contains(github.ref_name, '-') }}
