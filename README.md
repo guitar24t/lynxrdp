@@ -76,8 +76,9 @@ sudo dnf install ./lynxrdp-server-*.x86_64.rpm
 ```
 
 The package installs `lynxrdpd`, `lynxrdp-session`, a systemd unit (enabled
-and started), `/etc/lynxrdp/lynxrdp.toml`, `/etc/lynxrdp/startwm.sh` and a
-PAM service file `/etc/pam.d/lynxrdp`.
+and started), `/etc/lynxrdp/lynxrdp.toml`, `/etc/lynxrdp/startwm.sh`, a PAM
+service file `/etc/pam.d/lynxrdp` and a logrotate snippet
+`/etc/logrotate.d/lynxrdp` (see [Session logs](#session-logs)).
 
 You need a desktop environment on the server. XFCE is a good, light choice:
 
@@ -229,7 +230,26 @@ guarantee the daemon provides, so `lynxrdp you@server` works unchanged.
 | `session.max_fps`, `max_in_flight` | `60`, `2` | Latency/smoothness knobs. |
 | `session.idle_timeout_secs` | `0` | End sessions nobody is connected to. |
 
-Session logs are written to `/var/log/lynxrdp/<user>.log`.
+### Session logs
+
+Each session writes to `/var/log/lynxrdp/<user>.log`. That file is the session
+process's standard output and error, and the desktop inherits it, so it also
+collects the warnings of every application the user launches -- which on a
+normal desktop is most of what ends up in there.
+
+`/etc/logrotate.d/lynxrdp` keeps that bounded: it rotates a log once it passes
+20 MB and keeps five compressed generations, roughly 30 MB per user. Leave it
+installed. Without it one talkative application fills `/var`, and a full `/var`
+stops the daemon from opening a session log at all, which stops everyone from
+logging in -- the log is not optional to the session, so failing to open it
+fails the login.
+
+The snippet uses `copytruncate`, and that is not a preference: the session
+holds the log open for its whole life and cannot be told to reopen it, so a
+rotation that renamed the file would leave every running desktop writing to a
+file with no name left. If you point `session.log_dir` somewhere other than
+`/var/log/lynxrdp`, edit the snippet to match -- nothing derives the path from
+the configuration.
 
 ## Building from source
 
@@ -315,7 +335,7 @@ cd tools/lynxrdp-monitor && pip install -r requirements.txt && ./lynxrdp-monitor
 | `crates/proto` | Wire protocol, framing, tile codec, copy detection, keysyms. Shared by both sides. |
 | `crates/server` | `lynxrdpd` (daemon) and `lynxrdp-session` (per-user session). Linux only. |
 | `crates/client` | `lynxrdp` GUI client and the headless client library. |
-| `packaging/` | nfpm configs, systemd unit, PAM files, `startwm.sh`, the NSIS installer, the macOS bundle and disk image scripts. |
+| `packaging/` | nfpm configs, systemd unit, PAM files, `startwm.sh`, the logrotate snippet, the NSIS installer, the macOS bundle and disk image scripts. |
 | `assets/` | The application icon: one SVG and the PNG, `.ico` and `.icns` forms generated from it. |
 | `tools/lynxrdp-monitor` | PySide6 viewer for the optional heartbeat reports. |
 | `.github/workflows` | CI (lint, tests, multi-OS client builds, packages) and releases. |

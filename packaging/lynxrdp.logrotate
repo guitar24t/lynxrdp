@@ -1,0 +1,65 @@
+# Rotation for the per-user session logs, installed as /etc/logrotate.d/lynxrdp.
+#
+# /var/log/lynxrdp/<user>.log is not a log the daemon writes to politely: it is
+# dup()ed onto the session process's fd 1 and 2 and inherited by the desktop
+# and by every application the user launches from it, so it accumulates GTK,
+# Qt and dbus chatter for as long as the session lives. Nothing in the product
+# bounds it. The failure that matters is not a large file, it is that once
+# /var is full the daemon can no longer open a session log at all -- and
+# spawn() treats that as fatal, so a single chatty application locks every
+# user out of the machine.
+#
+# The path is hard-coded because logrotate has no way to learn it: if
+# session.log_dir in /etc/lynxrdp/lynxrdp.toml is pointed somewhere else, this
+# file has to be edited to match.
+/var/log/lynxrdp/*.log {
+    # Mandatory, not a preference. The session holds this fd for its whole
+    # life and has no way to be told to reopen the file -- there is no
+    # SIGHUP handler, and the applications that inherited the fd could not be
+    # told either. The usual rename-then-create rotation would therefore leave
+    # every running desktop appending to an unlinked inode: the rotated file
+    # would keep growing with no name to find it by while the live log stayed
+    # empty, which is worse than not rotating at all. Truncating in place is
+    # the only rotation the existing writers survive. The cost is the known
+    # copytruncate race -- whatever is written between the copy and the
+    # truncate is lost -- and for warning spam that is a fair trade.
+    #
+    # Debian's /etc/logrotate.conf sets "create" globally; logrotate documents
+    # it as having no effect when copytruncate is used, so it is safe to leave
+    # alone. Do not add "create" here to make the intent clearer: it would not
+    # be honoured, and the next reader would believe it was.
+    copytruncate
+
+    # Size, not a schedule. These logs are diagnostics nobody reads until
+    # something breaks, so a daily rotation would spend all five generations
+    # on an idle server and discard the crash the admin came looking for,
+    # while still doing nothing for the machine that fills a disk in an hour.
+    # Rotating only when the file is actually large keeps history on quiet
+    # servers and caps the noisy ones at about 20 MB live plus five compressed
+    # generations -- call it 30 MB per user.
+    #
+    # Both Debian and RHEL run logrotate once a day, so this bounds growth per
+    # run, not absolutely; a deployment with a pathological application wants a
+    # more frequent logrotate timer rather than a smaller size here.
+    size 20M
+    rotate 5
+    compress
+
+    # RHEL's /etc/logrotate.conf turns on "dateext" globally, which names the
+    # rotated file after the day instead of a generation number. A second
+    # rotation on the same day then finds its destination already there and
+    # refuses it -- "destination ... already exists, skipping rotation" -- so a
+    # RHEL 9 server silently caps out at one rotation per day no matter how
+    # often logrotate runs. That is exactly the remedy recommended above for a
+    # log growing faster than the daily run, so the global has to be turned off
+    # here. Numbered generations also make the two distributions rotate
+    # identically, which is the only reason a check run on Ubuntu says
+    # anything about what a RHEL 9 box will do.
+    nodateext
+
+    # A fresh install has no logs until someone connects, and a user who never
+    # starts a session leaves an empty file behind. Neither is an error and
+    # neither is worth a generation.
+    missingok
+    notifempty
+}
