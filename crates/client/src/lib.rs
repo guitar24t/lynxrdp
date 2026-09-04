@@ -20,7 +20,10 @@ pub mod imageclip;
 pub mod keymap;
 pub mod launch;
 pub mod launcher;
+pub mod overlay;
 pub mod profiles;
+pub mod settings;
+pub mod theme;
 pub mod tunnel;
 
 /// Name reported to the server.
