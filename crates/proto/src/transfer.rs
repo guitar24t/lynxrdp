@@ -24,10 +24,16 @@
 //! # Why it does not stall the screen
 //!
 //! Everything shares one TCP connection, so a large transfer could easily
-//! starve interactive frames. Two things prevent that: chunks are capped at
-//! [`CHUNK_SIZE`] so a frame only ever waits for one chunk to drain, and the
-//! sender keeps at most [`WINDOW_CHUNKS`] chunks unacknowledged, which bounds
-//! how much transfer data can be queued ahead of a frame.
+//! starve interactive frames. Three things prevent that: chunks are capped at
+//! [`CHUNK_SIZE`] so a frame only ever waits for one chunk to drain; the sender
+//! keeps at most [`WINDOW_CHUNKS`] chunks of any one transfer unacknowledged;
+//! and [`GLOBAL_WINDOW_CHUNKS`] bounds the total across all of them.
+//!
+//! That third one is not redundant. The claim is about the *queue*, and a
+//! per-transfer window says nothing about how many transfers there are:
+//! staging a clipboard file copy fans out one per file, so eight concurrent
+//! transfers used to put eight windows -- four megabytes -- in front of the
+//! next screen update.
 
 use std::io::{self, Read, Write};
 
@@ -40,6 +46,17 @@ pub const CHUNK_SIZE: usize = 64 * 1024;
 /// How many chunks may be in flight before the sender waits for acks.
 /// Bounds transfer data queued ahead of an interactive frame.
 pub const WINDOW_CHUNKS: u32 = 8;
+
+/// How many chunks may be in flight across *all* outgoing transfers at once.
+///
+/// [`WINDOW_CHUNKS`] bounds one transfer, and the promise at the top of this
+/// module -- that a frame waits for at most one chunk -- is about the queue, not
+/// about a transfer. With N running concurrently the real figure was
+/// N x WINDOW_CHUNKS x CHUNK_SIZE ahead of the next frame, and N is routinely
+/// large: staging a clipboard file copy fans out one transfer per file, bounded
+/// only by `MAX_FILE_LIST`. Two windows' worth keeps a single transfer at full
+/// speed while capping the queue at about 1 MiB however many are running.
+pub const GLOBAL_WINDOW_CHUNKS: u32 = WINDOW_CHUNKS * 2;
 
 /// Largest transfer accepted by default (2 GiB).
 pub const MAX_TRANSFER_SIZE: u64 = 2 * 1024 * 1024 * 1024;
@@ -223,6 +240,11 @@ impl<R: Read> TransferSender<R> {
             self.eof = true;
         }
         Ok(Some((seq, buf)))
+    }
+
+    /// Chunks sent but not yet acknowledged.
+    pub fn in_flight(&self) -> u32 {
+        self.next_seq - self.acked
     }
 
     /// Record an acknowledgement, freeing window space.
@@ -748,6 +770,10 @@ pub struct TransferManager {
     /// nothing to resolve against and the requester would wait forever.
     pending: HashSet<u64>,
     max_size: u64,
+    /// Where the next round-robin pump starts, so a transfer that keeps
+    /// arriving at an exhausted budget is not starved by whichever id happens
+    /// to sort first.
+    pump_cursor: u64,
 }
 
 impl std::fmt::Debug for TransferManager {
@@ -770,6 +796,7 @@ impl TransferManager {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             pending: HashSet::new(),
+            pump_cursor: 0,
             max_size: MAX_TRANSFER_SIZE,
         }
     }
@@ -943,7 +970,7 @@ impl TransferManager {
                     return Some(out);
                 }
                 o.accepted = true;
-                self.pump_one(*id, &mut out);
+                self.pump(&mut out);
             }
             Message::TransferData { id, seq, data } => {
                 let Some(i) = self.incoming.get_mut(id) else {
@@ -971,7 +998,7 @@ impl TransferManager {
                 if let Some(o) = self.outgoing.get_mut(id) {
                     o.sender.on_ack(*seq);
                 }
-                self.pump_one(*id, &mut out);
+                self.pump(&mut out);
             }
             Message::TransferEnd { id, ok, message } => {
                 let incoming = self.incoming.remove(id);
@@ -1056,32 +1083,65 @@ impl TransferManager {
     }
 
     /// Emit as many chunks for one transfer as its window allows.
-    fn pump_one(&mut self, id: u64, out: &mut Outcome) {
-        let Some(o) = self.outgoing.get_mut(&id) else {
-            return;
-        };
-        if !o.accepted {
+    /// Emit chunks for every outgoing transfer, within the global budget.
+    ///
+    /// This replaced a per-transfer `pump_one(id)`, and the replacement has to
+    /// be total: a transfer that stops early because the budget was exhausted
+    /// is only ever resumed by a later pump, so any call site still pumping a
+    /// single id would leave the others hanging forever.
+    fn pump(&mut self, out: &mut Outcome) {
+        if self.outgoing.is_empty() {
             return;
         }
-        loop {
-            match o.sender.next_chunk() {
-                Ok(Some((seq, data))) => out.replies.push(Message::TransferData { id, seq, data }),
-                Ok(None) => break,
-                Err(e) => {
-                    self.outgoing.remove(&id);
-                    out.replies.push(Message::TransferEnd {
-                        id,
-                        ok: false,
-                        message: e.to_string(),
-                    });
-                    out.failed.push((id, e.to_string()));
-                    return;
+        let mut ids: Vec<u64> = self.outgoing.keys().copied().collect();
+        ids.sort_unstable();
+        let start = (self.pump_cursor % ids.len() as u64) as usize;
+        ids.rotate_left(start);
+        self.pump_cursor = self.pump_cursor.wrapping_add(1);
+
+        let in_flight: u32 = self.outgoing.values().map(|o| o.sender.in_flight()).sum();
+        let mut budget = GLOBAL_WINDOW_CHUNKS.saturating_sub(in_flight);
+        // Collected rather than removed inline: the loop below holds a mutable
+        // borrow of `self.outgoing` for the transfer it is working on.
+        let mut failed: Vec<(u64, String)> = Vec::new();
+
+        for id in ids {
+            if budget == 0 {
+                break;
+            }
+            let Some(o) = self.outgoing.get_mut(&id) else {
+                continue;
+            };
+            if !o.accepted {
+                continue;
+            }
+            while budget > 0 {
+                match o.sender.next_chunk() {
+                    Ok(Some((seq, data))) => {
+                        out.replies.push(Message::TransferData { id, seq, data });
+                        budget -= 1;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        failed.push((id, e.to_string()));
+                        break;
+                    }
                 }
             }
         }
-        // The record stays until the peer confirms with TransferEnd: that is
-        // what tells us the bytes actually landed, and lets a late failure be
-        // reported against the right transfer.
+
+        for (id, message) in failed {
+            self.outgoing.remove(&id);
+            out.replies.push(Message::TransferEnd {
+                id,
+                ok: false,
+                message: message.clone(),
+            });
+            out.failed.push((id, message));
+        }
+        // A successful record stays until the peer confirms with TransferEnd:
+        // that is what tells us the bytes actually landed, and it lets a late
+        // failure be reported against the right transfer.
     }
 
     /// Describe a transfer in flight: its purpose, name and progress.
@@ -1236,6 +1296,59 @@ mod manager_tests {
         assert_eq!(back.failed.len(), 1);
         assert!(back.failed[0].1.contains("declined"), "{:?}", back.failed);
         assert_eq!(client.in_flight(), (0, 0));
+    }
+
+    /// Many concurrent transfers must not queue N windows ahead of a frame.
+    ///
+    /// `WINDOW_CHUNKS` bounds one transfer, and the module's stated promise --
+    /// that a frame waits for at most one chunk -- is about the queue. With the
+    /// per-transfer window only, eight concurrent transfers put eight windows,
+    /// four megabytes, in front of the next screen update; staging a clipboard
+    /// file copy fans out one transfer per file, so that is the ordinary case
+    /// rather than a contrived one.
+    ///
+    /// The measurement is taken at acceptance, because that is when a fan-out
+    /// queues its opening burst and where the difference actually shows.
+    #[test]
+    fn concurrent_transfers_share_one_queue_budget() {
+        const N: usize = 8;
+        let mut m = TransferManager::new(true);
+        let mut policy = MemoryPolicy;
+        let payload = vec![7u8; CHUNK_SIZE * (WINDOW_CHUNKS as usize + 4)];
+
+        let mut queued = 0usize;
+        for _ in 0..N {
+            let offer = m.offer_bytes(TransferPurpose::FileUpload, "f".into(), payload.clone());
+            let Message::TransferOffer { id, .. } = offer else {
+                panic!("offer_bytes did not produce an offer");
+            };
+            let out = m
+                .handle(
+                    &Message::TransferAccept {
+                        id,
+                        accepted: true,
+                        reason: String::new(),
+                    },
+                    &mut policy,
+                )
+                .expect("accept handled");
+            queued += out
+                .replies
+                .iter()
+                .filter(|r| matches!(r, Message::TransferData { .. }))
+                .count();
+        }
+
+        assert!(
+            queued <= GLOBAL_WINDOW_CHUNKS as usize,
+            "{queued} chunks queued across {N} transfers; the budget is {GLOBAL_WINDOW_CHUNKS}"
+        );
+        // Without a global budget every transfer queues its own full window, so
+        // this is the number the fix has to beat.
+        assert!(
+            queued < N * WINDOW_CHUNKS as usize,
+            "the per-transfer window was the only thing bounding the queue"
+        );
     }
 
     /// Neither side will hold an unbounded amount of a transfer in memory.
