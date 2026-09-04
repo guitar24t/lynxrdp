@@ -863,17 +863,62 @@ mod tests {
             assert_eq!(std::fs::read(bundle.join("keep")).unwrap(), b"still here");
         }
 
+        /// A tarball holding one entry whose name climbs out of the archive.
+        ///
+        /// The name is written into the header's bytes by hand because
+        /// `tar::Builder` refuses to produce this: `set_path` rejects a `..`
+        /// component outright. That refusal is a decent argument that the
+        /// archives we actually publish can never contain one -- and no
+        /// argument at all about an archive that did not come from us, which
+        /// is what the extractor has to survive.
+        fn escaping_tarball(dir: &Path, top: &str, escape: &str) -> PathBuf {
+            let path = dir.join("escape.tar.gz");
+            let file = std::fs::File::create(&path).unwrap();
+            let gz = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(gz);
+            let body = b"nope";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o755);
+            header.set_entry_type(tar::EntryType::Regular);
+            let name = format!("{top}/{escape}");
+            let gnu = header.as_gnu_mut().expect("a gnu header");
+            gnu.name[..name.len()].copy_from_slice(name.as_bytes());
+            // After the name, or it checksums the empty one.
+            header.set_cksum();
+            tar.append(&header, &body[..]).unwrap();
+            tar.into_inner().unwrap().finish().unwrap().flush().unwrap();
+            path
+        }
+
         #[test]
         fn an_archive_that_climbs_out_of_itself_is_refused() {
             let dir = tempfile::tempdir().unwrap();
-            let archive = tarball(
-                dir.path(),
-                "lynxrdp-0.1.0-linux-x86_64",
-                &[("../../escaped", b"nope", 0o755)],
-            );
+            let archive =
+                escaping_tarball(dir.path(), "lynxrdp-0.1.0-linux-x86_64", "../../escaped");
             let target = dir.path().join("lynxrdp");
             std::fs::write(&target, b"old").unwrap();
-            let err = apply(&Plan::Binary { target }, &archive).unwrap_err();
+            let err = apply(
+                &Plan::Binary {
+                    target: target.clone(),
+                },
+                &archive,
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("unsafe path"), "{err:#}");
+            assert!(!dir.path().join("escaped").exists());
+            assert_eq!(std::fs::read(&target).unwrap(), b"old");
+
+            // And the same on the way into a bundle, which unpacks every
+            // entry rather than looking for one.
+            let bundle = dir.path().join("LynxRDP.app");
+            std::fs::create_dir_all(&bundle).unwrap();
+            let archive = escaping_tarball(
+                dir.path(),
+                "lynxrdp-0.1.0-macos-aarch64",
+                "LynxRDP.app/../../escaped",
+            );
+            let err = apply(&Plan::Bundle { bundle }, &archive).unwrap_err();
             assert!(format!("{err:#}").contains("unsafe path"), "{err:#}");
             assert!(!dir.path().join("escaped").exists());
         }
