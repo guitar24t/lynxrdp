@@ -107,7 +107,20 @@ pub struct SessionConfig {
     /// Number of frames that may be in flight before the server waits for
     /// acknowledgements. `1` gives the lowest latency; `2` gives smoother
     /// motion on links with jitter.
+    ///
+    /// With `max_in_flight_auto` left on this is the *floor* rather than the
+    /// ceiling: the session may allow itself more when the round trip it
+    /// measures justifies more, and never allows itself less than this.
     pub max_in_flight: u32,
+    /// Whether a session may raise `max_in_flight` on its own, up to 8, when
+    /// the round trip it measures is long enough to justify it.
+    ///
+    /// On by default because the fixed default of 2 frames per round trip is
+    /// 20 fps at 100 ms, and the transport this server is designed for is an
+    /// SSH tunnel across a WAN. Turn it off to hold the window at exactly
+    /// `max_in_flight`, which is what an operator tuning for latency rather
+    /// than smoothness is asking for.
+    pub max_in_flight_auto: bool,
     /// Seconds without a connected client after which the session is
     /// terminated. `0` keeps sessions forever (until logout).
     pub idle_timeout_secs: u64,
@@ -156,6 +169,7 @@ impl Default for SessionConfig {
             startwm: "/etc/lynxrdp/startwm.sh".to_string(),
             max_fps: 60,
             max_in_flight: 2,
+            max_in_flight_auto: true,
             idle_timeout_secs: 0,
             pam_service: "lynxrdp".to_string(),
             runtime_dir: PathBuf::from("/run/lynxrdp"),
@@ -215,6 +229,11 @@ impl Config {
         if s.max_fps == 0 || s.max_fps > 240 {
             bail!("session.max_fps must be between 1 and 240");
         }
+        // 8 is also the ceiling the adaptive window raises itself to, so the
+        // two numbers cannot disagree about what a session may queue.
+        // `max_in_flight_auto` needs no check of its own beyond this one: it
+        // is a bool, and the only thing that can be out of range about it is
+        // the floor it is measured against, checked right here.
         if s.max_in_flight == 0 || s.max_in_flight > 8 {
             bail!("session.max_in_flight must be between 1 and 8");
         }
@@ -337,6 +356,19 @@ mod tests {
         assert!(Config::from_toml("[session]\nmax_in_flight = 9\n").is_err());
         assert!(Config::from_toml("[session]\ndefault_width = 5000\n").is_err());
         assert!(Config::from_toml("[session]\nmax_width = 20000\n").is_err());
+    }
+
+    /// The adaptive window is on unless an operator says otherwise, and
+    /// turning it off must not disturb the floor it is measured against.
+    #[test]
+    fn the_in_flight_window_adapts_by_default() {
+        assert!(Config::default().session.max_in_flight_auto);
+        let off = Config::from_toml("[session]\nmax_in_flight_auto = false\n").unwrap();
+        assert!(!off.session.max_in_flight_auto);
+        assert_eq!(
+            off.session.max_in_flight,
+            SessionConfig::default().max_in_flight
+        );
     }
 
     #[test]

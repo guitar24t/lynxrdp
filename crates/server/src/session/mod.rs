@@ -2,6 +2,7 @@
 
 pub mod desktop;
 pub mod engine;
+pub mod fileio;
 pub mod listener;
 pub mod socket;
 pub mod xserver;
@@ -20,11 +21,25 @@ pub struct SessionOptions {
     /// Upper bound on frames per second.
     pub max_fps: u32,
     /// Frames allowed in flight before waiting for acknowledgements.
+    ///
+    /// With [`SessionOptions::max_in_flight_auto`] set this is the *floor*:
+    /// the session may raise its own window above it when the round trip it
+    /// measures justifies more, but never lowers it below.
     pub max_in_flight: u32,
+    /// Whether the session may raise `max_in_flight` on its own.
+    pub max_in_flight_auto: bool,
     /// Largest screen size a client may request.
     pub max_width: u32,
     /// Largest screen height a client may request.
     pub max_height: u32,
+    /// Physical size the X screen reports, in dots per inch.
+    ///
+    /// This sets the root window's size in millimetres, which is what
+    /// `xdpyinfo` prints and what Qt reads to scale itself. It is deliberately
+    /// scoped that narrowly: GTK does *not* read it, taking its scaling from
+    /// the `Xft.dpi` X resource that the desktop's own settings set, so a GTK
+    /// application will not follow this on its own.
+    pub dpi: u32,
     /// Size to use when the client does not request one.
     pub default_width: u32,
     /// Height to use when the client does not request one.
@@ -48,8 +63,10 @@ impl Default for SessionOptions {
         Self {
             max_fps: 60,
             max_in_flight: 2,
+            max_in_flight_auto: true,
             max_width: 4096,
             max_height: 2160,
+            dpi: 96,
             default_width: 1920,
             default_height: 1080,
             username: String::new(),
@@ -100,4 +117,8 @@ pub enum CoreEvent {
     DesktopExited(String),
     /// Orderly shutdown request (signal).
     Shutdown(String),
+    /// The file worker finished opening a file a client asked to download.
+    /// Boxed because every other variant is small and this one need not make
+    /// the channel's element wider than the X events that dominate it.
+    FileOpened(Box<fileio::FileOpened>),
 }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use lynxrdp_proto::keysym;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{self, ConnectionExt as _};
+use x11rb::protocol::xproto::{self, AutoRepeatMode, ChangeKeyboardControlAux, ConnectionExt as _};
 use x11rb::protocol::xtest;
 
 use super::XDisplay;
@@ -128,6 +128,27 @@ impl Keymap {
     }
 }
 
+/// The server's global auto-repeat setting, or `None` if it would not say.
+///
+/// A server that will not answer this is one we must not "restore" a guess to,
+/// which is why the failure is an absence rather than a default.
+fn read_auto_repeat(display: &XDisplay) -> Option<AutoRepeatMode> {
+    let reply = match display.conn().get_keyboard_control() {
+        Ok(cookie) => cookie.reply(),
+        Err(e) => {
+            log::warn!("cannot ask for the keyboard auto-repeat setting: {e}");
+            return None;
+        }
+    };
+    match reply {
+        Ok(r) => Some(r.global_auto_repeat),
+        Err(e) => {
+            log::warn!("cannot read the keyboard auto-repeat setting: {e}");
+            None
+        }
+    }
+}
+
 /// Injects keyboard and pointer events.
 pub struct InputInjector {
     display: Arc<XDisplay>,
@@ -146,12 +167,18 @@ pub struct InputInjector {
     /// Round robin over `dynamic` when spares run out.
     dynamic_order: Vec<u32>,
     last_pointer: (i16, i16),
+    /// The server's global auto-repeat setting as it was when we attached, so
+    /// that a session we suppressed it for gets back exactly what it had.
+    /// Read once, here, rather than assumed to be on: a user who turned key
+    /// repeat off would otherwise find us turning it back on for them.
+    original_auto_repeat: Option<AutoRepeatMode>,
 }
 
 impl InputInjector {
     /// Create an injector and load the keyboard mapping.
     pub fn new(display: Arc<XDisplay>) -> Result<Self> {
         anyhow::ensure!(display.ext.xtest, "XTEST extension is required for input");
+        let original_auto_repeat = read_auto_repeat(&display);
         let mut s = Self {
             display,
             keymap: Keymap::default(),
@@ -164,9 +191,59 @@ impl InputInjector {
             dynamic: HashMap::new(),
             dynamic_order: Vec::new(),
             last_pointer: (0, 0),
+            original_auto_repeat,
         };
         s.reload_keymap()?;
         Ok(s)
+    }
+
+    /// Turn the X server's own key auto-repeat off while a client is connected.
+    ///
+    /// A held key otherwise has two repeat generators that know nothing about
+    /// each other. The client's operating system repeats the key and forwards
+    /// every repeat to us as another `KeyEvent`, and -- this is the part nobody
+    /// has confirmed against Xvfb -- `XTestFakeInput` leaves the keycode
+    /// logically held, which entitles the X server to repeat it as well. The
+    /// visible results are a repeat rate that is neither end's configured one
+    /// on arrows and Backspace, and a key that runs away entirely whenever a
+    /// `KeyRelease` is delayed past X's 660 ms threshold by a stalled tunnel.
+    /// x11vnc ships `-norepeat` and turns server-side repeat off by default for
+    /// exactly this reasoning.
+    ///
+    /// Applied per connection rather than once at startup because a desktop's
+    /// settings daemon (gnome-settings-daemon, xfsettingsd, kded) applies the
+    /// user's keyboard preferences some seconds into login, asynchronously, and
+    /// would simply overwrite a value set before it ran.
+    ///
+    /// Harmless if the guess about Xvfb is wrong: with no server-side repeat to
+    /// suppress this changes a setting nothing is reading, and
+    /// [`InputInjector::restore_auto_repeat`] puts it back on the way out.
+    pub fn suppress_auto_repeat(&self) {
+        self.set_auto_repeat(AutoRepeatMode::OFF);
+    }
+
+    /// Put the auto-repeat setting back to whatever it was when we attached.
+    pub fn restore_auto_repeat(&self) {
+        if let Some(mode) = self.original_auto_repeat {
+            self.set_auto_repeat(mode);
+        }
+    }
+
+    fn set_auto_repeat(&self, mode: AutoRepeatMode) {
+        let aux = ChangeKeyboardControlAux::new().auto_repeat_mode(mode);
+        // Logged, never propagated. This is a nicety about repeat rates; it has
+        // no business being able to end a user's desktop session, which is what
+        // an error out of here would eventually become.
+        let done = self
+            .display
+            .conn()
+            .change_keyboard_control(&aux)
+            .map_err(anyhow::Error::from)
+            .and_then(|c| c.check().map_err(anyhow::Error::from));
+        match done {
+            Ok(()) => log::debug!("keyboard auto-repeat set to {mode:?}"),
+            Err(e) => log::warn!("cannot change the keyboard auto-repeat setting: {e:#}"),
+        }
     }
 
     /// Re-read the keyboard mapping (after a `MappingNotify`).
