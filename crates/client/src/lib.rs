@@ -12,6 +12,7 @@
 pub const APP_ID: &str = "lynxrdp";
 
 pub mod app;
+pub mod clipchange;
 pub mod connection;
 pub mod console;
 pub mod fileclip;

@@ -88,6 +88,13 @@ pub enum ClientEvent {
     ClipboardFiles(Vec<lynxrdp_proto::FileEntry>),
     /// A file finished downloading to this path.
     FileDownloaded {
+        /// Transfer identifier, as returned by [`Client::request_file`].
+        ///
+        /// The id, not the name, is what a caller tracking a batch has to key
+        /// on: a session can copy two files called `notes.txt` from different
+        /// directories in one go, and names stop being unique the moment a
+        /// caller queues transfers across more than one request.
+        id: u64,
         /// Where it was written locally.
         path: PathBuf,
         /// Name the server reported.
@@ -95,6 +102,8 @@ pub enum ClientEvent {
     },
     /// A file finished uploading into the session.
     FileUploaded {
+        /// Transfer identifier, as returned by [`Client::send_file`].
+        id: u64,
         /// Name as offered to the server.
         name: String,
     },
@@ -132,24 +141,28 @@ impl TransferPolicy for ClientTransferPolicy {
     ) -> Result<Sink, String> {
         match purpose {
             TransferPurpose::ClipboardImage => Ok(Sink::Memory(Vec::new())),
-            TransferPurpose::FileDownload => {
-                let dest = self
-                    .downloads
-                    .get(&id)
-                    .ok_or_else(|| "unsolicited download".to_string())?;
-                if let Some(parent) = dest.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-                    }
-                }
-                let f = std::fs::File::create(dest)
-                    .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
-                Ok(Sink::Stream(Box::new(f)))
-            }
+            TransferPurpose::FileDownload => self.open_download(id),
             // The session never uploads to us.
-            TransferPurpose::FileUpload => Err("unexpected upload offer".into()),
+            TransferPurpose::FileUpload => Err("unexpected upload offer".to_string()),
         }
+    }
+}
+
+impl ClientTransferPolicy {
+    fn open_download(&mut self, id: u64) -> Result<Sink, String> {
+        let dest = self
+            .downloads
+            .get(&id)
+            .ok_or_else(|| "unsolicited download".to_string())?;
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            }
+        }
+        let f = std::fs::File::create(dest)
+            .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+        Ok(Sink::Stream(Box::new(f)))
     }
 }
 
@@ -188,6 +201,16 @@ pub struct Client {
     /// ServerAliveInterval only fires when the *transport* dies, not when the
     /// thing behind it stops.
     last_message_at: Instant,
+    /// Events one server message produced but a single `poll_event` call
+    /// cannot return.
+    ///
+    /// One message routinely resolves more than one transfer -- a
+    /// `TransferAck` pumps every outgoing transfer and can fail several of
+    /// them, and a refusal is reported alongside whatever else the same
+    /// message finished. The old code returned the first and dropped the rest,
+    /// which is invisible until a caller is tracking a set of transfers and
+    /// one of them never resolves.
+    queued: std::collections::VecDeque<ClientEvent>,
     transfers: TransferManager,
     /// Destinations for downloads this client asked for.
     downloads: HashMap<u64, PathBuf>,
@@ -336,6 +359,7 @@ impl Client {
             bytes_received,
             last_ping: None,
             last_message_at: Instant::now(),
+            queued: std::collections::VecDeque::new(),
             transfers: TransferManager::new(true),
             downloads: HashMap::new(),
             pending_image: None,
@@ -528,6 +552,20 @@ impl Client {
         Ok(id)
     }
 
+    /// Abandon transfer `id` in either direction.
+    ///
+    /// Used when what the transfer was *for* has gone: a clipboard copy
+    /// superseded by the next one is still downloading files nobody will ever
+    /// paste, and each of them holds an open descriptor and a share of the
+    /// global window until it finishes. No event follows -- the caller asked
+    /// for this and already knows.
+    pub fn cancel_transfer(&mut self, id: u64) {
+        self.downloads.remove(&id);
+        if let Some(end) = self.transfers.cancel(id, "no longer wanted") {
+            let _ = self.send(&end);
+        }
+    }
+
     /// Drive the connection until transfer `id` finishes.
     ///
     /// Returns the local path for a completed download. Used by the
@@ -539,9 +577,15 @@ impl Client {
             if remaining.is_zero() {
                 bail!("transfer timed out");
             }
+            // Matched by id rather than by "the next completion of that
+            // shape": nothing stops a caller from having other transfers in
+            // flight, and returning someone else's completion here would
+            // report success for a transfer that is still running.
             match self.poll_event(remaining)? {
-                Some(ClientEvent::FileUploaded { .. }) => return Ok(None),
-                Some(ClientEvent::FileDownloaded { path, .. }) => return Ok(Some(path)),
+                Some(ClientEvent::FileUploaded { id: done, .. }) if done == id => return Ok(None),
+                Some(ClientEvent::FileDownloaded { id: done, path, .. }) if done == id => {
+                    return Ok(Some(path))
+                }
                 Some(ClientEvent::TransferFailed { id: failed, reason }) if failed == id => {
                     bail!("{reason}")
                 }
@@ -565,6 +609,13 @@ impl Client {
     /// Process the next server message, applying frames to the framebuffer
     /// and answering pings. Returns `None` on timeout.
     pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<ClientEvent>> {
+        // Before the closed check, not after: a connection that ends in the
+        // same batch of messages that finished a transfer still owes the
+        // caller the completion, and a batch reported as neither done nor
+        // failed is exactly what leaves a caller waiting forever.
+        if let Some(ev) = self.queued.pop_front() {
+            return Ok(Some(ev));
+        }
         if let Some(reason) = &self.closed {
             return Ok(Some(ClientEvent::Disconnected(reason.clone())));
         }
@@ -605,34 +656,73 @@ impl Client {
     }
 
     /// Feed a message to the transfer manager, sending any replies.
-    /// Returns the event it produced, if any.
+    ///
+    /// Every outcome the message produced is queued, and the first is
+    /// returned; the rest come out of later `poll_event` calls. Nothing is
+    /// dropped, because a caller waiting on a set of transfers cannot tell an
+    /// event that never happened from one that was thrown away.
     fn handle_transfer(&mut self, msg: &Message) -> Option<Result<Option<ClientEvent>>> {
         let mut policy = ClientTransferPolicy {
-            downloads: self.downloads.clone(),
+            // Moved out and back rather than cloned: this runs for every
+            // message on the connection, screen updates included, and staging
+            // a clipboard copy can leave hundreds of entries in the map.
+            downloads: std::mem::take(&mut self.downloads),
         };
-        let outcome = self.transfers.handle(msg, &mut policy)?;
+        let outcome = self.transfers.handle(msg, &mut policy);
+        self.downloads = std::mem::take(&mut policy.downloads);
+        let outcome = outcome?;
         for reply in &outcome.replies {
+            // A refusal is read off the reply rather than reported by the
+            // policy, because the policy is not the only thing that turns an
+            // offer away: `TransferManager` refuses one that is over the size
+            // limit, or that would be the third transfer landing in memory,
+            // without consulting the policy at all. Every one of those paths
+            // -- and the policy's own refusals, of which a local
+            // `File::create` failure is the common one, since `a:b.txt`,
+            // `what?.png`, `CON` and a trailing dot are ordinary names in an
+            // X11 session and none of them can be created on NTFS -- answers
+            // on the wire and puts nothing in `Outcome::failed`, because from
+            // the manager's point of view no transfer ever existed. The
+            // requester is still waiting, and a clipboard batch holding a slot
+            // for a file that can never arrive strands the whole paste.
+            // `TransferAccept { accepted: false }` is the one thing all of
+            // them have in common, so that is what becomes the event.
+            if let Message::TransferAccept {
+                id,
+                accepted: false,
+                reason,
+            } = reply
+            {
+                self.fail_transfer(*id, reason.clone());
+            }
             if let Err(e) = self.send(reply) {
                 return Some(Err(e));
             }
         }
-        if let Some((id, reason)) = outcome.failed.into_iter().next() {
-            self.downloads.remove(&id);
-            return Some(Ok(Some(ClientEvent::TransferFailed { id, reason })));
+        for (id, reason) in outcome.failed {
+            self.fail_transfer(id, reason);
         }
-        if let Some((_, purpose, name)) = outcome.sent.into_iter().next() {
+        for (id, purpose, name) in outcome.sent {
             if purpose == TransferPurpose::FileUpload {
-                return Some(Ok(Some(ClientEvent::FileUploaded { name })));
+                self.queued
+                    .push_back(ClientEvent::FileUploaded { id, name });
             }
         }
         for done in outcome.completed {
             match self.on_completed(done) {
-                Ok(Some(ev)) => return Some(Ok(Some(ev))),
+                Ok(Some(ev)) => self.queued.push_back(ev),
                 Ok(None) => {}
                 Err(e) => return Some(Err(e)),
             }
         }
-        Some(Ok(None))
+        Some(Ok(self.queued.pop_front()))
+    }
+
+    /// Record a transfer as failed and release whatever it was holding.
+    fn fail_transfer(&mut self, id: u64, reason: String) {
+        self.downloads.remove(&id);
+        self.queued
+            .push_back(ClientEvent::TransferFailed { id, reason });
     }
 
     fn on_completed(&mut self, done: Completed) -> Result<Option<ClientEvent>> {
@@ -642,6 +732,7 @@ impl Client {
                 self.downloads
                     .remove(&done.id)
                     .map(|path| ClientEvent::FileDownloaded {
+                        id: done.id,
                         path,
                         name: done.name,
                     })
@@ -837,6 +928,7 @@ mod tests {
     use super::*;
     use lynxrdp_proto::codec::{TileEncoding, TileUpdate};
     use lynxrdp_proto::frame::write_message;
+    use lynxrdp_proto::transfer::MAX_CONCURRENT_MEMORY_TRANSFERS;
     use std::net::TcpListener;
 
     /// A minimal fake server for exercising the client state machine.
@@ -955,6 +1047,141 @@ mod tests {
         let _server = fake_server(listener, vec![h]);
         let err = Client::connect(addr, &ConnectOptions::default(), None).unwrap_err();
         assert!(err.to_string().contains("version"), "{err}");
+    }
+
+    #[test]
+    fn a_refused_offer_is_reported_and_not_merely_declined() {
+        // The policy refusing an offer used to be silent: `TransferManager`
+        // answers on the wire and forgets, nothing reaches `Outcome::failed`,
+        // and the requester waits for a completion that cannot come. A caller
+        // counting a batch of downloads then never publishes it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = fake_server(
+            listener,
+            vec![
+                hello(4, 4),
+                // An id this client never asked for: refused by the policy,
+                // which is the same code path a local `File::create` failure
+                // takes on a name NTFS will not accept.
+                Message::TransferOffer {
+                    id: 4242,
+                    purpose: TransferPurpose::FileDownload,
+                    name: "what?.png".into(),
+                    size: 9,
+                },
+            ],
+        );
+        let mut c = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        match c.poll_event(Duration::from_secs(5)).unwrap().unwrap() {
+            ClientEvent::TransferFailed { id, reason } => {
+                assert_eq!(id, 4242);
+                assert!(reason.contains("unsolicited"), "{reason}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        c.disconnect("bye");
+        let received = server.join().unwrap();
+        assert!(
+            received.iter().any(|m| matches!(
+                m,
+                Message::TransferAccept {
+                    id: 4242,
+                    accepted: false,
+                    ..
+                }
+            )),
+            "the peer must still be told it was refused"
+        );
+    }
+
+    #[test]
+    fn a_refusal_the_policy_never_saw_is_reported_too() {
+        // The policy is not the only thing that turns an offer away.
+        // `TransferManager` refuses an offer that would be the third landing
+        // in memory before it consults the policy at all, so a scheme that
+        // reports refusals from inside the policy misses this one entirely --
+        // and the requester waits for a completion that cannot come. Reading
+        // the refusal off the reply is what covers every path at once.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let image = |id: u64| Message::TransferOffer {
+            id,
+            purpose: TransferPurpose::ClipboardImage,
+            name: "shot.png".into(),
+            // Non-zero, so each stays in flight rather than completing on the
+            // offer and freeing its slot again.
+            size: 16,
+        };
+        let mut script = vec![hello(4, 4)];
+        script.extend((0..=MAX_CONCURRENT_MEMORY_TRANSFERS as u64).map(image));
+        let server = fake_server(listener, script);
+        let mut c = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        let refused = MAX_CONCURRENT_MEMORY_TRANSFERS as u64;
+        match c.poll_event(Duration::from_secs(5)).unwrap().unwrap() {
+            ClientEvent::TransferFailed { id, reason } => {
+                assert_eq!(id, refused, "{reason}");
+                assert!(reason.contains("in-memory"), "{reason}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        c.disconnect("bye");
+        let received = server.join().unwrap();
+        assert!(
+            received.iter().any(|m| matches!(
+                m,
+                Message::TransferAccept {
+                    id,
+                    accepted: false,
+                    ..
+                } if *id == refused
+            )),
+            "the peer must still be told it was refused"
+        );
+    }
+
+    #[test]
+    fn every_outcome_of_one_message_reaches_the_caller() {
+        // A `TransferAck` pumps every outgoing transfer at once and a
+        // `TransferEnd` resolves whatever the same message finished, so one
+        // message can produce several events. Returning the first and dropping
+        // the rest leaves a caller tracking a set of transfers waiting on ids
+        // that were resolved and thrown away.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = fake_server(listener, vec![hello(4, 4)]);
+        let mut c = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        c.queued.push_back(ClientEvent::TransferFailed {
+            id: 1,
+            reason: "a".into(),
+        });
+        c.queued.push_back(ClientEvent::TransferFailed {
+            id: 2,
+            reason: "b".into(),
+        });
+        assert!(matches!(
+            c.try_event().unwrap(),
+            Some(ClientEvent::TransferFailed { id: 1, .. })
+        ));
+        assert!(matches!(
+            c.try_event().unwrap(),
+            Some(ClientEvent::TransferFailed { id: 2, .. })
+        ));
+        // Even after the connection is gone: a queued completion is owed to
+        // the caller regardless of what happened to the socket afterwards.
+        c.closed = Some("gone".into());
+        c.queued.push_back(ClientEvent::FileUploaded {
+            id: 3,
+            name: "c".into(),
+        });
+        assert!(matches!(
+            c.try_event().unwrap(),
+            Some(ClientEvent::FileUploaded { id: 3, .. })
+        ));
+        assert!(matches!(
+            c.try_event().unwrap(),
+            Some(ClientEvent::Disconnected(_))
+        ));
     }
 
     #[test]

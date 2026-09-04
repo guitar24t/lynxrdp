@@ -11,7 +11,9 @@
 //! the blit, never into the decoded framebuffer, because the server sends
 //! incremental frames that diff against the pixels it believes we hold.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,13 +27,19 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+use crate::clipchange::ClipboardWatcher;
 use crate::connection::{Client, ClientEvent};
 use crate::keymap;
 use crate::overlay::{self, Overlay};
 
 /// How long to wait after the last resize before asking the server.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
-/// Clipboard poll interval while focused.
+/// How often the clipboard watcher is consulted while focused.
+///
+/// This is the *decision* interval, not the read interval:
+/// [`ClipboardWatcher`] turns most of these ticks into nothing at all, and
+/// what it does not turn away is paced by the platform's own change counter
+/// or by its backoff.
 const CLIPBOARD_POLL: Duration = Duration::from_millis(700);
 /// RTT probe interval.
 const PING_INTERVAL: Duration = Duration::from_secs(3);
@@ -41,6 +49,15 @@ const STALL_AFTER: Duration = Duration::from_secs(2 * PING_INTERVAL.as_secs());
 /// How often the window repaints while the bar is up, so the round-trip and
 /// upload figures on it are not stale.
 const OVERLAY_TICK: Duration = Duration::from_millis(100);
+
+/// How many frames of presented damage are remembered, for buffer age.
+///
+/// Three is one more than any backend we ship against actually needs -- X11
+/// and Win32 keep a single shadow buffer and report age 1 forever, and
+/// softbuffer's Wayland backend double-buffers, so age settles at 2. The spare
+/// entry costs a few rectangles and means an age we did not predict is served
+/// from the log rather than falling back to a full repaint.
+const PRESENT_LOG_DEPTH: usize = 3;
 
 /// Pixels of trackpad scroll that make one wheel detent.
 ///
@@ -95,12 +112,25 @@ pub struct App {
     /// Hash of the last image seen on the local clipboard, so an image we
     /// received from the session is not immediately offered back to it.
     last_image: Option<u64>,
-    /// Uploads started by dropping files on the window: (transfer id, name).
+    /// Decides when the clipboard is worth reading at all.
+    clipwatch: ClipboardWatcher,
+    /// Uploads in flight: (transfer id, destination name).
     uploads: Vec<(u64, String)>,
-    /// Clipboard files downloaded so far in the current batch.
-    clipboard_files: Vec<std::path::PathBuf>,
-    /// How many clipboard files are still downloading.
-    clipboard_pending: usize,
+    /// Uploads waiting for a slot: (local path, destination name).
+    ///
+    /// Dropped files are queued rather than offered all at once because each
+    /// live transfer holds an open descriptor until the peer confirms it, and
+    /// `MAX_DROPPED_FILES` bounds one dropped *path*, not the drop: five
+    /// folders arrive as five separate events. See [`MAX_CONCURRENT_UPLOADS`].
+    upload_queue: VecDeque<(PathBuf, String)>,
+    /// Uploads finished (or given up on) since the queue was last empty, so
+    /// progress can be reported across a whole drop rather than per file.
+    upload_done: usize,
+    /// The clipboard file copy being staged, if any.
+    clipboard_batch: Option<ClipBatch>,
+    /// Number of clipboard batches this process has started, which is what
+    /// gives each one its own directory.
+    clipboard_batches: u64,
     last_clipboard_poll: Instant,
     last_ping: Instant,
     rtt: Option<Duration>,
@@ -108,6 +138,23 @@ pub struct App {
     /// Where the local cursor was drawn last frame, so the pixels it is
     /// leaving are presented along with the ones it is entering.
     last_cursor: Option<Rect>,
+    /// Where the bar was painted last frame.
+    ///
+    /// Tracked here as well as inside [`Overlay`] because the rectangle is
+    /// needed *before* the blit -- see [`App::redraw`] on why the bar's own
+    /// pixels have to be repainted from the framebuffer every time it is
+    /// drawn.
+    last_bar: Option<Rect>,
+    /// What each of the last few frames presented, newest first.
+    ///
+    /// This is what makes a buffer's age usable: age `n` means the buffer we
+    /// were handed holds the picture from `n` frames ago, so everything those
+    /// `n - 1` frames since changed has to be repainted along with this
+    /// frame's own damage.
+    present_log: VecDeque<Vec<Rect>>,
+    /// Window size at the last present, so a resize is caught here as well as
+    /// in the event that caused it.
+    presented_size: Option<(u32, u32)>,
     full_redraw: bool,
     /// Whether the next `RedrawRequested` is one we asked for.
     ///
@@ -189,14 +236,20 @@ impl App {
             clipboard,
             last_clipboard: None,
             last_image: None,
+            clipwatch: ClipboardWatcher::new(now),
             uploads: Vec::new(),
-            clipboard_files: Vec::new(),
-            clipboard_pending: 0,
+            upload_queue: VecDeque::new(),
+            upload_done: 0,
+            clipboard_batch: None,
+            clipboard_batches: 0,
             last_clipboard_poll: now,
             last_ping: now,
             rtt: None,
             dirty: None,
             last_cursor: None,
+            last_bar: None,
+            present_log: VecDeque::new(),
+            presented_size: None,
             full_redraw: true,
             redraw_asked: false,
             exit_reason: None,
@@ -240,18 +293,37 @@ impl App {
         if let Some(rtt) = self.rtt {
             t.push_str(&format!(" - {:.0} ms", rtt.as_secs_f64() * 1000.0));
         }
-        if !self.uploads.is_empty() {
-            let (done, total) = self.uploads.iter().fold((0u64, 0u64), |(d, t), (id, _)| {
-                let (a, b) = self.client.transfer_progress(*id).unwrap_or((0, 0));
-                (d + a, t + b)
-            });
-            let pct = (done * 100).checked_div(total).unwrap_or(0);
-            t.push_str(&format!(
-                " - uploading {} file(s) {pct}%",
-                self.uploads.len()
-            ));
+        if let Some((files, pct)) = self.upload_progress() {
+            t.push_str(&format!(" - uploading {files} file(s) {pct}%"));
         }
         t
+    }
+
+    /// Files still to upload and how far through the whole drop we are.
+    ///
+    /// The count spans the queue as well as the transfers actually running,
+    /// because a user who dropped a folder wants to know how much of *it* is
+    /// left, not how many descriptors we happen to be holding.
+    ///
+    /// The percentage counts files finished, plus the byte fraction of the
+    /// slice that is moving now -- which is why the slice is weighted by how
+    /// many files it holds. Byte progress alone would say 5% for a drop that
+    /// is nearly half done, and file progress alone would sit at 0% for the
+    /// whole of a single large file.
+    fn upload_progress(&self) -> Option<(usize, u64)> {
+        let remaining = self.uploads.len() + self.upload_queue.len();
+        if remaining == 0 {
+            return None;
+        }
+        let total = (self.upload_done + remaining) as u64;
+        let (done, size) = self.uploads.iter().fold((0u64, 0u64), |(d, t), (id, _)| {
+            let (a, b) = self.client.transfer_progress(*id).unwrap_or((0, 0));
+            (d + a, t + b)
+        });
+        let live = (self.uploads.len() as u64 * done * 100)
+            .checked_div(size)
+            .unwrap_or(0);
+        Some((remaining, (self.upload_done as u64 * 100 + live) / total))
     }
 
     fn init_window(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -296,12 +368,19 @@ impl App {
 
     /// Repaint the window and present what actually changed.
     ///
-    /// The whole window is still blitted every frame -- the framebuffer copy
-    /// is cheap and, more to the point, it means the buffer is complete
-    /// whichever of `softbuffer`'s buffers we were handed, so damage can be
-    /// declared without any buffer-age reasoning. What the damage list saves
-    /// is the upload: without it the compositor takes a full-window texture
-    /// for a two-line terminal cursor.
+    /// Both halves are now damage-driven: the same list of rectangles is
+    /// blitted out of the framebuffer and handed to `present_with_damage`, so
+    /// a blinking terminal cursor costs a few hundred pixels of copy and a few
+    /// hundred pixels of upload instead of two full-window passes.
+    ///
+    /// That is only sound because the buffer we are handed back is not blank.
+    /// `Buffer::age` says how many frames ago its contents were presented, and
+    /// [`stale_regions`] turns that into the extra rectangles the last few
+    /// frames changed and this buffer therefore has not seen. Where the age
+    /// cannot be trusted -- a fresh buffer (`age == 0`), an age deeper than the
+    /// log, an expose we did not ask for, or any resize -- the whole window is
+    /// repainted, which is exactly what this code did unconditionally before.
+    /// A full blit is a cost; a stale rectangle is a visible artefact.
     fn redraw(&mut self) -> Result<()> {
         let Some(size) = self.gfx.as_ref().map(|g| g.window.inner_size()) else {
             return Ok(());
@@ -321,6 +400,25 @@ impl App {
             (true, Some(cur)) => self.pointer.map(|(px, py)| cursor_bounds(cur, px, py)),
             _ => None,
         };
+        // The bar is blended over what is underneath it, so the pixels it
+        // covers have to come fresh out of the framebuffer every time it is
+        // painted -- otherwise the scrim is laid over a scrim and the strip
+        // darkens frame by frame. That means the rectangle has to be in the
+        // list *before* the blit, which is why it is predicted here rather
+        // than taken from what `Overlay::draw` returns. The prediction is
+        // exact: the bar is always the full window width and a fixed height.
+        let bar_now = (self.overlay.visible())
+            .then(|| Rect::new(0, 0, size.width, overlay::bar_height(scale)));
+        // A resize invalidates every buffer the surface holds, and
+        // softbuffer's Wayland backend reallocates the mapping without
+        // resetting `age`, so this check has to be ours rather than the
+        // backend's.
+        if self.presented_size != Some((size.width, size.height)) {
+            self.full_redraw = true;
+        }
+        // Snapshot before `gfx` is borrowed; it is at most three short lists.
+        let log: Vec<Vec<Rect>> = self.present_log.iter().cloned().collect();
+        let asked_full = self.full_redraw;
 
         let Some(gfx) = self.gfx.as_mut() else {
             return Ok(());
@@ -332,36 +430,80 @@ impl App {
             .surface
             .buffer_mut()
             .map_err(|e| anyhow::anyhow!("surface buffer: {e}"))?;
-        blit(&mut buf, size.width, size.height, self.client.framebuffer());
+
+        let stale = stale_regions(buf.age(), &log);
+        let full = asked_full || stale.is_none();
+        let own = [
+            self.dirty.unwrap_or_default(),
+            self.last_cursor.unwrap_or_default(),
+            cursor_now.unwrap_or_default(),
+            bar_now.unwrap_or_default(),
+            // What the bar covered last frame but does not now: the blit
+            // restores those pixels, but nothing else would present them.
+            self.last_bar.unwrap_or_default(),
+        ];
+        // Two lists, not one: `regions` is painted and presented, `changed` is
+        // what a later frame is told this one altered. See [`present_plan`] --
+        // conflating them makes a buffer age of 2 repaint the whole window for
+        // ever.
+        let (regions, changed) = present_plan(win, full, &own, &stale.unwrap_or_default());
+        for r in &regions {
+            blit_rect(
+                &mut buf,
+                size.width,
+                size.height,
+                self.client.framebuffer(),
+                *r,
+            );
+        }
         // After the blit and before the cursor: the bar sits over the remote
         // screen and under the pointer, and it is drawn into this buffer
         // rather than into the framebuffer the next frame will diff against.
         let (bar, bar_was) = self
             .overlay
             .draw(&mut buf, size.width, size.height, scale, &status);
+        debug_assert_eq!(
+            bar, bar_now,
+            "the predicted bar rectangle must match the painted one, or the \
+             blit did not cover the pixels the scrim was blended onto"
+        );
+        debug_assert_eq!(bar_was, self.last_bar, "the bar's own history drifted");
         if cursor_now.is_some() {
             if let (Some(cur), Some((px, py))) = (&self.cursor, self.pointer) {
                 draw_cursor(&mut buf, size.width, size.height, cur, px, py);
             }
         }
-        let parts = [
-            self.dirty.unwrap_or_default(),
-            self.last_cursor.unwrap_or_default(),
-            cursor_now.unwrap_or_default(),
-            bar.unwrap_or_default(),
-            // What the bar covered last frame but does not now: the blit has
-            // already restored those pixels, but nothing would present them.
-            bar_was.unwrap_or_default(),
-        ];
-        let damage: Vec<softbuffer::Rect> = damage_regions(win, self.full_redraw, &parts)
-            .into_iter()
-            .filter_map(surface_rect)
-            .collect();
-        buf.present_with_damage(&damage)
-            .map_err(|e| anyhow::anyhow!("present: {e}"))?;
+        let damage: Vec<softbuffer::Rect> =
+            regions.iter().copied().filter_map(surface_rect).collect();
+        let presented = buf.present_with_damage(&damage);
+
+        // Recorded before the error is propagated, and unconditionally: what
+        // the bar painted is what the *next* frame has to blit back, whether
+        // or not this one reached the screen.
         self.last_cursor = cursor_now;
+        self.last_bar = bar;
         self.dirty = None;
-        self.full_redraw = false;
+        self.presented_size = Some((size.width, size.height));
+        if presented.is_err() {
+            // A present that failed says nothing about what the surface now
+            // holds, so the next frame starts from nothing known.
+            self.present_log.clear();
+            self.full_redraw = true;
+        } else {
+            // A full redraw clears the log rather than appending to it:
+            // whatever forced the full redraw may also have replaced the
+            // buffers behind our back, and an entry from before that says
+            // nothing about what they hold now.
+            if full {
+                self.present_log.clear();
+            }
+            self.present_log.push_front(changed);
+            while self.present_log.len() > PRESENT_LOG_DEPTH {
+                self.present_log.pop_back();
+            }
+            self.full_redraw = false;
+        }
+        presented.map_err(|e| anyhow::anyhow!("present: {e}"))?;
         Ok(())
     }
 
@@ -382,16 +524,7 @@ impl App {
             self.rtt,
         );
         st.stalled = self.stalled_for(now);
-        if !self.uploads.is_empty() {
-            let (done, total) = self.uploads.iter().fold((0u64, 0u64), |(d, t), (id, _)| {
-                let (a, b) = self.client.transfer_progress(*id).unwrap_or((0, 0));
-                (d + a, t + b)
-            });
-            st.uploads = Some((
-                self.uploads.len(),
-                (done * 100).checked_div(total).unwrap_or(0),
-            ));
-        }
+        st.uploads = self.upload_progress();
         st
     }
 
@@ -475,24 +608,22 @@ impl App {
                     }
                     ClientEvent::ClipboardImage(png) => self.on_remote_image(png),
                     ClientEvent::ClipboardFiles(files) => self.on_remote_files(files),
-                    ClientEvent::FileDownloaded { path, name } => {
+                    ClientEvent::FileDownloaded { id, path, name } => {
                         log::info!("downloaded {name} to {}", path.display());
-                        self.on_clipboard_file_ready(path);
+                        self.on_clipboard_file(id, Some(path));
                     }
-                    ClientEvent::FileUploaded { name } => {
+                    ClientEvent::FileUploaded { id, name } => {
                         log::info!("uploaded {name}");
-                        let done = self
-                            .uploads
-                            .iter()
-                            .find(|(_, n)| *n == name)
-                            .map(|(id, _)| *id);
-                        if let Some(id) = done {
-                            self.finish_upload(id);
-                        }
+                        self.finish_upload(id);
                     }
                     ClientEvent::TransferFailed { id, reason } => {
+                        // Either direction, and the id says which: a failure
+                        // has to reach the batch as well as the upload list,
+                        // or a refused download leaves a paste waiting on a
+                        // file that is never coming.
                         log::warn!("transfer {id} failed: {reason}");
                         self.finish_upload(id);
+                        self.on_clipboard_file(id, None);
                     }
                     ClientEvent::Notice(text) => log::info!("server: {text}"),
                     ClientEvent::Rtt(rtt) => {
@@ -538,8 +669,19 @@ impl App {
         }
         if self.focused && now.duration_since(self.last_clipboard_poll) >= CLIPBOARD_POLL {
             self.last_clipboard_poll = now;
-            self.poll_clipboard();
-            self.poll_clipboard_image();
+            // Ask before reading. On Windows and macOS this is a change
+            // counter and almost every tick stops here; elsewhere the text
+            // read goes ahead as it always did and only the image read, which
+            // is the one that copies a whole screenshot out of the window
+            // system, is paced.
+            let look = self.clipwatch.tick(now);
+            if look.text {
+                self.poll_clipboard();
+            }
+            if look.image {
+                let found = self.poll_clipboard_image();
+                self.clipwatch.image_read(found, now);
+            }
         }
         if now.duration_since(self.last_title_update) >= Duration::from_secs(1) {
             self.last_title_update = now;
@@ -633,6 +775,15 @@ impl App {
     }
 
     /// Upload a file or directory dropped onto the window.
+    ///
+    /// The drop is queued, not started. `MAX_DROPPED_FILES` bounds the walk of
+    /// one dropped *path*, and a drop of five folders arrives as five separate
+    /// `DroppedFile` events -- so the bound that mattered was never applied to
+    /// what the user actually dropped. The budget below is checked against
+    /// everything already outstanding, and a path that does not fit is refused
+    /// whole: uploading the first two hundred files of a folder and silently
+    /// dropping the rest produces a directory in the session that looks
+    /// complete and is not.
     fn on_dropped_file(&mut self, path: &std::path::Path) {
         if self.client.info().features & features::FILE_TRANSFER == 0 {
             log::warn!("the server did not enable file transfer; ignoring dropped file");
@@ -649,14 +800,44 @@ impl App {
             log::warn!("nothing to upload from {}", path.display());
             return;
         }
-        for (local, dest) in files {
+        let outstanding = self.uploads.len() + self.upload_queue.len();
+        if outstanding + files.len() > MAX_PENDING_UPLOADS {
+            log::warn!(
+                "refusing {}: its {} file(s) on top of the {outstanding} already queued would \
+                 pass the {MAX_PENDING_UPLOADS} file limit; drop it again once the current \
+                 uploads have finished",
+                path.display(),
+                files.len()
+            );
+            return;
+        }
+        log::info!("queued {} file(s) from {}", files.len(), path.display());
+        self.upload_queue.extend(files);
+        self.pump_uploads();
+    }
+
+    /// Start as many queued uploads as the concurrency limit allows.
+    fn pump_uploads(&mut self) {
+        while self.uploads.len() < MAX_CONCURRENT_UPLOADS {
+            let Some((local, dest)) = self.upload_queue.pop_front() else {
+                break;
+            };
             match self.client.send_file(&local, &dest) {
                 Ok(id) => {
-                    log::info!("uploading {} as {dest}", local.display());
+                    log::debug!("uploading {} as {dest}", local.display());
                     self.uploads.push((id, dest));
                 }
-                Err(e) => log::warn!("uploading {} failed: {e:#}", local.display()),
+                Err(e) => {
+                    // One unreadable file does not stop the drop; it is
+                    // counted as finished so the progress figure still reaches
+                    // the end.
+                    log::warn!("uploading {} failed: {e:#}", local.display());
+                    self.upload_done += 1;
+                }
             }
+        }
+        if self.uploads.is_empty() && self.upload_queue.is_empty() {
+            self.upload_done = 0;
         }
         self.update_title();
     }
@@ -666,60 +847,131 @@ impl App {
         if files.is_empty() {
             return;
         }
-        let dir = match clipboard_staging_dir() {
+        // A copy in the session replaces whatever the last one was staging.
+        // The old transfers are cancelled rather than left to finish: nobody
+        // will paste them, and each one holds a descriptor and a share of the
+        // connection's global transfer window until it ends.
+        if let Some(old) = self.clipboard_batch.take() {
+            for id in old.live_ids() {
+                self.client.cancel_transfer(id);
+            }
+        }
+        let dir = match clipboard_staging_dir()
+            .and_then(|root| new_batch_dir(&root, &mut self.clipboard_batches))
+        {
             Ok(d) => d,
             Err(e) => {
                 log::warn!("cannot prepare the clipboard staging directory: {e:#}");
                 return;
             }
         };
-        self.clipboard_files.clear();
-        self.clipboard_pending = 0;
-        for f in &files {
-            let name = f.path.rsplit(['/', '\\']).next().unwrap_or("file");
-            let Some(safe) = lynxrdp_proto::transfer::safe_relative_path(name) else {
-                continue;
-            };
-            let dest = dir.join(&safe);
-            match self.client.request_file(&f.path, dest) {
-                Ok(_) => self.clipboard_pending += 1,
-                Err(e) => log::warn!("cannot fetch {}: {e:#}", f.path),
-            }
-        }
         log::info!(
-            "fetching {} file(s) copied in the session",
-            self.clipboard_pending
+            "fetching {} file(s) copied in the session into {}",
+            files.len(),
+            dir.display()
         );
+        self.clipboard_batch = Some(ClipBatch::new(dir, &files));
+        self.pump_clipboard_batch();
     }
 
-    /// One staged clipboard file arrived; publish once the batch is complete.
-    fn on_clipboard_file_ready(&mut self, path: std::path::PathBuf) {
-        if self.clipboard_pending == 0 {
+    /// Issue what the batch is allowed to have in flight, and publish it once
+    /// every file in it has either arrived or failed.
+    fn pump_clipboard_batch(&mut self) {
+        while let Some((remote, dest, slot)) = self
+            .clipboard_batch
+            .as_mut()
+            .and_then(ClipBatch::next_request)
+        {
+            match self.client.request_file(&remote, dest) {
+                Ok(id) => {
+                    if let Some(b) = self.clipboard_batch.as_mut() {
+                        b.requested(slot, id);
+                    }
+                }
+                // Nothing to record: taking it off the queue already made the
+                // batch one file closer to finishing, and its slot stays empty
+                // so the file is simply missing from what gets published.
+                Err(e) => log::warn!("cannot fetch {remote}: {e:#}"),
+            }
+        }
+        if self.clipboard_batch.as_ref().is_some_and(ClipBatch::done) {
+            if let Some(b) = self.clipboard_batch.take() {
+                self.publish_clipboard_batch(b);
+            }
+        }
+    }
+
+    /// One staged file resolved, one way or the other.
+    fn on_clipboard_file(&mut self, id: u64, path: Option<PathBuf>) {
+        let Some(b) = self.clipboard_batch.as_mut() else {
+            return;
+        };
+        if !b.resolve(id, path) {
+            // Not ours: an upload, or a leftover from a superseded batch.
             return;
         }
-        self.clipboard_files.push(path);
-        self.clipboard_pending -= 1;
-        if self.clipboard_pending > 0 {
-            return;
-        }
-        let files = std::mem::take(&mut self.clipboard_files);
-        match crate::fileclip::write_files(&files) {
-            Ok(()) => log::info!("{} file(s) are on the clipboard", files.len()),
-            Err(e) => {
-                // The files are still on disk, so say where rather than
-                // leaving the user with nothing.
-                log::warn!("could not put the files on the clipboard: {e:#}");
-                for f in &files {
-                    log::info!("downloaded to {}", f.display());
+        self.pump_clipboard_batch();
+    }
+
+    /// Put whatever arrived on the local clipboard.
+    ///
+    /// Whatever *arrived*, not everything that was asked for: one file the
+    /// session offered and this side could not create used to strand the
+    /// entire copy, because the batch was a count that only ever went down on
+    /// success. The user pressed Ctrl+V, got their old clipboard back, and the
+    /// explanation went to a terminal a windowed client does not have.
+    fn publish_clipboard_batch(&mut self, batch: ClipBatch) {
+        let asked = batch.total();
+        let dir = batch.dir().to_path_buf();
+        let files = batch.into_files();
+        if files.is_empty() {
+            log::warn!("none of the {asked} file(s) copied in the session could be staged");
+        } else {
+            if files.len() < asked {
+                log::warn!(
+                    "{} of {asked} file(s) could not be staged; offering the {} that could",
+                    asked - files.len(),
+                    files.len()
+                );
+            }
+            match crate::fileclip::write_files(&files) {
+                Ok(()) => log::info!("{} file(s) are on the clipboard", files.len()),
+                Err(e) => {
+                    // The files are still on disk, so say where rather than
+                    // leaving the user with nothing.
+                    log::warn!("could not put the files on the clipboard: {e:#}");
+                    for f in &files {
+                        log::info!("downloaded to {}", f.display());
+                    }
                 }
             }
         }
+        // Pruning happens here and not at startup. A staged file has to outlive
+        // the paste that reads it -- a file manager opens it when the user
+        // pastes, which may be minutes later -- so directories are removed only
+        // once a newer batch has replaced them, and the last few are kept
+        // because the paste of the previous copy may still be in progress.
+        // Doing it at startup instead would delete a directory a *running*
+        // download is writing into and then recreate it empty, which is the
+        // one ordering that loses data.
+        if let Some(parent) = dir.parent() {
+            prune_batches(parent, KEEP_STAGED_BATCHES);
+        }
     }
 
-    /// Forget an upload that finished or failed.
+    /// Forget an upload that finished or failed, and start the next.
+    ///
+    /// Matched by id, not by name: a queue that spans several drops can hold
+    /// two files with the same destination name -- `project/README.md` from
+    /// two projects -- and the first completion would then retire the wrong
+    /// transfer, leaving one in the list forever and its slot never reused.
     fn finish_upload(&mut self, id: u64) {
+        let before = self.uploads.len();
         self.uploads.retain(|(uid, _)| *uid != id);
-        self.update_title();
+        if self.uploads.len() < before {
+            self.upload_done += 1;
+        }
+        self.pump_uploads();
     }
 
     fn update_title(&self) {
@@ -750,25 +1002,29 @@ impl App {
     }
 
     /// Look for an image on the local clipboard and offer it to the session.
-    fn poll_clipboard_image(&mut self) {
+    ///
+    /// Returns whether the clipboard held an image this side had not seen
+    /// before, which is what tells [`ClipboardWatcher`] whether looking was
+    /// worth it.
+    fn poll_clipboard_image(&mut self) -> bool {
         if self.client.info().features & features::CLIPBOARD_IMAGE == 0 {
-            return;
+            return false;
         }
         let Some(cb) = self.clipboard.as_mut() else {
-            return;
+            return false;
         };
         let img = match cb.get_image() {
             Ok(i) => i,
             // No image on the clipboard is the common case, not an error.
-            Err(arboard::Error::ContentNotAvailable) => return,
+            Err(arboard::Error::ContentNotAvailable) => return false,
             Err(e) => {
                 log::debug!("reading the clipboard image failed: {e}");
-                return;
+                return false;
             }
         };
         let digest = image_digest(&img.bytes);
         if self.last_image == Some(digest) {
-            return;
+            return false;
         }
         self.last_image = Some(digest);
         let rgba = match crate::imageclip::Rgba::new(img.width, img.height, img.bytes.into_owned())
@@ -776,7 +1032,11 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 log::debug!("clipboard image was not usable: {e:#}");
-                return;
+                // Still a change: something new was on the clipboard, it was
+                // just not something we can send. Reporting it as "nothing
+                // found" would back the watcher off for as long as it sat
+                // there.
+                return true;
             }
         };
         match crate::imageclip::encode_png(&rgba) {
@@ -792,6 +1052,7 @@ impl App {
             }
             Err(e) => log::warn!("encoding the clipboard image failed: {e:#}"),
         }
+        true
     }
 
     fn poll_clipboard(&mut self) {
@@ -1117,6 +1378,65 @@ pub fn damage_regions(win: Rect, full: bool, parts: &[Rect]) -> Vec<Rect> {
     }
 }
 
+/// What a buffer of this age is still showing out of date.
+///
+/// `log` holds what each of the last few frames painted, newest first. An age
+/// of `n` means this buffer's contents are the picture from `n` frames ago, so
+/// the `n - 1` frames presented since then have changed pixels it has never
+/// seen; those are what come back. An age of 1 is the common case and needs
+/// nothing: the buffer is last frame's, and last frame's damage is already in
+/// it.
+///
+/// `None` means "no idea, repaint everything". That covers `age == 0`, which
+/// softbuffer documents as a buffer with unspecified contents, and an age
+/// deeper than the log -- including the case where the log was just cleared,
+/// because a cleared log is precisely the statement that nothing is known
+/// about what the buffers hold.
+pub fn stale_regions(age: u8, log: &[Vec<Rect>]) -> Option<Vec<Rect>> {
+    if age == 0 || log.is_empty() {
+        return None;
+    }
+    let back = usize::from(age) - 1;
+    if back > log.len() {
+        return None;
+    }
+    Some(log[..back].iter().flatten().copied().collect())
+}
+
+/// What to paint this frame, and what to remember of it.
+///
+/// `own` are the rectangles this frame's own state changed -- decoded damage,
+/// the cursor's old box and its new one, the bar's. `stale` is what
+/// [`stale_regions`] says the buffer we were handed has not seen. The paint
+/// list is both together; the remembered list is `own` alone.
+///
+/// That difference is the whole point of the function, and it is not
+/// cosmetic. What a buffer from `n` frames ago is missing is what *changed on
+/// screen* since, not what those frames happened to repaint -- and a log of
+/// the latter never decays where the age is 2. softbuffer's Wayland backend
+/// settles there permanently: each frame is handed the buffer from two frames
+/// back, so it repaints what the previous frame painted, which was in turn
+/// what the frame before that painted. Seed one full redraw into a log of
+/// painted rectangles -- and start-up seeds two -- and the whole window is
+/// blitted *and presented* for the rest of the session, which is exactly the
+/// cost the damage list exists to avoid. Remembering only what changed lets
+/// the list shrink back to the real damage on the second frame.
+///
+/// `own` is passed through [`damage_regions`], so an idle frame with nothing
+/// changed at all is remembered as the whole window rather than as nothing.
+/// That is the conservative direction (repainting more than needed is a cost,
+/// not an artefact), and `about_to_wait` does not ask for a redraw with
+/// nothing to draw, so it does not arise in practice.
+pub fn present_plan(win: Rect, full: bool, own: &[Rect], stale: &[Rect]) -> (Vec<Rect>, Vec<Rect>) {
+    let changed = damage_regions(win, full, own);
+    if full || stale.is_empty() {
+        return (changed.clone(), changed);
+    }
+    let mut all = own.to_vec();
+    all.extend_from_slice(stale);
+    (damage_regions(win, false, &all), changed)
+}
+
 /// Convert to softbuffer's rectangle, dropping empty ones.
 fn surface_rect(r: Rect) -> Option<softbuffer::Rect> {
     Some(softbuffer::Rect {
@@ -1195,6 +1515,12 @@ impl ApplicationHandler<Wake> for App {
                 self.focused = f;
                 self.overlay.set_focused(f);
                 if f {
+                    // Coming back to the window is the moment someone is about
+                    // to paste what they copied elsewhere, so the image poll's
+                    // backoff is cleared here rather than waited out. Where
+                    // there is a change counter this costs nothing: the
+                    // counter already knows whether anything was copied.
+                    self.clipwatch.wake(Instant::now());
                     self.poll_clipboard();
                 } else {
                     self.release_all_keys();
@@ -1295,15 +1621,320 @@ impl ApplicationHandler<Wake> for App {
 /// Where files copied in the session are downloaded before being offered on
 /// the local clipboard. A file manager pasting them reads them from here, so
 /// they outlive the paste rather than living in a directory we delete.
-pub fn clipboard_staging_dir() -> anyhow::Result<std::path::PathBuf> {
+///
+/// This is the root; each copy gets a numbered subdirectory of its own from
+/// [`new_batch_dir`]. It is per process so that two sessions cannot fight over
+/// the same names, and the process id is reused by the operating system, which
+/// is exactly why `new_batch_dir` refuses to reuse a directory it finds.
+pub fn clipboard_staging_dir() -> anyhow::Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("lynxrdp-clipboard-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
+/// Prefix of a per-copy staging directory under [`clipboard_staging_dir`].
+const BATCH_PREFIX: &str = "batch-";
+
+/// How many staged copies are kept before the oldest are deleted.
+///
+/// More than one, because a file manager reads a pasted file when the *paste*
+/// happens: copying something new in the session while the previous paste is
+/// still being written would otherwise delete the bytes out from under it.
+/// Four is a couple of copies' worth of grace and still a bounded amount of
+/// temporary space.
+const KEEP_STAGED_BATCHES: usize = 4;
+
 /// Largest number of files one drop may upload, so dropping a huge tree
 /// does not queue thousands of transfers by accident.
 pub const MAX_DROPPED_FILES: usize = 512;
+
+/// How many uploads may be in flight at once.
+///
+/// Each live transfer holds the source file open until the peer confirms it,
+/// and the whole point of a queue is that this number, not the size of the
+/// drop, is what the process's descriptor limit has to accommodate. macOS
+/// inherits `RLIMIT_NOFILE` from launchd, commonly 256, so a ~300 file folder
+/// used to fail partway through and take every other open in the process down
+/// with it.
+///
+/// Eight also costs nothing in throughput: `GLOBAL_WINDOW_CHUNKS` caps the
+/// data in flight across *all* transfers at sixteen chunks, so past about
+/// eight concurrent transfers each one is down to less than a chunk of window
+/// and the connection moves no faster for having more of them open.
+pub const MAX_CONCURRENT_UPLOADS: usize = 8;
+
+/// Largest number of files that may be queued and in flight together.
+///
+/// [`MAX_DROPPED_FILES`] bounds one dropped path; this bounds the drop. Four
+/// full folders' worth, after which a further drop is refused whole and said
+/// so, rather than accepted and quietly truncated.
+pub const MAX_PENDING_UPLOADS: usize = 4 * MAX_DROPPED_FILES;
+
+/// How many files of one clipboard copy are fetched at once.
+///
+/// The same reasoning as [`MAX_CONCURRENT_UPLOADS`], in the other direction:
+/// the receiving side creates a file per accepted offer and holds it open
+/// until the transfer ends, and a session may copy up to `MAX_FILE_LIST`
+/// (4096) files in one go.
+pub const MAX_CONCURRENT_CLIPBOARD_FILES: usize = 8;
+
+/// Longest staged file name, in bytes.
+///
+/// Comfortably inside the 255-byte component limit that ext4, APFS and NTFS
+/// all share, with room for the disambiguating suffix and the extension that
+/// are appended after the truncation.
+const MAX_STAGED_NAME: usize = 200;
+
+/// Create a fresh directory for one clipboard copy.
+///
+/// `next` is bumped past whatever was used, so the numbering is monotonic
+/// within a process and [`prune_batches`] can order by it. Creation is
+/// exclusive rather than `create_dir_all`, because the operating system reuses
+/// process ids: a directory already there belongs to a dead process that had
+/// this pid, and reusing it would mix its files into this copy.
+pub fn new_batch_dir(root: &Path, next: &mut u64) -> anyhow::Result<PathBuf> {
+    for _ in 0..1024 {
+        let dir = root.join(format!("{BATCH_PREFIX}{}", *next));
+        *next += 1;
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).context(format!("creating {}", dir.display())),
+        }
+    }
+    anyhow::bail!("no free staging directory under {}", root.display())
+}
+
+/// Delete all but the `keep` newest staged copies under `root`.
+///
+/// Ordered by the number in the name rather than by a timestamp: the number is
+/// what this process assigned, and a modification time can be identical across
+/// two copies made in the same second. Anything that is not a `batch-<n>`
+/// directory is left alone -- this runs against a directory in the system
+/// temporary area and has no business deleting something it does not recognise.
+pub fn prune_batches(root: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut found: Vec<(u64, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(n) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(BATCH_PREFIX))
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        found.push((n, entry.path()));
+    }
+    // Newest batch first, so `skip(keep)` drops the oldest.
+    found.sort_unstable_by_key(|(n, _)| std::cmp::Reverse(*n));
+    for (_, path) in found.into_iter().skip(keep) {
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            log::debug!("could not remove {}: {e}", path.display());
+        }
+    }
+}
+
+/// Reduce a name from the session to one every platform can create.
+///
+/// Sanitising happens on all three platforms, not under `cfg(windows)`, for
+/// two reasons. The obvious one is that the staged file has to be creatable
+/// here; the less obvious one is that the *result* has to be predictable,
+/// because the caller deduplicates names and a rule that differs per platform
+/// gives a different set of collisions per platform -- so the case that
+/// silently overwrites a file would only ever appear on the platform nobody
+/// tested on.
+///
+/// What is removed: the path separators and the characters Windows rejects
+/// outright, control characters (a newline in a file name is legal on Linux
+/// and a menace everywhere else), trailing dots and spaces, which Windows
+/// strips when it resolves a name so that `report.` and `report` are the same
+/// file, and the device names that are reserved whatever the extension.
+pub fn safe_file_name(raw: &str) -> String {
+    const FORBIDDEN: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+    // `CON.txt` opens the console on Windows, not a file. The check is on the
+    // part before the first dot, which is how Windows resolves them.
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+
+    let mut name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_control() || FORBIDDEN.contains(&c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    if name.len() > MAX_STAGED_NAME {
+        // Keep the extension: it is what a file manager uses to decide what
+        // the pasted file is, and losing it turns a spreadsheet into a blob.
+        let ext = Path::new(&name)
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned())
+            .filter(|e| e.len() <= 16)
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
+        let mut cut = MAX_STAGED_NAME - ext.len();
+        while cut > 0 && !name.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        name.truncate(cut);
+        name.push_str(&ext);
+    }
+
+    // After the truncation, not before: cutting a name can expose a dot that
+    // was in the middle of it.
+    let trimmed = name.trim_end_matches([' ', '.']);
+    // This is also what rules out "." and "..", which trim to nothing.
+    let mut name = if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
+    };
+    let stem = name.split('.').next().unwrap_or_default();
+    if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
+        name.insert(0, '_');
+    }
+    name
+}
+
+/// Make `name` unique among the names already `taken`, recording it.
+///
+/// Two files called `notes.txt` from different directories in the session used
+/// to be staged over each other -- the second `File::create` truncated the
+/// first and the paste delivered one file where the user copied two, with no
+/// error anywhere. Comparison is case-insensitive because NTFS and a default
+/// APFS volume both resolve `Notes.txt` and `notes.txt` to the same file, so
+/// on those platforms the collision is real even when the names differ.
+pub fn unique_name(taken: &mut HashSet<String>, name: &str) -> String {
+    if taken.insert(name.to_lowercase()) {
+        return name.to_string();
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string());
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    // Terminates because `taken` is finite and every candidate is distinct.
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{stem} ({n}){ext}");
+        if taken.insert(candidate.to_lowercase()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// One clipboard file copy, from the session's list to the local clipboard.
+///
+/// A batch cannot be tracked by a count, which is what it was: the counter
+/// only came down when a file arrived, so a single file that could not be
+/// created locally left it stuck above zero and the copy was never published
+/// at all. That is disproportionately a Windows failure -- `a:b.txt`,
+/// `what?.png`, `CON` and a trailing dot are all ordinary names in an X11
+/// session and none of them can be created on NTFS -- and the user's only
+/// symptom was Ctrl+V returning their old clipboard.
+///
+/// Here every file has a slot and every transfer has an id, each id is
+/// resolved exactly once whether it arrived or failed, and the batch finishes
+/// when there is nothing left outstanding. What did not arrive is simply
+/// missing from the published list.
+pub struct ClipBatch {
+    dir: PathBuf,
+    /// Not yet requested: (remote path, local destination, slot).
+    queued: VecDeque<(String, PathBuf, usize)>,
+    /// Requested and unresolved: transfer id to slot.
+    live: HashMap<u64, usize>,
+    /// Where each file landed, in the order the session listed them. Order is
+    /// kept because it is the order the user selected, and a file manager
+    /// shows a paste in the order it is given.
+    slots: Vec<Option<PathBuf>>,
+}
+
+impl ClipBatch {
+    /// Plan a copy: one slot per file, with a staged name that is safe on this
+    /// platform and unique within the batch.
+    pub fn new(dir: PathBuf, files: &[lynxrdp_proto::FileEntry]) -> Self {
+        let mut taken = HashSet::new();
+        let mut queued = VecDeque::with_capacity(files.len());
+        for (slot, f) in files.iter().enumerate() {
+            let base = f.path.rsplit(['/', '\\']).next().unwrap_or_default();
+            let name = unique_name(&mut taken, &safe_file_name(base));
+            queued.push_back((f.path.clone(), dir.join(name), slot));
+        }
+        Self {
+            dir,
+            queued,
+            live: HashMap::new(),
+            slots: vec![None; files.len()],
+        }
+    }
+
+    /// Where this batch is staged.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// How many files the session offered.
+    pub fn total(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The next file to request, if the concurrency limit leaves room.
+    pub fn next_request(&mut self) -> Option<(String, PathBuf, usize)> {
+        if self.live.len() >= MAX_CONCURRENT_CLIPBOARD_FILES {
+            return None;
+        }
+        self.queued.pop_front()
+    }
+
+    /// Record the transfer id a request was given.
+    pub fn requested(&mut self, slot: usize, id: u64) {
+        self.live.insert(id, slot);
+    }
+
+    /// Resolve a transfer: `Some(path)` if it arrived, `None` if it failed.
+    /// Returns whether the id belonged to this batch.
+    pub fn resolve(&mut self, id: u64, path: Option<PathBuf>) -> bool {
+        let Some(slot) = self.live.remove(&id) else {
+            return false;
+        };
+        if let Some(p) = path {
+            self.slots[slot] = Some(p);
+        }
+        true
+    }
+
+    /// Transfers still in flight, for cancelling a superseded copy.
+    pub fn live_ids(&self) -> Vec<u64> {
+        self.live.keys().copied().collect()
+    }
+
+    /// Whether every file has arrived, failed or been given up on.
+    pub fn done(&self) -> bool {
+        self.queued.is_empty() && self.live.is_empty()
+    }
+
+    /// The files that actually landed, in the order they were copied.
+    pub fn into_files(self) -> Vec<PathBuf> {
+        self.slots.into_iter().flatten().collect()
+    }
+}
 
 /// Work out what to upload for a dropped path.
 ///
@@ -1369,6 +2000,11 @@ fn image_digest(bytes: &[u8]) -> u64 {
 
 /// Copy the framebuffer into the window buffer (top-left anchored, black
 /// where the window is larger than the remote screen).
+///
+/// [`redraw`](App::redraw) goes through [`blit_rect`] now, but this stays as
+/// the statement of what a full repaint means, and as what `blit_rect` is
+/// tested against: the two must agree over the whole window or the damage
+/// path is painting something the full path would not.
 pub fn blit(dst: &mut [u32], dst_w: u32, dst_h: u32, fb: &Framebuffer) {
     let w = dst_w.min(fb.width());
     let h = dst_h.min(fb.height());
@@ -1377,6 +2013,40 @@ pub fn blit(dst: &mut [u32], dst_w: u32, dst_h: u32, fb: &Framebuffer) {
         if y < h {
             row[..w as usize].copy_from_slice(fb.row(y, 0, w));
             row[w as usize..].fill(0);
+        } else {
+            row.fill(0);
+        }
+    }
+}
+
+/// Copy one rectangle of the framebuffer into the window buffer.
+///
+/// Row for row this does exactly what [`blit`] does to those rows: framebuffer
+/// pixels where the remote screen reaches, black where it does not. The clamp
+/// is the entire point of the function. `Framebuffer::row` panics past its end
+/// and the window is routinely larger than the remote screen -- a window
+/// maximised before the session has resized to match is the ordinary case, not
+/// a corner -- so a rectangle that runs off the right or bottom edge of the
+/// remote screen has to be split into the part that is there and the part that
+/// is padding, per row, exactly as `blit` splits it.
+pub fn blit_rect(dst: &mut [u32], dst_w: u32, dst_h: u32, fb: &Framebuffer, rect: Rect) {
+    if dst.len() < (dst_w as usize) * (dst_h as usize) {
+        return;
+    }
+    let r = rect.intersect(&Rect::new(0, 0, dst_w, dst_h));
+    if r.is_empty() {
+        return;
+    }
+    // Columns of this rectangle the framebuffer actually covers. Saturating,
+    // because a rectangle can start beyond the right edge of the remote screen
+    // and then every column of it is padding.
+    let copy_w = r.right().min(fb.width()).saturating_sub(r.x);
+    for y in r.y..r.bottom() {
+        let start = (y as usize) * (dst_w as usize) + (r.x as usize);
+        let row = &mut dst[start..start + r.width as usize];
+        if y < fb.height() && copy_w > 0 {
+            row[..copy_w as usize].copy_from_slice(fb.row(y, r.x, copy_w));
+            row[copy_w as usize..].fill(0);
         } else {
             row.fill(0);
         }
@@ -1497,6 +2167,152 @@ mod tests {
                 lynxrdp_proto::transfer::safe_relative_path(&dest).is_some(),
                 "{dest} would be refused by the session"
             );
+        }
+    }
+
+    /// A framebuffer whose pixels all differ, so a misplaced copy shows up.
+    fn ramp(w: u32, h: u32) -> Framebuffer {
+        let mut fb = Framebuffer::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                fb.set(x, y, 0x11_0000 | (y * w + x));
+            }
+        }
+        fb
+    }
+
+    #[test]
+    fn a_full_window_blit_rect_is_the_full_blit() {
+        // The equivalence the damage path rests on: when everything is
+        // repainted, repainting it rectangle by rectangle has to produce the
+        // pixels the old unconditional blit produced. The window sizes cover
+        // both directions of over- and under-hang.
+        let fb = ramp(7, 5);
+        for (w, h) in [(7u32, 5u32), (10, 8), (4, 3), (10, 3), (4, 8)] {
+            let mut whole = vec![0xDEADu32; (w * h) as usize];
+            let mut piece = whole.clone();
+            blit(&mut whole, w, h, &fb);
+            blit_rect(&mut piece, w, h, &fb, Rect::new(0, 0, w, h));
+            assert_eq!(whole, piece, "{w}x{h} window");
+        }
+    }
+
+    #[test]
+    fn blit_rect_pads_exactly_where_blit_pads() {
+        // The window is wider and taller than the remote screen, and the
+        // rectangle straddles both edges. `Framebuffer::row` panics past its
+        // end, so getting this wrong is a crash rather than an artefact.
+        let fb = ramp(4, 3);
+        let (w, h) = (8u32, 6u32);
+        let mut whole = vec![0xDEADu32; (w * h) as usize];
+        blit(&mut whole, w, h, &fb);
+        for rect in [
+            Rect::new(2, 1, 4, 4),   // straddles the right and bottom edges
+            Rect::new(5, 0, 3, 6),   // entirely past the right edge
+            Rect::new(0, 4, 8, 2),   // entirely below the bottom edge
+            Rect::new(0, 0, 8, 6),   // the lot
+            Rect::new(3, 2, 100, 9), // running off the window, to be clipped
+        ] {
+            let mut piece = vec![0xDEADu32; (w * h) as usize];
+            blit_rect(&mut piece, w, h, &fb, Rect::new(0, 0, w, h));
+            // Scribble over the rectangle, then repaint just it: the result
+            // must be indistinguishable from the full blit.
+            let clipped = rect.intersect(&Rect::new(0, 0, w, h));
+            for y in clipped.y..clipped.bottom() {
+                for x in clipped.x..clipped.right() {
+                    piece[(y * w + x) as usize] = 0xBADD;
+                }
+            }
+            blit_rect(&mut piece, w, h, &fb, rect);
+            assert_eq!(whole, piece, "{rect}");
+        }
+    }
+
+    #[test]
+    fn blit_rect_touches_nothing_outside_itself() {
+        let fb = ramp(6, 6);
+        let (w, h) = (6u32, 6u32);
+        let mut buf = vec![0xBADDu32; (w * h) as usize];
+        blit_rect(&mut buf, w, h, &fb, Rect::new(2, 2, 2, 2));
+        for y in 0..h {
+            for x in 0..w {
+                let inside = (2..4).contains(&x) && (2..4).contains(&y);
+                let got = buf[(y * w + x) as usize];
+                if inside {
+                    assert_eq!(got, fb.get(x, y), "({x},{y})");
+                } else {
+                    assert_eq!(got, 0xBADD, "({x},{y}) was overwritten");
+                }
+            }
+        }
+        // An empty rectangle, and one wholly off the window, do nothing.
+        let before = buf.clone();
+        blit_rect(&mut buf, w, h, &fb, Rect::default());
+        blit_rect(&mut buf, w, h, &fb, Rect::new(20, 20, 4, 4));
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn buffer_age_names_the_frames_the_buffer_missed() {
+        let log = vec![
+            vec![Rect::new(1, 1, 2, 2)],
+            vec![Rect::new(5, 5, 3, 3)],
+            vec![Rect::new(9, 9, 4, 4)],
+        ];
+        // A fresh buffer holds nothing we can reason about.
+        assert_eq!(stale_regions(0, &log), None);
+        // Age 1 is last frame's buffer: last frame's damage is already in it.
+        assert_eq!(stale_regions(1, &log), Some(vec![]));
+        assert_eq!(stale_regions(2, &log), Some(vec![Rect::new(1, 1, 2, 2)]));
+        assert_eq!(
+            stale_regions(3, &log),
+            Some(vec![Rect::new(1, 1, 2, 2), Rect::new(5, 5, 3, 3)])
+        );
+        // Deeper than the log: nothing is known, so everything is repainted.
+        assert_eq!(stale_regions(5, &log), None);
+        // And an empty log is exactly the statement that nothing is known --
+        // it is what a full redraw leaves behind.
+        assert_eq!(stale_regions(1, &[]), None);
+        assert_eq!(stale_regions(2, &[]), None);
+    }
+
+    #[test]
+    fn a_double_buffered_backend_settles_back_to_the_real_damage() {
+        // softbuffer's Wayland backend settles at a buffer age of 2 for the
+        // life of the surface: every frame is handed the buffer from two
+        // frames back and has to repaint what the frame in between changed.
+        // Remember what was *painted* instead of what changed and that is a
+        // fixed point -- the full redraws at start-up put the whole window in
+        // the log, the next frame repaints the whole window because of it and
+        // logs that, and the window is blitted and presented in full for the
+        // rest of the session. This walks the loop the way `redraw` does.
+        let win = Rect::new(0, 0, 100, 100);
+        let d = Rect::new(10, 10, 4, 4);
+        let mut log: VecDeque<Vec<Rect>> = VecDeque::new();
+        let mut painted: Vec<Vec<Rect>> = Vec::new();
+        for frame in 0..6 {
+            // Age 0 on the first frame (nothing has been presented yet), 2
+            // from then on, which is what the backend actually reports.
+            let age = if frame == 0 { 0 } else { 2 };
+            let snapshot: Vec<Vec<Rect>> = log.iter().cloned().collect();
+            let stale = stale_regions(age, &snapshot);
+            let full = stale.is_none();
+            let (paint, changed) = present_plan(win, full, &[d], &stale.unwrap_or_default());
+            painted.push(paint);
+            if full {
+                log.clear();
+            }
+            log.push_front(changed);
+            while log.len() > PRESENT_LOG_DEPTH {
+                log.pop_back();
+            }
+        }
+        assert_eq!(painted[0], vec![win], "a fresh buffer has to be filled");
+        // The only frame between this buffer and the one it holds was the full
+        // one, so this frame genuinely does owe the whole window.
+        assert_eq!(painted[1], vec![win]);
+        for (i, p) in painted.iter().enumerate().skip(2) {
+            assert_eq!(p, &vec![d], "frame {i} never stopped repainting the lot");
         }
     }
 
@@ -1770,6 +2586,265 @@ mod tests {
 
         blit(&mut buf, w, h, &fb);
         assert_eq!(buf, clean, "the next blit must erase every trace of it");
+    }
+
+    fn entries(paths: &[&str]) -> Vec<lynxrdp_proto::FileEntry> {
+        paths
+            .iter()
+            .map(|p| lynxrdp_proto::FileEntry {
+                path: (*p).to_string(),
+                size: 1,
+            })
+            .collect()
+    }
+
+    /// Issue every request the batch will give out, numbering the transfers
+    /// 1, 2, 3... as a real connection would. Returns (id, destination).
+    fn issue_all(batch: &mut ClipBatch, from: u64) -> Vec<(u64, PathBuf)> {
+        let mut out = Vec::new();
+        let mut next = from;
+        while let Some((_, dest, slot)) = batch.next_request() {
+            batch.requested(slot, next);
+            out.push((next, dest));
+            next += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn one_file_that_cannot_be_staged_no_longer_strands_the_paste() {
+        // The defect this replaces: the batch was a count decremented only on
+        // success, so a file that failed left it above zero forever. The user
+        // pressed Ctrl+V, got their old clipboard back, and the warning went
+        // to a terminal a windowed client does not have.
+        let mut b = ClipBatch::new(
+            PathBuf::from("/staging"),
+            &entries(&["/home/a/notes.txt", "/home/a/what?.png"]),
+        );
+        let issued = issue_all(&mut b, 1);
+        assert_eq!(issued.len(), 2);
+        assert!(!b.done());
+        assert!(b.resolve(issued[0].0, Some(issued[0].1.clone())));
+        assert!(!b.done());
+        // The second one failed -- a refused offer, or a local `File::create`
+        // that could not make the name. It still resolves.
+        assert!(b.resolve(issued[1].0, None));
+        assert!(b.done());
+        assert_eq!(b.into_files(), vec![issued[0].1.clone()]);
+    }
+
+    #[test]
+    fn a_transfer_that_is_not_ours_is_ignored() {
+        // Uploads and the tail of a superseded copy both arrive as ids this
+        // batch has never heard of, and resolving one of those against a slot
+        // would finish the batch early.
+        let mut b = ClipBatch::new(PathBuf::from("/staging"), &entries(&["/a/one.txt"]));
+        let issued = issue_all(&mut b, 10);
+        assert!(!b.resolve(999, Some(PathBuf::from("/elsewhere"))));
+        assert!(!b.done());
+        assert!(b.resolve(issued[0].0, Some(issued[0].1.clone())));
+        assert!(b.done());
+    }
+
+    #[test]
+    fn two_files_with_one_name_get_two_files() {
+        // Flattening to the basename is unavoidable -- a clipboard file list
+        // is a list of names -- but flattening two of them onto one path is
+        // not: the second `File::create` truncated the first and the paste
+        // delivered one file where the user copied two, silently.
+        let mut b = ClipBatch::new(
+            PathBuf::from("/staging"),
+            &entries(&["/a/notes.txt", "/b/notes.txt", "/c/NOTES.TXT", "/d/notes"]),
+        );
+        let dests: Vec<PathBuf> = issue_all(&mut b, 1).into_iter().map(|(_, d)| d).collect();
+        let mut seen: Vec<String> = dests
+            .iter()
+            .map(|d| d.file_name().unwrap().to_string_lossy().to_lowercase())
+            .collect();
+        let before = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            before,
+            "two files landed on one name: {dests:?}"
+        );
+        assert_eq!(dests[0].file_name().unwrap().to_string_lossy(), "notes.txt");
+        assert_eq!(
+            dests[1].file_name().unwrap().to_string_lossy(),
+            "notes (2).txt"
+        );
+    }
+
+    #[test]
+    fn a_batch_keeps_only_a_few_files_open_at_a_time() {
+        // A session may copy up to MAX_FILE_LIST files, and each accepted
+        // offer creates a file this side holds open until the transfer ends.
+        // macOS inherits an RLIMIT_NOFILE of 256 from launchd.
+        let paths: Vec<String> = (0..64).map(|i| format!("/a/f{i}.txt")).collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let mut b = ClipBatch::new(PathBuf::from("/staging"), &entries(&refs));
+        let first = issue_all(&mut b, 1);
+        assert_eq!(first.len(), MAX_CONCURRENT_CLIPBOARD_FILES);
+        // A slot only frees when a transfer resolves.
+        assert!(b.next_request().is_none());
+        b.resolve(first[0].0, Some(first[0].1.clone()));
+        assert!(b.next_request().is_some());
+    }
+
+    #[test]
+    fn the_published_order_is_the_order_the_session_copied_in() {
+        // A file manager shows a paste in the order it is handed, and files
+        // finish in whatever order the network delivers them.
+        let mut b = ClipBatch::new(
+            PathBuf::from("/staging"),
+            &entries(&["/a/one.txt", "/a/two.txt", "/a/three.txt"]),
+        );
+        let issued = issue_all(&mut b, 1);
+        for i in [2usize, 0, 1] {
+            b.resolve(issued[i].0, Some(issued[i].1.clone()));
+        }
+        assert!(b.done());
+        assert_eq!(
+            b.into_files(),
+            vec![
+                issued[0].1.clone(),
+                issued[1].1.clone(),
+                issued[2].1.clone()
+            ]
+        );
+    }
+
+    #[test]
+    fn names_the_session_allows_and_a_filesystem_does_not() {
+        // Every one of these is an ordinary name in an X11 session and none of
+        // them can be created on NTFS. Sanitising happens on all platforms so
+        // that the deduplication above sees the same collisions everywhere.
+        for (raw, want) in [
+            ("notes.txt", "notes.txt"),
+            ("a:b.txt", "a_b.txt"),
+            ("what?.png", "what_.png"),
+            ("re<port>.txt", "re_port_.txt"),
+            ("pipe|it", "pipe_it"),
+            ("star*", "star_"),
+            ("quote\"d", "quote_d"),
+            ("line\nbreak", "line_break"),
+            ("report.", "report"),
+            ("report...", "report"),
+            ("trailing  ", "trailing"),
+            ("CON", "_CON"),
+            ("con.txt", "_con.txt"),
+            ("LPT9.log", "_LPT9.log"),
+            ("nul", "_nul"),
+            // Not reserved: the device names are exact, not prefixes.
+            ("console.log", "console.log"),
+            (".", "file"),
+            ("..", "file"),
+            ("", "file"),
+            ("   ", "file"),
+            // Separators cannot survive: the name is joined onto the staging
+            // directory and must not be able to point anywhere else.
+            ("a/b.txt", "a_b.txt"),
+            ("a\\b.txt", "a_b.txt"),
+            ("../../.ssh/authorized_keys", ".._.._.ssh_authorized_keys"),
+        ] {
+            assert_eq!(safe_file_name(raw), want, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_staged_name_is_always_a_single_safe_component() {
+        // The property, rather than the table: whatever the session says, the
+        // result is one component the session's own traversal check accepts.
+        for raw in [
+            "notes.txt",
+            "../..",
+            "/etc/passwd",
+            "C:\\Windows\\System32",
+            "\u{0}embedded",
+            "CON",
+            &"x".repeat(4000),
+            &format!("{}.tar.gz", "y".repeat(4000)),
+            &"\u{e9}".repeat(500),
+        ] {
+            let got = safe_file_name(raw);
+            assert!(!got.is_empty(), "{raw:?} produced nothing");
+            assert!(!got.contains(['/', '\\', '\0']), "{raw:?} produced {got:?}");
+            assert!(got != "." && got != "..", "{raw:?} produced {got:?}");
+            assert!(
+                got.len() <= MAX_STAGED_NAME + 1,
+                "{raw:?} is {} bytes",
+                got.len()
+            );
+            assert_eq!(
+                lynxrdp_proto::transfer::safe_relative_path(&got).as_deref(),
+                Some(got.as_str()),
+                "{raw:?} produced {got:?}, which the traversal check changes"
+            );
+        }
+        // A long name keeps its extension, which is what a file manager uses
+        // to decide what the pasted file is.
+        assert!(safe_file_name(&format!("{}.pdf", "z".repeat(4000))).ends_with(".pdf"));
+    }
+
+    #[test]
+    fn unique_name_disambiguates_case_insensitively() {
+        // NTFS and a default APFS volume both resolve Notes.txt and notes.txt
+        // to the same file, so a case-sensitive check would miss the
+        // collision on exactly the platforms where it matters.
+        let mut taken = HashSet::new();
+        assert_eq!(unique_name(&mut taken, "notes.txt"), "notes.txt");
+        assert_eq!(unique_name(&mut taken, "NOTES.TXT"), "NOTES (2).TXT");
+        assert_eq!(unique_name(&mut taken, "notes.txt"), "notes (3).txt");
+        assert_eq!(unique_name(&mut taken, "README"), "README");
+        assert_eq!(unique_name(&mut taken, "README"), "README (2)");
+        assert_eq!(unique_name(&mut taken, "a.tar.gz"), "a.tar.gz");
+        assert_eq!(unique_name(&mut taken, "a.tar.gz"), "a.tar (2).gz");
+    }
+
+    #[test]
+    fn each_copy_gets_a_directory_of_its_own() {
+        // Two copies of `notes.txt` must not share a path, and a second copy
+        // must not overwrite bytes a still-running paste of the first is
+        // reading. One directory per copy is what buys both.
+        let root = tempfile::tempdir().unwrap();
+        let mut next = 0u64;
+        let a = new_batch_dir(root.path(), &mut next).unwrap();
+        let b = new_batch_dir(root.path(), &mut next).unwrap();
+        assert_ne!(a, b);
+        assert!(a.is_dir() && b.is_dir());
+        // A directory left by a dead process that had this pid is never
+        // adopted: its files would be mixed into this copy.
+        let mut reused = 0u64;
+        let c = new_batch_dir(root.path(), &mut reused).unwrap();
+        assert_ne!(c, a);
+        assert_ne!(c, b);
+    }
+
+    #[test]
+    fn pruning_keeps_the_newest_and_leaves_strangers_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let mut next = 0u64;
+        let dirs: Vec<PathBuf> = (0..6)
+            .map(|_| new_batch_dir(root.path(), &mut next).unwrap())
+            .collect();
+        for d in &dirs {
+            std::fs::write(d.join("f.txt"), b"x").unwrap();
+        }
+        // Something we did not create. This runs against a directory in the
+        // system temporary area; deleting what it does not recognise is not
+        // its business.
+        let stranger = root.path().join("not-a-batch");
+        std::fs::create_dir(&stranger).unwrap();
+        std::fs::write(root.path().join("batch-notanumber"), b"x").unwrap();
+
+        prune_batches(root.path(), 2);
+        assert!(!dirs[0].exists() && !dirs[3].exists());
+        assert!(dirs[4].exists() && dirs[5].exists());
+        assert!(stranger.exists());
+        assert!(root.path().join("batch-notanumber").exists());
+        // Pruning an absent directory is not an error.
+        prune_batches(&root.path().join("missing"), 2);
     }
 
     #[test]
