@@ -13,6 +13,8 @@
 //! of that into a config file of ours would be a step backwards. A profile
 //! names an identity *file* at most, which is a path, not a secret.
 
+use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -27,6 +29,11 @@ pub const MAX_PROFILES: usize = 500;
 
 /// Longest name, host or user we accept.
 pub const MAX_FIELD: usize = 255;
+
+/// How many rejected copies of the connections file we will keep before
+/// refusing to make another. A hundred `.bad` files means something is wrong
+/// that moving a hundred and first aside will not fix.
+pub const MAX_ASIDE: u32 = 100;
 
 /// Whether a flag is off, for `skip_serializing_if`.
 ///
@@ -234,16 +241,30 @@ impl Profiles {
     ///
     /// Written to a temporary file and renamed, so an interrupted save
     /// cannot leave a half-written file where the connections used to be.
+    /// Two details make that actually true rather than merely intended:
+    /// the temporary name is unique to this process, and its contents are
+    /// on disk before the rename. `temp_path` and `write_durably` say what
+    /// goes wrong without each.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let temporary = path.with_extension("toml.new");
-        std::fs::write(&temporary, self.to_toml())
-            .with_context(|| format!("writing {}", temporary.display()))?;
-        std::fs::rename(&temporary, path)
-            .with_context(|| format!("replacing {}", path.display()))?;
+        let temporary = temp_path(path);
+        if let Err(e) = write_durably(&temporary, self.to_toml().as_bytes()) {
+            // Both error paths take the temporary with them. Correctness
+            // does not depend on it -- the next save truncates whatever is
+            // there -- but this is the user's configuration directory, and a
+            // stray connections.toml.4711.new sitting next to the real file
+            // is exactly the sort of thing that gets opened and edited by
+            // mistake.
+            let _ = std::fs::remove_file(&temporary);
+            return Err(e).with_context(|| format!("writing {}", temporary.display()));
+        }
+        if let Err(e) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(e).with_context(|| format!("replacing {}", path.display()));
+        }
         Ok(())
     }
 
@@ -267,6 +288,22 @@ impl Profiles {
                 false
             }
         }
+    }
+
+    /// Whether `name` belongs to some profile other than `excluding`.
+    ///
+    /// The name is the key: [`Self::upsert`] replaces the entry that has it.
+    /// So an editor that saved onto a name already in use would not report a
+    /// clash, it would quietly fold two connections into one and lose the
+    /// host of whichever was there first. `excluding` is the name the editor
+    /// started from, since saving a profile back under its own name is not a
+    /// clash. Compared exactly, matching [`Self::position`]: a check that
+    /// disagreed with the lookup would refuse saves that upsert would have
+    /// treated as new.
+    pub fn name_taken(&self, name: &str, excluding: Option<&str>) -> bool {
+        self.items
+            .iter()
+            .any(|p| p.name == name && Some(p.name.as_str()) != excluding)
     }
 
     /// Remove by name, returning whether anything went.
@@ -302,6 +339,97 @@ impl Profiles {
         // Only reachable with MAX_PROFILES entries already sharing the base.
         format!("{base} {}", self.items.len() + 1)
     }
+}
+
+/// Where [`Profiles::save`] stages the new file before renaming it into place.
+///
+/// The name carries this process's id, and that is the whole point. A fixed
+/// `connections.toml.new` is shared by every launcher a user has open: two
+/// of them saving at once write the same staging file, so one window's list
+/// lands on top of the other's half-written bytes and the rename publishes
+/// the mixture. A pid is enough to separate them -- a single process only
+/// ever saves from its own UI thread -- and it keeps the leftover, if a save
+/// dies outright, identifiable rather than anonymous.
+fn temp_path(path: &Path) -> PathBuf {
+    with_suffix(path, &format!(".{}.new", std::process::id()))
+}
+
+/// Write `bytes` to `path` and do not return until they are on the disk.
+///
+/// `fs::write` alone leaves the contents in the page cache. The rename that
+/// follows is atomic with respect to *other processes*, but not with respect
+/// to power loss: the directory entry can reach the disk before the data it
+/// points at, so a crash in the wrong second leaves `connections.toml`
+/// present, renamed, and empty -- every saved connection gone, with no
+/// broken file to hint that anything was lost.
+fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// `path` with `suffix` appended to the file name.
+///
+/// Built from the `OsString` rather than through `Display`, because a path
+/// under a directory whose name is not valid UTF-8 would otherwise come back
+/// with replacement characters in it and name a different file.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name: OsString = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Reserve a name to move an unreadable connections file to.
+///
+/// `<path>.bad`, then `<path>.bad.2` and upwards. Numbered rather than
+/// overwriting, because the file being moved aside is by definition the only
+/// copy of connections we could not read, and a second bad save that
+/// clobbered the first would destroy the thing the move exists to preserve.
+///
+/// The chosen name is created empty here rather than merely tested for
+/// absence: two launcher windows can hit this at the same moment, and an
+/// `exists()` check would let both pick the same name and one overwrite the
+/// other. The empty file is replaced by the rename in [`move_aside`].
+fn reserve_aside(path: &Path) -> Result<PathBuf> {
+    for n in 1..=MAX_ASIDE {
+        let candidate = match n {
+            1 => with_suffix(path, ".bad"),
+            n => with_suffix(path, &format!(".bad.{n}")),
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating {}", candidate.display())),
+        }
+    }
+    bail!(
+        "{} and {} numbered copies of it already exist",
+        with_suffix(path, ".bad").display(),
+        MAX_ASIDE - 1
+    )
+}
+
+/// Move a connections file that could not be read out of the way, returning
+/// where it went.
+///
+/// The escape hatch from an unparseable file: the launcher will not write
+/// over one, so without this a single stray character in the file leaves the
+/// user with a launcher that can never save again and no way out but a
+/// terminal.
+pub fn move_aside(path: &Path) -> Result<PathBuf> {
+    let destination = reserve_aside(path)?;
+    // Replaces the empty file reserved above; `fs::rename` overwrites on
+    // both Unix and Windows.
+    if let Err(e) = std::fs::rename(path, &destination) {
+        let _ = std::fs::remove_file(&destination);
+        return Err(e)
+            .with_context(|| format!("moving {} to {}", path.display(), destination.display()));
+    }
+    Ok(destination)
 }
 
 /// Configuration directory for this application on this platform.
@@ -560,6 +688,114 @@ mod tests {
             .filter(|n| n != FILE_NAME)
             .collect();
         assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    }
+
+    #[test]
+    fn the_staging_file_is_unique_to_this_process() {
+        // A shared "connections.toml.new" is what lets two launcher windows
+        // interleave their saves into one file.
+        let path = Path::new("/cfg/connections.toml");
+        let temporary = temp_path(path);
+        assert_ne!(temporary, path.with_extension("toml.new"));
+        assert!(temporary
+            .to_string_lossy()
+            .contains(&std::process::id().to_string()));
+        assert_eq!(temporary.parent(), path.parent());
+    }
+
+    #[test]
+    fn a_save_that_cannot_be_published_cleans_up_after_itself() {
+        // A directory where the connections file should be: the staging
+        // write succeeds and the rename cannot. The staging file is named
+        // after this process, so leaving it would poison the next save.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("occupied"), b"x").unwrap();
+
+        let mut store = Profiles::default();
+        store.upsert(sample());
+        assert!(store.save(&path).is_err());
+        assert!(
+            !temp_path(&path).exists(),
+            "the staging file was left behind"
+        );
+    }
+
+    #[test]
+    fn a_bad_file_is_moved_to_the_first_free_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+
+        std::fs::write(&path, "not toml at all").unwrap();
+        let first = move_aside(&path).unwrap();
+        assert_eq!(first.file_name().unwrap(), "connections.toml.bad");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "not toml at all");
+        assert!(!path.exists());
+
+        // The second one must not overwrite the first: each is the only copy
+        // of whatever connections it holds.
+        std::fs::write(&path, "still not toml").unwrap();
+        let second = move_aside(&path).unwrap();
+        assert_eq!(second.file_name().unwrap(), "connections.toml.bad.2");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "not toml at all");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "still not toml");
+    }
+
+    #[test]
+    fn a_hundred_bad_files_is_where_it_stops() {
+        // The loop has to end somewhere, and the end has to be an error
+        // rather than a silent reuse of the last name: reusing it would
+        // overwrite a file that is, by definition, the only copy of some
+        // connections we could not read.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        for _ in 0..MAX_ASIDE {
+            reserve_aside(&path).unwrap();
+        }
+        let err = reserve_aside(&path).unwrap_err().to_string();
+        assert!(err.contains("already exist"), "{err}");
+    }
+
+    #[test]
+    fn reserving_an_aside_name_claims_it_rather_than_just_checking() {
+        // Two launchers can reach this at the same moment; an exists() test
+        // would let both pick the same name and one destroy the other.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let first = reserve_aside(&path).unwrap();
+        let second = reserve_aside(&path).unwrap();
+        assert_ne!(first, second);
+        assert!(first.exists() && second.exists());
+    }
+
+    #[test]
+    fn moving_a_missing_file_aside_leaves_no_empty_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        assert!(move_aside(&path).is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    }
+
+    #[test]
+    fn a_name_in_use_is_reported_except_for_the_profile_being_edited() {
+        let mut store = Profiles::default();
+        store.upsert(Profile::new("work"));
+        store.upsert(Profile::new("home"));
+
+        // Adding: any existing name is taken.
+        assert!(store.name_taken("work", None));
+        assert!(!store.name_taken("lab", None));
+        // Editing "work" and leaving the name alone is not a clash.
+        assert!(!store.name_taken("work", Some("work")));
+        // Renaming "work" onto "home" is: upsert would merge the two.
+        assert!(store.name_taken("home", Some("work")));
+        assert!(!store.name_taken("lab", Some("work")));
     }
 
     #[test]
