@@ -18,7 +18,13 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use lynxrdp_client::app::{App, AppOptions};
 use lynxrdp_client::connection::{Client, ConnectOptions};
+use lynxrdp_client::profiles::MAX_SCALE;
 use lynxrdp_client::tunnel::{parse_destination, RemoteTarget, Tunnel, TunnelConfig};
+
+// Part of the binary rather than the library: it is an entry point, reached
+// only through this file's argument handling, and nothing that links the
+// client as a library has any use for it.
+mod askpass;
 
 /// Connect to a LynxRDP session over SSH.
 #[derive(Parser, Debug)]
@@ -47,7 +53,8 @@ struct Args {
     /// Forward to a Unix socket on the remote host instead of a TCP port.
     #[arg(long)]
     remote_socket: Option<String>,
-    /// Local port for the tunnel (default: a free port).
+    /// Bind the tunnel's local end to this loopback TCP port instead of a
+    /// private Unix socket. Every process on this machine can then reach it.
     #[arg(long, default_value_t = 0)]
     local_port: u16,
     /// Connect directly to an already tunnelled loopback address and skip
@@ -60,6 +67,10 @@ struct Args {
     /// Start in fullscreen (toggle with Ctrl+Alt+Enter).
     #[arg(short = 'f', long)]
     fullscreen: bool,
+    /// Magnify the remote screen by a whole number of pixels, 1 to 4
+    /// (default: match the display, so a 2x screen gets 2).
+    #[arg(long, value_parser = parse_scale)]
+    scale: Option<u8>,
     /// Keep the remote screen size fixed instead of following the window.
     #[arg(long)]
     no_dynamic_resize: bool,
@@ -97,6 +108,23 @@ enum Command {
     },
 }
 
+/// Only whole factors, and only small ones.
+///
+/// The magnification is nearest-neighbour, which is what keeps the promise
+/// that a remote desktop is never resampled and text stays exactly as the
+/// server drew it; that only holds at an integer factor. The upper bound is
+/// the profile's, so a connection saved in the launcher and a connection
+/// typed here cannot disagree about what is allowed.
+fn parse_scale(s: &str) -> Result<u8, String> {
+    let n: u8 = s
+        .parse()
+        .map_err(|_| "expected a whole number".to_string())?;
+    if !(1..=MAX_SCALE).contains(&n) {
+        return Err(format!("the scale must be between 1 and {MAX_SCALE}"));
+    }
+    Ok(n)
+}
+
 fn parse_size(s: &str) -> Result<(u16, u16), String> {
     let (w, h) = s
         .split_once('x')
@@ -110,6 +138,15 @@ fn parse_size(s: &str) -> Result<(u16, u16), String> {
 }
 
 fn main() {
+    // Before everything, including the standard handles. ssh runs this same
+    // binary as its askpass helper and reads the answer from our stdout, so
+    // `attach_to_parent` -- which points stdout at the terminal the launcher
+    // was started from -- would send the answer somewhere ssh is not looking.
+    // The prompt also arrives as a bare positional argument that clap would
+    // read as a destination.
+    if let Some(code) = askpass::run_if_helper() {
+        std::process::exit(code);
+    }
     // Before the logger: it writes to stderr, which does not exist yet.
     lynxrdp_client::console::attach_to_parent();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -136,7 +173,7 @@ fn run() -> Result<()> {
                     "--connect only accepts loopback addresses; use an SSH tunnel for remote hosts"
                 );
             }
-            (*addr, None)
+            (Some(*addr), None)
         }
         (None, Some(dest)) => {
             let (destination, port_in_dest) = parse_destination(dest)?;
@@ -152,6 +189,9 @@ fn run() -> Result<()> {
                 local_port: args.local_port,
                 ssh_program: args.ssh.clone(),
                 extra_args: Vec::new(),
+                // Empty unless the connection manager started us, so a
+                // session typed at a terminal keeps prompting there.
+                env: askpass::ssh_env(),
             };
             let tunnel = Tunnel::open(&cfg, Duration::from_secs(args.tunnel_timeout))?;
             (tunnel.local_addr(), Some(tunnel))
@@ -161,6 +201,11 @@ fn run() -> Result<()> {
             // application, so show the connection manager. The CLI is still
             // there for anyone who wants it, and for the sessions this
             // launches, which are this same binary with a destination.
+            // Marked before the window opens, because the sessions this
+            // starts inherit the environment and that is how each of them
+            // knows to answer ssh in a window rather than on a terminal it
+            // does not have.
+            askpass::mark_launcher();
             let path = lynxrdp_client::launcher::default_path()?;
             return lynxrdp_client::launcher::run(path);
         }
@@ -171,9 +216,12 @@ fn run() -> Result<()> {
         size: args.size,
         ..Default::default()
     };
-    let client = match _tunnel.as_mut().and_then(Tunnel::take_stream) {
-        Some(s) => Client::from_stream(s, &opts, Some(waker)),
-        None => Client::connect(addr, &opts, Some(waker)),
+    let client = match (_tunnel.as_mut().and_then(Tunnel::take_stream), addr) {
+        (Some(s), _) => Client::from_stream(s.into_tcp(), &opts, Some(waker)),
+        (None, Some(addr)) => Client::connect(addr, &opts, Some(waker)),
+        // Only reachable if the tunnel's connection were taken twice, and
+        // there is nothing to dial when the local end is a Unix socket.
+        (None, None) => bail!("the tunnel's connection has already been used"),
     }
     .context("connecting to the LynxRDP server")?;
     log::info!(
@@ -184,6 +232,15 @@ fn run() -> Result<()> {
         client.size().0,
         client.size().1
     );
+    // `--scale` is client-side integer magnification: the framebuffer is
+    // presented n times larger with nearest-neighbour sampling, which is what
+    // keeps a 2x display sharp rather than showing a half-size window of a
+    // 96-DPI desktop. Applying it belongs to the present path in `app.rs`,
+    // and `AppOptions` has no field for it yet, so the option is carried this
+    // far and said out loud rather than silently dropped.
+    if let Some(scale) = args.scale {
+        log::warn!("--scale {scale} is not applied yet: the session window still presents 1:1");
+    }
     let app_opts = AppOptions {
         fullscreen: args.fullscreen,
         title: "LynxRDP".to_string(),
@@ -215,17 +272,19 @@ fn connect_headless(args: &Args, destination: &str) -> Result<(Client, Option<Tu
         local_port: args.local_port,
         ssh_program: args.ssh.clone(),
         extra_args: Vec::new(),
+        env: askpass::ssh_env(),
     };
     let mut tunnel = Tunnel::open(&cfg, Duration::from_secs(args.tunnel_timeout))?;
     let opts = ConnectOptions::default();
     // Reuse the connection the readiness check already made. Dialling again
     // would be a second client as far as the daemon is concerned, which
-    // replaces the session the first one just attached to.
-    let client = match tunnel.take_stream() {
-        Some(s) => Client::from_stream(s, &opts, None),
-        None => Client::connect(tunnel.local_addr(), &opts, None),
-    }
-    .context("connecting to the LynxRDP server")?;
+    // replaces the session the first one just attached to -- and on a Unix
+    // local end there is no address to dial in the first place.
+    let stream = tunnel
+        .take_stream()
+        .context("the tunnel came up without a connection")?;
+    let client = Client::from_stream(stream.into_tcp(), &opts, None)
+        .context("connecting to the LynxRDP server")?;
     Ok((client, Some(tunnel)))
 }
 

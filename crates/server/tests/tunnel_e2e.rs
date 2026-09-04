@@ -171,7 +171,7 @@ fn connects_through_a_real_ssh_tunnel() {
         remote: RemoteTarget::Port(session_port),
         ..Default::default()
     };
-    let tunnel = match Tunnel::open(&cfg, Duration::from_secs(20)) {
+    let mut tunnel = match Tunnel::open(&cfg, Duration::from_secs(20)) {
         Ok(t) => t,
         Err(e) => {
             let _ = session.kill();
@@ -183,7 +183,17 @@ fn connects_through_a_real_ssh_tunnel() {
         }
     };
 
-    let mut client = Client::connect(tunnel.local_addr(), &ConnectOptions::default(), None)
+    // Take the connection the readiness check already made rather than dialling
+    // the local end again, which is what the client itself does -- and here it
+    // is the only thing that can work: with no `--local-port` the local end of
+    // the forward is a Unix socket in a private directory, so `local_addr()` is
+    // `None` and there is no address left to connect to. That makes this the
+    // one test that drives the default (socket) local end through a real ssh
+    // and a real sshd.
+    let stream = tunnel
+        .take_stream()
+        .expect("the tunnel came up without a connection");
+    let mut client = Client::from_stream(stream.into_tcp(), &ConnectOptions::default(), None)
         .expect("connect through tunnel");
     assert_eq!(client.size(), (400, 300));
 

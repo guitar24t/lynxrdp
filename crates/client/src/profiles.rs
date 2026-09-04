@@ -30,6 +30,15 @@ pub const MAX_PROFILES: usize = 500;
 /// Longest name, host or user we accept.
 pub const MAX_FIELD: usize = 255;
 
+/// Largest client-side magnification a profile may ask for.
+///
+/// The magnification is nearest-neighbour at a whole factor, which is the
+/// only kind that leaves the server's pixels untouched -- the point of it is
+/// that a 2x display stops showing a half-size window, not that the picture
+/// can be stretched. Four covers every display that exists; past that the
+/// framebuffer a session has to hold grows faster than the window it fills.
+pub const MAX_SCALE: u8 = 4;
+
 /// How many rejected copies of the connections file we will keep before
 /// refusing to make another. A hundred `.bad` files means something is wrong
 /// that moving a hundred and first aside will not fix.
@@ -70,6 +79,15 @@ pub struct Profile {
     /// Initial screen size. `None` uses the server's default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<(u16, u16)>,
+    /// Client-side magnification, 1 to [`MAX_SCALE`].
+    ///
+    /// `None` follows the display, which is the answer a user would give if
+    /// asked: a 2x screen wants 2. A number pins it, for the two cases
+    /// following the display gets wrong -- a large 1x screen where the remote
+    /// desktop is simply too small to read, and a 2x laptop driving a 1x
+    /// projector. Not a secret, and not a path: a magnification factor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<u8>,
     /// Start the session fullscreen.
     #[serde(skip_serializing_if = "is_false")]
     pub fullscreen: bool,
@@ -140,6 +158,11 @@ impl Profile {
                 return Some("The screen size must be positive.".into());
             }
         }
+        if let Some(scale) = self.scale {
+            if !(1..=MAX_SCALE).contains(&scale) {
+                return Some(format!("The scale must be between 1 and {MAX_SCALE}."));
+            }
+        }
         for option in &self.ssh_options {
             if option.trim().is_empty() {
                 return Some("An SSH option is blank.".into());
@@ -177,6 +200,10 @@ impl Profile {
         if let Some((w, h)) = self.size {
             args.push("--size".into());
             args.push(format!("{w}x{h}"));
+        }
+        if let Some(scale) = self.scale {
+            args.push("--scale".into());
+            args.push(scale.to_string());
         }
         if self.fullscreen {
             args.push("--fullscreen".into());
@@ -515,6 +542,7 @@ mod tests {
         ];
         p.remote_port = Some(3391);
         p.size = Some((1920, 1080));
+        p.scale = Some(2);
         p.fullscreen = true;
         p.dynamic_resize = false;
         p.clipboard = false;
@@ -530,6 +558,7 @@ mod tests {
             .any(|w| w == ["--ssh-option", "StrictHostKeyChecking=yes"]));
         assert!(args.windows(2).any(|w| w == ["--remote-port", "3391"]));
         assert!(args.windows(2).any(|w| w == ["--size", "1920x1080"]));
+        assert!(args.windows(2).any(|w| w == ["--scale", "2"]));
         assert!(args.iter().any(|a| a == "--fullscreen"));
         assert!(args.iter().any(|a| a == "--no-dynamic-resize"));
         assert!(args.iter().any(|a| a == "--no-clipboard"));
@@ -598,6 +627,23 @@ mod tests {
         let mut p = sample();
         p.size = Some((0, 1080));
         assert!(p.problem().is_some());
+    }
+
+    #[test]
+    fn only_whole_magnifications_in_range_are_accepted() {
+        // The factor reaches the command line, so a file edited by hand must
+        // not be able to smuggle a 0 (a window of no pixels) or a 200 (a
+        // framebuffer no machine will allocate) past the launcher.
+        let mut p = sample();
+        p.scale = Some(0);
+        assert!(p.problem().unwrap().contains("scale"));
+        p.scale = Some(MAX_SCALE + 1);
+        assert!(p.problem().is_some());
+        p.scale = Some(MAX_SCALE);
+        assert_eq!(p.problem(), None);
+        // Unset is the normal case and means "follow the display".
+        p.scale = None;
+        assert_eq!(p.problem(), None);
     }
 
     #[test]
@@ -862,6 +908,7 @@ mod tests {
             "ssh_options",
             "remote_port",
             "size",
+            "scale",
             "fullscreen",
         ] {
             // Matched at the start of a line: "size" is also a substring of
@@ -887,6 +934,7 @@ mod tests {
         full.ssh_options = vec!["ProxyJump=bastion".into()];
         full.remote_port = Some(4000);
         full.size = Some((1600, 900));
+        full.scale = Some(2);
         full.fullscreen = true;
         store.items.push(full);
 
