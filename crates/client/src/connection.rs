@@ -154,6 +154,19 @@ impl TransferPolicy for ClientTransferPolicy {
 }
 
 /// Client-side connection state.
+/// Declare the server gone after this long with no message of any kind.
+///
+/// Matches the server's own `PONG_TIMEOUT`, so both ends give up at the same
+/// point rather than one of them holding a connection the other has abandoned.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest single blocking wait inside `poll_event`.
+///
+/// A caller asking to wait a minute must still have the liveness deadline
+/// checked on the way, so the wait is chopped into pieces rather than trusting
+/// the caller to pass something short.
+const POLL_SLICE: Duration = Duration::from_millis(250);
+
 pub struct Client {
     writer: Arc<Mutex<TcpStream>>,
     events: Receiver<Message>,
@@ -165,6 +178,16 @@ pub struct Client {
     frames_received: u64,
     bytes_received: Arc<Mutex<u64>>,
     last_ping: Option<(u64, Instant)>,
+    /// When the last message of any kind arrived from the server.
+    ///
+    /// The server pings every two seconds from the session core thread, so
+    /// "nothing at all for thirty seconds" is an exact test for that thread
+    /// being wedged -- and it is the only test the client has. Without it a
+    /// stuck session shows a frozen screen, accepts input that goes nowhere and
+    /// displays a stale round-trip time indefinitely, because ssh's own
+    /// ServerAliveInterval only fires when the *transport* dies, not when the
+    /// thing behind it stops.
+    last_message_at: Instant,
     transfers: TransferManager,
     /// Destinations for downloads this client asked for.
     downloads: HashMap<u64, PathBuf>,
@@ -210,6 +233,11 @@ impl Client {
     ) -> Result<Self> {
         stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(opts.timeout))?;
+        // Without this a send into a stalled tunnel blocks forever, and
+        // `Client::send` is called from the winit thread -- including on the
+        // way out, where `exiting()` sends a Disconnect before the shutdown
+        // that would have unblocked it, so the window could not even close.
+        stream.set_write_timeout(Some(opts.timeout))?;
         let (w, h) = opts.size.unwrap_or((0, 0));
         let hello = Message::ClientHello {
             version: PROTOCOL_VERSION,
@@ -307,6 +335,7 @@ impl Client {
             frames_received: 0,
             bytes_received,
             last_ping: None,
+            last_message_at: Instant::now(),
             transfers: TransferManager::new(true),
             downloads: HashMap::new(),
             pending_image: None,
@@ -539,15 +568,31 @@ impl Client {
         if let Some(reason) = &self.closed {
             return Ok(Some(ClientEvent::Disconnected(reason.clone())));
         }
+        let deadline = Instant::now() + timeout;
         loop {
-            let msg = match self.events.recv_timeout(timeout) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let msg = match self.events.recv_timeout(remaining.min(POLL_SLICE)) {
                 Ok(m) => m,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if self.last_message_at.elapsed() > LIVENESS_TIMEOUT {
+                        let reason = format!(
+                            "no response from the session for {}s",
+                            LIVENESS_TIMEOUT.as_secs()
+                        );
+                        self.closed = Some(reason.clone());
+                        return Ok(Some(ClientEvent::Disconnected(reason)));
+                    }
+                    if remaining <= POLL_SLICE {
+                        return Ok(None);
+                    }
+                    continue;
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     self.closed = Some("reader stopped".into());
                     return Ok(Some(ClientEvent::Disconnected("reader stopped".into())));
                 }
             };
+            self.last_message_at = Instant::now();
             if let Some(ev) = self.handle(msg)? {
                 return Ok(Some(ev));
             }

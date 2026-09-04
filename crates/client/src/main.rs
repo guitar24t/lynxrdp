@@ -126,7 +126,10 @@ fn run() -> Result<()> {
     if let Some(command) = &args.command {
         return run_transfer_command(&args, command);
     }
-    let (addr, _tunnel) = match (&args.connect, &args.destination) {
+    // The tunnel's readiness check already opened a connection; carry it here
+    // so the session reuses it instead of dialling a second one, which the
+    // daemon would treat as a separate client and use to replace this session.
+    let (addr, mut _tunnel) = match (&args.connect, &args.destination) {
         (Some(addr), _) => {
             if !addr.ip().is_loopback() {
                 bail!(
@@ -168,8 +171,11 @@ fn run() -> Result<()> {
         size: args.size,
         ..Default::default()
     };
-    let client =
-        Client::connect(addr, &opts, Some(waker)).context("connecting to the LynxRDP server")?;
+    let client = match _tunnel.as_mut().and_then(Tunnel::take_stream) {
+        Some(s) => Client::from_stream(s, &opts, Some(waker)),
+        None => Client::connect(addr, &opts, Some(waker)),
+    }
+    .context("connecting to the LynxRDP server")?;
     log::info!(
         "connected to {} as {} (session {}), screen {}x{}",
         client.info().server_name,
@@ -210,10 +216,16 @@ fn connect_headless(args: &Args, destination: &str) -> Result<(Client, Option<Tu
         ssh_program: args.ssh.clone(),
         extra_args: Vec::new(),
     };
-    let tunnel = Tunnel::open(&cfg, Duration::from_secs(args.tunnel_timeout))?;
+    let mut tunnel = Tunnel::open(&cfg, Duration::from_secs(args.tunnel_timeout))?;
     let opts = ConnectOptions::default();
-    let client = Client::connect(tunnel.local_addr(), &opts, None)
-        .context("connecting to the LynxRDP server")?;
+    // Reuse the connection the readiness check already made. Dialling again
+    // would be a second client as far as the daemon is concerned, which
+    // replaces the session the first one just attached to.
+    let client = match tunnel.take_stream() {
+        Some(s) => Client::from_stream(s, &opts, None),
+        None => Client::connect(tunnel.local_addr(), &opts, None),
+    }
+    .context("connecting to the LynxRDP server")?;
     Ok((client, Some(tunnel)))
 }
 

@@ -64,23 +64,13 @@ impl TunnelConfig {
         // Note: ClearAllForwardings must NOT be set here. OpenSSH applies it
         // to command-line forwardings too, which would silently discard the
         // -L below and the tunnel would never come up.
-        let mut a = vec![
-            "-N".to_string(),
-            "-o".into(),
-            "ExitOnForwardFailure=yes".into(),
-            "-o".into(),
-            "ServerAliveInterval=15".into(),
-            "-o".into(),
-            "ServerAliveCountMax=3".into(),
-        ];
-        // TCP keepalive on the SSH connection itself and no compression: our
-        // stream is already compressed and adding zlib only adds latency.
-        a.extend([
-            "-o".to_string(),
-            "TCPKeepAlive=yes".into(),
-            "-o".into(),
-            "Compression=no".into(),
-        ]);
+        let mut a = vec!["-N".to_string()];
+        // ExitOnForwardFailure is load-bearing rather than a preference: the
+        // readiness probe below concludes the tunnel is up when the local port
+        // accepts, and without this ssh would happily stay connected with no
+        // forward at all. So it is pinned, and a user setting that collides
+        // with it is refused loudly rather than silently losing.
+        a.extend(["-o".to_string(), "ExitOnForwardFailure=yes".into()]);
         if let Some(p) = self.ssh_port {
             a.push("-p".into());
             a.push(p.to_string());
@@ -89,9 +79,36 @@ impl TunnelConfig {
             a.push("-i".into());
             a.push(i.display().to_string());
         }
+        // The user's options come BEFORE our remaining defaults, because
+        // OpenSSH takes the *first* value it sees for a keyword. With the
+        // defaults first, anything typed into the launcher's ssh_options box
+        // that named ServerAliveInterval, TCPKeepAlive or Compression was
+        // accepted, saved, passed to ssh -- and then quietly ignored.
+        //
+        // -p and -i stay above them so a stray `Port=` cannot override the
+        // port field of the profile it sits next to.
         for o in &self.options {
+            if keyword_of(o).is_some_and(|k| k.eq_ignore_ascii_case("exitonforwardfailure")) {
+                log::warn!(
+                    "ignoring ssh option {o:?}: the tunnel's readiness check depends on \
+                     ExitOnForwardFailure=yes"
+                );
+                continue;
+            }
             a.push("-o".into());
             a.push(o.clone());
+        }
+        // Defaults last, so any of these the user set above wins. TCP keepalive
+        // on the SSH connection itself, and no compression: our stream is
+        // already compressed and adding zlib only adds latency.
+        for (k, v) in [
+            ("ServerAliveInterval", "15"),
+            ("ServerAliveCountMax", "3"),
+            ("TCPKeepAlive", "yes"),
+            ("Compression", "no"),
+        ] {
+            a.push("-o".into());
+            a.push(format!("{k}={v}"));
         }
         let target = match &self.remote {
             RemoteTarget::Port(p) => format!("127.0.0.1:{p}"),
@@ -106,10 +123,24 @@ impl TunnelConfig {
     }
 }
 
+/// The keyword part of an `ssh -o` argument, i.e. what comes before `=` or
+/// whitespace. `None` when the argument has no recognisable keyword.
+fn keyword_of(option: &str) -> Option<&str> {
+    let k = option
+        .split(['=', ' ', '\t'])
+        .next()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())?;
+    Some(k)
+}
+
 /// A running SSH tunnel; killed on drop.
 pub struct Tunnel {
     child: Child,
     local_addr: SocketAddr,
+    /// The connection the readiness check made, kept for the real client to
+    /// use rather than thrown away. See `take_stream`.
+    probe: Option<TcpStream>,
 }
 
 impl std::fmt::Debug for Tunnel {
@@ -148,23 +179,47 @@ impl Tunnel {
             })?;
         let local_addr: SocketAddr = ([127, 0, 0, 1], local_port).into();
         let deadline = Instant::now() + timeout;
-        loop {
+        let probe = loop {
             if let Some(status) = child.try_wait()? {
                 bail!("ssh exited before the tunnel came up ({status})");
             }
-            if TcpStream::connect_timeout(&local_addr, Duration::from_millis(200)).is_ok() {
+            if let Ok(s) = TcpStream::connect_timeout(&local_addr, Duration::from_millis(200)) {
                 // A successful connect means ssh has bound the forward, which
                 // it only does after authentication succeeded.
-                break;
+                //
+                // Keep it. This is not a probe as far as the far end is
+                // concerned: it reaches lynxrdpd, which identifies the peer and
+                // starts or attaches that user's session. Dropping it therefore
+                // evicted a client connected from another device ("Another
+                // client connected to this session") and then immediately went
+                // away, and it killed an --exit-on-disconnect session outright
+                // before the real client ever arrived. Handing the same
+                // connection to `Client::from_stream` costs nothing and makes
+                // the readiness check honest.
+                break Some(s);
             }
             if Instant::now() > deadline {
                 let _ = child.kill();
                 bail!("timed out waiting for the SSH tunnel");
             }
             std::thread::sleep(Duration::from_millis(100));
-        }
+        };
         log::info!("tunnel ready on {local_addr}");
-        Ok(Self { child, local_addr })
+        Ok(Self {
+            child,
+            local_addr,
+            probe,
+        })
+    }
+
+    /// Take the connection the readiness check already established.
+    ///
+    /// Callers should prefer this over dialling `local_addr` again: the far end
+    /// treats every connection as a real client, so a second one replaces the
+    /// session the first just attached to. Returns `None` only if it has
+    /// already been taken.
+    pub fn take_stream(&mut self) -> Option<TcpStream> {
+        self.probe.take()
     }
 
     /// Local end of the tunnel.
@@ -237,6 +292,51 @@ pub fn parse_destination(s: &str) -> Result<(String, Option<u16>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A user's ssh option must beat our default, not be silently discarded.
+    ///
+    /// OpenSSH takes the *first* value it sees for a keyword. The built-in
+    /// defaults used to be emitted before the user's, so anything typed into
+    /// the launcher's ssh_options box that named ServerAliveInterval,
+    /// TCPKeepAlive or Compression was accepted, saved, passed to ssh, and then
+    /// quietly ignored -- the worst kind of failure, because the setting is
+    /// visibly there.
+    #[test]
+    fn a_user_option_wins_over_the_matching_default() {
+        let cfg = TunnelConfig {
+            destination: "alice@example.org".into(),
+            options: vec![
+                "ServerAliveInterval=60".into(),
+                "Compression=yes".into(),
+                // Pinned: the readiness probe depends on it, so this one is
+                // refused rather than honoured.
+                "ExitOnForwardFailure=no".into(),
+            ],
+            ..Default::default()
+        };
+        let a = cfg.args(40000);
+        let first_index = |needle: &str| {
+            a.iter()
+                .position(|s| s == needle)
+                .unwrap_or_else(|| panic!("{needle} missing from {a:?}"))
+        };
+        assert!(
+            first_index("ServerAliveInterval=60") < first_index("ServerAliveInterval=15"),
+            "the default was emitted first and would win: {a:?}"
+        );
+        assert!(
+            first_index("Compression=yes") < first_index("Compression=no"),
+            "the default was emitted first and would win: {a:?}"
+        );
+        assert!(
+            !a.iter().any(|s| s == "ExitOnForwardFailure=no"),
+            "a user option overrode the pinned ExitOnForwardFailure: {a:?}"
+        );
+        assert!(a.iter().any(|s| s == "ExitOnForwardFailure=yes"));
+        // -p and -i must stay above the user's options so a stray Port= cannot
+        // override the profile's own port field.
+        assert!(first_index("-o") > 0);
+    }
 
     #[test]
     fn builds_ssh_arguments() {
