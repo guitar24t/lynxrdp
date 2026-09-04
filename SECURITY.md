@@ -141,6 +141,38 @@ malicious report cannot corrupt the display.
 If you do not need any of this, leave `reporting.enabled = false`, which is
 the default, and the code never runs.
 
+## Client updates
+
+The connection manager can check `api.github.com` for a newer release and
+replace itself with it. Three things are worth stating plainly.
+
+* **It is the client only, never the server.** `lynxrdpd` runs as root and is
+  installed from a package; a root daemon that downloads its own replacement
+  would be a far larger thing to trust than a desktop application swapping a
+  file in a directory its own user can write. There is no code path that
+  updates the server, and a client installed from a `.deb` or `.rpm` refuses
+  to update itself too, because those files belong to the package manager.
+* **What it verifies is integrity, not authorship.** The download is checked
+  against the `SHA256SUMS` published in the same release, which catches a
+  truncated or corrupted file. That file arrives from the same host over the
+  same connection as the asset, so it is not a second opinion about who
+  published the release. Nothing here is code signed. The trust anchor is the
+  TLS connection to GitHub and GitHub's own control of the repository — the
+  same anchor as downloading the release by hand, and no more.
+
+  Where a stronger claim is wanted, the shape of the code allows it:
+  `update::verify` is the only door the downloaded bytes come through, and a
+  signature check belongs there.
+* **It is outbound, small, and optional.** One HTTPS GET a day at most,
+  carrying the client's address and a user agent naming its release. It binds
+  nothing, opens nothing, and reads no reply beyond the release listing.
+  `Help → Check Automatically` turns it off, which is recorded as
+  `updates.check = false` in `settings.toml`; with it off nothing is sent
+  unless a user asks for a check.
+
+An update is offered but never applied on its own: downloading and replacing
+happen on a click, and the replaced build is only running after a restart.
+
 ## Hardening tips
 
 * Keep `PermitOpen` in `sshd_config` at its default or restrict it to

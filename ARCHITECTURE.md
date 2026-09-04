@@ -166,6 +166,26 @@ could have typed, so the GUI and the command line cannot drift apart.
 `profiles.rs` holds no credentials of any kind. SSH owns authentication, and
 a second, weaker copy of it on disk would be a liability with no benefit.
 
+`update/` is the connection manager's self-updater, and it lives on the
+launcher side only — a session window is a child process with no menus, and
+replacing an executable under a desktop that is mid-keystroke would be rude.
+Its shape follows the same rule as the rest of the client: everything that
+decides anything is a pure function taking its inputs as arguments — which
+release, which asset, whether this installation may be replaced and how —
+because none of the interesting cases (a `.deb` install, an Intel Mac with no
+download, a working copy) exist on the machine running the tests. Only
+`update/fetch.rs` and `update/install.rs` touch the world, and the swap they
+perform always unpacks to a staging name on the target's own filesystem and
+then renames, so an interrupted update leaves a working application and some
+rubbish beside it rather than half an executable.
+
+The version a build believes it is comes from `LYNXRDP_RELEASE_TAG`, stamped
+in by `build.rs` from the release workflow. The Cargo version cannot answer
+that question: it stays `0.1.0` across every release candidate, so a build
+from `v0.1.0-rc.5` would read itself as `0.1.0` and conclude that
+`v0.1.0-rc.6` was a downgrade. A build without the tag is not a release build
+and will not replace itself.
+
 ## Monitoring reports
 
 `crates/server/src/reporting.rs` is optional and off by default. When it is

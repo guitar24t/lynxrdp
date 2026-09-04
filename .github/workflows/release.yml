@@ -17,6 +17,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Stamped into the client so it knows which release it is. The Cargo
+  # version cannot answer that -- it stays 0.1.0 across every candidate --
+  # and without it the updater would compare v0.1.0-rc.6 against "0.1.0" and
+  # call the newer release a downgrade. Empty everywhere else, which is how a
+  # build that is not a release refuses to replace itself.
+  LYNXRDP_RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build-client:
@@ -85,6 +91,7 @@ jobs:
       - name: Build server and client (release, against the RHEL 9 glibc)
         run: |
           docker run --rm -v "$PWD:/src" -w /src -e CARGO_TERM_COLOR=always \
+            -e "LYNXRDP_RELEASE_TAG=$LYNXRDP_RELEASE_TAG" \
             almalinux:9 bash -euo pipefail -c '
               dnf -y install gcc >/dev/null
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
