@@ -1340,7 +1340,7 @@ impl Launcher {
                 rect,
                 egui::CornerRadius::same(theme::RADIUS),
                 t.surface_sunken,
-                egui::Stroke::new(1.0, t.border),
+                egui::Stroke::new(1.0_f32, t.border),
                 egui::StrokeKind::Inside,
             );
             let galley = one_line(
@@ -1501,7 +1501,7 @@ impl Launcher {
 
                     ui.add_space(2.5 * theme::UNIT);
                     egui::Frame::NONE
-                        .stroke(egui::Stroke::new(1.0, t.border))
+                        .stroke(egui::Stroke::new(1.0_f32, t.border))
                         .corner_radius(egui::CornerRadius::same(theme::RADIUS))
                         .inner_margin(egui::Margin::same(12))
                         .show(ui, |ui| {
@@ -1972,7 +1972,7 @@ impl Launcher {
         ctx.layer_painter(egui::LayerId::background()).hline(
             seam.x_range(),
             seam.bottom() - 0.5,
-            egui::Stroke::new(1.0, t.border),
+            egui::Stroke::new(1.0_f32, t.border),
         );
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_ui(ui));
@@ -2089,7 +2089,7 @@ fn hairline(ui: &mut egui::Ui, colour: egui::Color32) {
     ui.painter().hline(
         rect.x_range(),
         rect.center().y,
-        egui::Stroke::new(1.0, colour),
+        egui::Stroke::new(1.0_f32, colour),
     );
 }
 

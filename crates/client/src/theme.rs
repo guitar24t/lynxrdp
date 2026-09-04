@@ -355,14 +355,14 @@ fn style(dark: bool) -> egui::Style {
     v.extreme_bg_color = t.surface_sunken;
     v.faint_bg_color = t.surface_raised;
     v.code_bg_color = t.surface_sunken;
-    v.window_stroke = egui::Stroke::new(1.0, t.border);
+    v.window_stroke = egui::Stroke::new(1.0_f32, t.border);
     v.window_corner_radius = egui::CornerRadius::same(RADIUS_WINDOW);
     v.menu_corner_radius = egui::CornerRadius::same(RADIUS_WINDOW);
     v.hyperlink_color = t.accent;
     v.warn_fg_color = t.warn;
     v.error_fg_color = t.danger;
     v.selection.bg_fill = t.accent_weak;
-    v.selection.stroke = egui::Stroke::new(1.0, t.accent);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, t.accent);
     v.button_frame = true;
     v.striped = false;
     // Keep egui's geometry, replace only the colour: the stock dark shadow is
@@ -375,27 +375,27 @@ fn style(dark: bool) -> egui::Style {
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = t.surface;
     w.noninteractive.weak_bg_fill = t.surface;
-    w.noninteractive.bg_stroke = egui::Stroke::new(1.0, t.border);
-    w.noninteractive.fg_stroke = egui::Stroke::new(1.0, t.text);
+    w.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, t.border);
+    w.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, t.text);
     w.inactive.bg_fill = t.surface_raised;
     w.inactive.weak_bg_fill = t.surface_raised;
-    w.inactive.bg_stroke = egui::Stroke::new(1.0, t.border);
-    w.inactive.fg_stroke = egui::Stroke::new(1.0, t.text);
+    w.inactive.bg_stroke = egui::Stroke::new(1.0_f32, t.border);
+    w.inactive.fg_stroke = egui::Stroke::new(1.0_f32, t.text);
     w.hovered.bg_fill = t.hover_fill;
     w.hovered.weak_bg_fill = t.hover_fill;
-    w.hovered.bg_stroke = egui::Stroke::new(1.0, t.border_strong);
-    w.hovered.fg_stroke = egui::Stroke::new(1.0, t.text);
+    w.hovered.bg_stroke = egui::Stroke::new(1.0_f32, t.border_strong);
+    w.hovered.fg_stroke = egui::Stroke::new(1.0_f32, t.text);
     // `active` is also what egui hands a *focused* widget, so this stroke is
     // the keyboard focus ring: 2 points of accent rather than the stock one
     // point of pure white, which on this surface is nearly invisible.
     w.active.bg_fill = t.hover_fill;
     w.active.weak_bg_fill = t.hover_fill;
     w.active.bg_stroke = egui::Stroke::new(FOCUS_RING, focus_ring(&t, dark));
-    w.active.fg_stroke = egui::Stroke::new(1.0, t.text);
+    w.active.fg_stroke = egui::Stroke::new(1.0_f32, t.text);
     w.open.bg_fill = t.hover_fill;
     w.open.weak_bg_fill = t.hover_fill;
-    w.open.bg_stroke = egui::Stroke::new(1.0, t.border_strong);
-    w.open.fg_stroke = egui::Stroke::new(1.0, t.text);
+    w.open.bg_stroke = egui::Stroke::new(1.0_f32, t.border_strong);
+    w.open.fg_stroke = egui::Stroke::new(1.0_f32, t.text);
     for widget in [
         &mut w.noninteractive,
         &mut w.inactive,
