@@ -124,6 +124,52 @@ pub enum ClientEvent {
     Disconnected(String),
 }
 
+/// What every rejection string says, and the only place it is written down.
+const REJECTION_MARK: &str = "rejected (code ";
+
+/// How a rejection from the server is phrased for the user.
+///
+/// A function rather than a `format!` where it happens, because the code has
+/// to be readable back out of the string afterwards: the session window
+/// decides whether a dropped link is worth retrying, and a rejection --
+/// a version floor, a policy refusal -- is precisely the case where retrying
+/// achieves nothing but noise. [`rejection_code`] and [`mentions_rejection`]
+/// are the other half, and all three are tested against each other rather
+/// than against a literal, so the wording can change without quietly turning
+/// every rejection retryable.
+pub fn rejection_reason(code: u16, reason: &str) -> String {
+    format!("{REJECTION_MARK}{code}): {reason}")
+}
+
+/// The code out of a string [`rejection_reason`] produced, if it is one.
+pub fn rejection_code(text: &str) -> Option<u16> {
+    text.strip_prefix(REJECTION_MARK)?
+        .split_once(')')?
+        .0
+        .parse()
+        .ok()
+}
+
+/// Whether a failure reports a rejection, wherever in it that is said.
+///
+/// The question [`rejection_code`] answers is "is this string a rejection",
+/// and that is the wrong one to ask of a reconnection failure: by the time
+/// one reaches the session window it has been through a `Result` chain, and
+/// a single `.context()` anywhere along it turns `rejected (code 3): ...`
+/// into `reconnecting: rejected (code 3): ...`. A rejection that stops being
+/// recognisable is not a cosmetic loss -- it is the whole retry budget spent
+/// re-asking a question whose answer cannot change, and eight refusals in
+/// the server's log for an administrator to explain instead of one.
+///
+/// Nesting does not make it less of a rejection, so searching rather than
+/// matching at the front has no false positive to trade against: the parse
+/// is still `rejection_code`'s, so the two cannot come to disagree about
+/// what the string looks like.
+pub fn mentions_rejection(text: &str) -> bool {
+    text.match_indices(REJECTION_MARK)
+        .any(|(at, _)| rejection_code(&text[at..]).is_some())
+}
+
 /// Accepts what the session sends us.
 ///
 /// Downloads only land where this client asked them to: a `FileDownload`
@@ -309,9 +355,10 @@ impl Client {
                         u32::from(height),
                     )
                 }
-                Message::Rejected { code, reason } => {
-                    bail!("server rejected the connection (code {code}): {reason}")
-                }
+                // Phrased by `rejection_reason` like every other rejection,
+                // because the window reads the code back out of it to decide
+                // whether a reconnection attempt is worth repeating.
+                Message::Rejected { code, reason } => bail!("{}", rejection_reason(code, &reason)),
                 other => bail!("unexpected message {:?} during handshake", other.kind()),
             };
         stream.set_read_timeout(None)?;
@@ -412,6 +459,19 @@ impl Client {
     /// Reason the connection closed, if it has.
     pub fn closed(&self) -> Option<&str> {
         self.closed.as_deref()
+    }
+
+    /// How long it has been since the server said anything at all.
+    ///
+    /// A better liveness signal than a caller's own ping/pong bookkeeping,
+    /// and the reason it is exposed: *any* message refreshes it, so a session
+    /// that is answering pings but sending nothing else still reads as alive,
+    /// and one whose core thread has wedged reads as quiet within a couple of
+    /// server ping intervals. It starts at the handshake, which is itself
+    /// proof the link was up, so it never lies about a connection too young
+    /// to have been probed.
+    pub fn quiet_for(&self) -> Duration {
+        self.last_message_at.elapsed()
     }
 
     /// Send a message to the server.
@@ -875,7 +935,7 @@ impl Client {
                 Some(ClientEvent::Disconnected(reason))
             }
             Message::Rejected { code, reason } => {
-                let r = format!("rejected (code {code}): {reason}");
+                let r = rejection_reason(code, &reason);
                 self.closed = Some(r.clone());
                 Some(ClientEvent::Disconnected(r))
             }
@@ -913,14 +973,37 @@ impl Client {
         let _ = self.send(&Message::Disconnect {
             reason: reason.to_string(),
         });
+        self.close_socket("closed by client");
+    }
+
+    /// Let go of a connection that has already failed, without saying goodbye.
+    ///
+    /// [`Client::disconnect`] writes a `Disconnect` first, which is right for
+    /// a link that is still there and wrong for one that is not: against a
+    /// half-open socket -- a sleeping laptop, a forward whose far end has gone
+    /// -- that write ends only when the kernel's send buffer fills and the
+    /// write timeout expires, fifteen seconds of it, on whatever thread called
+    /// in. The session window calls in on the winit thread, and a reconnection
+    /// that freezes the window for fifteen seconds before it starts is not a
+    /// reconnection anyone would keep.
+    ///
+    /// The shutdown alone is what actually has to happen: it wakes the reader
+    /// thread out of its blocking read so the thread and the descriptor are
+    /// released rather than leaked, once per attempt, for as long as the user
+    /// keeps trying.
+    pub fn abandon(&mut self, reason: &str) {
+        self.close_socket(reason);
+    }
+
+    /// Take the socket down and collect the reader thread.
+    fn close_socket(&mut self, reason: &str) {
         if let Ok(w) = self.writer.lock() {
             let _ = w.shutdown(std::net::Shutdown::Both);
         }
         if let Some(t) = self.reader.take() {
             let _ = t.join();
         }
-        self.closed
-            .get_or_insert_with(|| "closed by client".to_string());
+        self.closed.get_or_insert_with(|| reason.to_string());
     }
 }
 
@@ -1224,6 +1307,62 @@ mod tests {
             c.try_event().unwrap(),
             Some(ClientEvent::Disconnected(_))
         ));
+    }
+
+    #[test]
+    fn a_rejection_can_be_read_back_out_of_what_the_user_is_shown() {
+        // The pair, not a literal: the session window has to tell a rejection
+        // from an ordinary drop to decide whether retrying is worth anything,
+        // and it has only this string to go on.
+        for code in [0u16, 1, 2, 3, 4, u16::MAX] {
+            let text = rejection_reason(code, "no: (parens) and 12345");
+            assert_eq!(rejection_code(&text), Some(code), "{text}");
+            assert!(mentions_rejection(&text), "{text}");
+            // Wrapped in context on the way up, which is what actually
+            // reaches the retry classifier.
+            let wrapped = format!("reconnecting: {text}");
+            assert_eq!(rejection_code(&wrapped), None, "{wrapped}");
+            assert!(mentions_rejection(&wrapped), "{wrapped}");
+        }
+        // Anything else is not a rejection, and must not be mistaken for one.
+        for other in [
+            "connection closed",
+            "no response from the session for 30s",
+            "Another client connected to this session.",
+            "rejected (code x): not a number",
+            "rejected (code ",
+            "",
+        ] {
+            assert_eq!(rejection_code(other), None, "{other}");
+            assert!(!mentions_rejection(other), "{other}");
+        }
+        // A rejection nested inside another failure is still a rejection: the
+        // strict parse says no, the question the classifier asks says yes.
+        assert_eq!(rejection_code("protocol error: rejected (code 2): x"), None);
+        assert!(mentions_rejection("protocol error: rejected (code 2): x"));
+    }
+
+    #[test]
+    fn abandoning_a_dead_link_does_not_write_to_it() {
+        // The point of `abandon`: no `Disconnect` goes out, so a half-open
+        // socket cannot hold the caller for the write timeout. The reader
+        // thread is still collected, which is the part that must happen.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = fake_server(listener, vec![hello(4, 4)]);
+        let mut c = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        c.abandon("link lost");
+        assert_eq!(c.closed(), Some("link lost"));
+        // Dropping it must not send either: `Drop` only speaks for a
+        // connection nobody has closed.
+        drop(c);
+        let received = server.join().unwrap();
+        assert!(
+            !received
+                .iter()
+                .any(|m| matches!(m, Message::Disconnect { .. })),
+            "a goodbye was written down a link that had already failed: {received:?}"
+        );
     }
 
     #[test]

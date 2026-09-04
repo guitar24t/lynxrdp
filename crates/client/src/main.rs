@@ -16,10 +16,10 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use lynxrdp_client::app::{App, AppOptions};
+use lynxrdp_client::app::{App, AppOptions, Session};
 use lynxrdp_client::connection::{Client, ConnectOptions};
 use lynxrdp_client::profiles::MAX_SCALE;
-use lynxrdp_client::tunnel::{parse_destination, RemoteTarget, Tunnel, TunnelConfig};
+use lynxrdp_client::tunnel::{parse_destination, Endpoint, RemoteTarget, Tunnel, TunnelConfig};
 
 // Part of the binary rather than the library: it is an entry point, reached
 // only through this file's argument handling, and nothing that links the
@@ -67,7 +67,7 @@ struct Args {
     /// Start in fullscreen (toggle with Ctrl+Alt+Enter).
     #[arg(short = 'f', long)]
     fullscreen: bool,
-    /// Magnify the remote screen by a whole number of pixels, 1 to 4
+    /// Magnify the remote screen by a whole number, 1 to 4
     /// (default: match the display, so a 2x screen gets 2).
     #[arg(long, value_parser = parse_scale)]
     scale: Option<u8>,
@@ -158,44 +158,42 @@ fn main() {
     }
 }
 
+/// The SSH invocation a destination on this command line asks for.
+fn tunnel_config(args: &Args, destination: &str) -> Result<TunnelConfig> {
+    let (destination, port_in_dest) = parse_destination(destination)?;
+    Ok(TunnelConfig {
+        destination,
+        ssh_port: args.port.or(port_in_dest),
+        identity: args.identity.clone(),
+        options: args.ssh_options.clone(),
+        remote: match &args.remote_socket {
+            Some(p) => RemoteTarget::Socket(p.clone()),
+            None => RemoteTarget::Port(args.remote_port),
+        },
+        local_port: args.local_port,
+        ssh_program: args.ssh.clone(),
+        extra_args: Vec::new(),
+        // Empty unless the connection manager started us, so a session typed
+        // at a terminal keeps prompting there.
+        env: askpass::ssh_env(),
+    })
+}
+
 fn run() -> Result<()> {
     let args = Args::parse();
     if let Some(command) = &args.command {
         return run_transfer_command(&args, command);
     }
-    // The tunnel's readiness check already opened a connection; carry it here
-    // so the session reuses it instead of dialling a second one, which the
-    // daemon would treat as a separate client and use to replace this session.
-    let (addr, mut _tunnel) = match (&args.connect, &args.destination) {
-        (Some(addr), _) => {
-            if !addr.ip().is_loopback() {
-                bail!(
-                    "--connect only accepts loopback addresses; use an SSH tunnel for remote hosts"
-                );
-            }
-            (Some(*addr), None)
-        }
-        (None, Some(dest)) => {
-            let (destination, port_in_dest) = parse_destination(dest)?;
-            let cfg = TunnelConfig {
-                destination,
-                ssh_port: args.port.or(port_in_dest),
-                identity: args.identity.clone(),
-                options: args.ssh_options.clone(),
-                remote: match &args.remote_socket {
-                    Some(p) => RemoteTarget::Socket(p.clone()),
-                    None => RemoteTarget::Port(args.remote_port),
-                },
-                local_port: args.local_port,
-                ssh_program: args.ssh.clone(),
-                extra_args: Vec::new(),
-                // Empty unless the connection manager started us, so a
-                // session typed at a terminal keeps prompting there.
-                env: askpass::ssh_env(),
-            };
-            let tunnel = Tunnel::open(&cfg, Duration::from_secs(args.tunnel_timeout))?;
-            (tunnel.local_addr(), Some(tunnel))
-        }
+    // The endpoint, not a connection: the session window keeps it and dials it
+    // again if the link drops, so the way back is the same way it came. The
+    // first connection goes through it too, which is what stops the two paths
+    // from drifting -- the reconnect path is exercised by every start.
+    let mut endpoint = match (&args.connect, &args.destination) {
+        (Some(addr), _) => Endpoint::direct(*addr)?,
+        (None, Some(dest)) => Endpoint::ssh(
+            tunnel_config(&args, dest)?,
+            Duration::from_secs(args.tunnel_timeout),
+        ),
         (None, None) => {
             // No arguments is not a usage error any more: this is a desktop
             // application, so show the connection manager. The CLI is still
@@ -216,14 +214,13 @@ fn run() -> Result<()> {
         size: args.size,
         ..Default::default()
     };
-    let client = match (_tunnel.as_mut().and_then(Tunnel::take_stream), addr) {
-        (Some(s), _) => Client::from_stream(s.into_tcp(), &opts, Some(waker)),
-        (None, Some(addr)) => Client::connect(addr, &opts, Some(waker)),
-        // Only reachable if the tunnel's connection were taken twice, and
-        // there is nothing to dial when the local end is a Unix socket.
-        (None, None) => bail!("the tunnel's connection has already been used"),
-    }
-    .context("connecting to the LynxRDP server")?;
+    // For an SSH endpoint this starts ssh and hands over the connection its
+    // readiness check already made: dialling a second one would be a second
+    // client as far as the daemon is concerned, and it would replace the
+    // session this one just attached to.
+    let stream = endpoint.connect()?;
+    let client = Client::from_stream(stream.into_tcp(), &opts, Some(waker))
+        .context("connecting to the LynxRDP server")?;
     log::info!(
         "connected to {} as {} (session {}), screen {}x{}",
         client.info().server_name,
@@ -232,22 +229,19 @@ fn run() -> Result<()> {
         client.size().0,
         client.size().1
     );
-    // `--scale` is client-side integer magnification: the framebuffer is
-    // presented n times larger with nearest-neighbour sampling, which is what
-    // keeps a 2x display sharp rather than showing a half-size window of a
-    // 96-DPI desktop. Applying it belongs to the present path in `app.rs`,
-    // and `AppOptions` has no field for it yet, so the option is carried this
-    // far and said out loud rather than silently dropped.
-    if let Some(scale) = args.scale {
-        log::warn!("--scale {scale} is not applied yet: the session window still presents 1:1");
-    }
     let app_opts = AppOptions {
         fullscreen: args.fullscreen,
         title: "LynxRDP".to_string(),
         dynamic_resize: !args.no_dynamic_resize,
         clipboard: !args.no_clipboard,
+        scale: args.scale,
     };
-    let reason = App::run(client, app_opts, slot)?;
+    let session = Session {
+        endpoint: Some(endpoint),
+        connect: opts,
+        waker: slot,
+    };
+    let reason = App::run(client, app_opts, session)?;
     if let Some(r) = reason {
         log::info!("session closed: {r}");
         if r.starts_with("rejected") || r.starts_with("protocol error") {
@@ -259,21 +253,7 @@ fn run() -> Result<()> {
 
 /// Open a tunnel and a connection to the destination, without a window.
 fn connect_headless(args: &Args, destination: &str) -> Result<(Client, Option<Tunnel>)> {
-    let (dest, port_in_dest) = parse_destination(destination)?;
-    let cfg = TunnelConfig {
-        destination: dest,
-        ssh_port: args.port.or(port_in_dest),
-        identity: args.identity.clone(),
-        options: args.ssh_options.clone(),
-        remote: match &args.remote_socket {
-            Some(p) => RemoteTarget::Socket(p.clone()),
-            None => RemoteTarget::Port(args.remote_port),
-        },
-        local_port: args.local_port,
-        ssh_program: args.ssh.clone(),
-        extra_args: Vec::new(),
-        env: askpass::ssh_env(),
-    };
+    let cfg = tunnel_config(args, destination)?;
     let mut tunnel = Tunnel::open(&cfg, Duration::from_secs(args.tunnel_timeout))?;
     let opts = ConnectOptions::default();
     // Reuse the connection the readiness check already made. Dialling again

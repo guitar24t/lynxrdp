@@ -1,10 +1,21 @@
 //! The graphical client: a winit window painted with softbuffer.
 //!
-//! The window shows the remote framebuffer 1:1. When the window is resized
-//! the remote screen is asked to follow (debounced), so there is never any
-//! scaling and text stays sharp. The pointer is drawn locally from the
+//! The window shows the remote framebuffer at a whole-number magnification --
+//! 1:1 on an ordinary display, 2:1 on a 2x one, so a 96-DPI remote desktop
+//! comes out the size it would be on the machine it is being viewed from
+//! rather than half of it. Magnifying by a whole number with nearest
+//! neighbour duplicates whole pixels and invents none, so text is still
+//! exactly what the server drew; nothing here ever resamples. When the window
+//! is resized the remote screen is asked to follow (debounced), at the size
+//! that divides by the magnification. The pointer is drawn locally from the
 //! cursor images the server sends, which makes it feel instantaneous even
 //! on slow links.
+//!
+//! The window also outlives the connection. A link that drops leaves the last
+//! frame on screen, dimmed, with what happened written across the bottom,
+//! while a worker thread tries to reconnect -- because the desktop those
+//! pixels came from is still running on the server, and closing the window is
+//! the one part of this that cannot be undone.
 //!
 //! There is no widget toolkit here: the window owns raw pixels. The connection
 //! bar in [`crate::overlay`] is composited into the *presented* buffer after
@@ -28,9 +39,11 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::clipchange::ClipboardWatcher;
-use crate::connection::{Client, ClientEvent};
+use crate::connection::{Client, ClientEvent, ConnectOptions};
 use crate::keymap;
 use crate::overlay::{self, Overlay};
+use crate::profiles::MAX_SCALE;
+use crate::tunnel::Endpoint;
 
 /// How long to wait after the last resize before asking the server.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -74,6 +87,41 @@ const PRESENT_LOG_DEPTH: usize = 3;
 /// honest one.
 pub const PX_PER_DETENT: f32 = 24.0;
 
+/// How long a lost link waits before each automatic attempt, by attempt
+/// number; the last entry repeats.
+///
+/// The first wait is short because the common causes are instantaneous from
+/// the user's side -- a laptop lid, a train tunnel, a VPN reconnecting -- and
+/// the session is sitting there on the server the whole time. It lengthens
+/// because the uncommon causes are not: a server that is being restarted, or
+/// a network that is gone for the afternoon, must not be dialled once a second
+/// for as long as the window is open.
+const RETRY_BACKOFF: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
+/// How many automatic attempts a lost link gets before it waits to be asked.
+///
+/// The budget exists because an automatic retry is only polite while there is
+/// reason to think it will work. Eight attempts spans about a minute of
+/// backoff, after which the window says what happened and waits: a person who
+/// wants another go presses a key, and a person who has walked away is not
+/// leaving a process dialling a dead host until the battery runs out.
+const RETRY_BUDGET: u32 = 8;
+
+/// How far the last frame is dimmed while the link is not up.
+///
+/// Dark enough that the window is plainly not live, light enough that the
+/// desktop underneath is still recognisable -- which is the point of keeping
+/// it at all: what is on screen is what the session still has, and it is the
+/// user's evidence that nothing was lost.
+const DIM_ALPHA: u32 = 140;
+
 /// Options for the GUI.
 #[derive(Clone, Debug)]
 pub struct AppOptions {
@@ -85,6 +133,191 @@ pub struct AppOptions {
     pub dynamic_resize: bool,
     /// Sync the clipboard.
     pub clipboard: bool,
+    /// Client-side magnification, or `None` to follow the display.
+    ///
+    /// `Some` is a user who asked for a number and gets that number on every
+    /// monitor; `None` follows the window's scale factor, which is what makes
+    /// a 2x display show a 96-DPI remote desktop at the size it would be on a
+    /// 1x one instead of half of it.
+    pub scale: Option<u8>,
+}
+
+/// What a session window needs in order to come back after the link drops.
+///
+/// Held by the window rather than by `main`, which is the change that makes
+/// reconnection possible at all: the tunnel used to be a local in `run()` and
+/// the GUI was handed a `Client` and nothing else, so it could not so much as
+/// ask whether `ssh` was still alive, let alone dial through it again.
+pub struct Session {
+    /// How to reach the server again, when there is a way.
+    pub endpoint: Option<Endpoint>,
+    /// The options the first connection was made with. A reconnection asks
+    /// for the same features, or it would be a different session.
+    pub connect: ConnectOptions,
+    /// Where the event loop proxy lives, so a reconnected client's reader
+    /// thread can wake this loop the way the first one does.
+    pub waker: WakerSlot,
+}
+
+/// What has become of the connection to the session.
+///
+/// The window outlives the connection now. Every state but [`Link::Up`] keeps
+/// the last frame on screen, dimmed, with what happened written across it --
+/// because the desktop those pixels came from is still running on the server,
+/// untouched, and closing the window is the one thing that cannot be undone.
+#[derive(Debug)]
+enum Link {
+    /// Messages are flowing.
+    Up,
+    /// The link failed, and nothing is being done about it: either the retry
+    /// budget is spent or the reason was not one to retry automatically.
+    Lost {
+        /// What ended it.
+        reason: String,
+        /// When it ended.
+        since: Instant,
+    },
+    /// An attempt is in flight, or scheduled for `next_try`.
+    Reconnecting {
+        /// What ended the link in the first place.
+        reason: String,
+        /// When it ended -- not when this attempt began.
+        since: Instant,
+        /// Which attempt this is, counting from one.
+        attempt: u32,
+        /// When the next attempt starts, if one is not already running.
+        next_try: Instant,
+    },
+    /// The link failed for a reason no reconnection can fix.
+    Gone {
+        /// What ended it.
+        reason: String,
+        /// When it ended.
+        since: Instant,
+    },
+}
+
+impl Link {
+    /// Whether anything may be sent to the session.
+    fn is_up(&self) -> bool {
+        matches!(self, Self::Up)
+    }
+
+    /// When the link went down. `None` while it is up.
+    fn since(&self) -> Option<Instant> {
+        match self {
+            Self::Up => None,
+            Self::Lost { since, .. } | Self::Gone { since, .. } => Some(*since),
+            Self::Reconnecting { since, .. } => Some(*since),
+        }
+    }
+
+    /// What ended the link.
+    fn reason(&self) -> &str {
+        match self {
+            Self::Up => "",
+            Self::Lost { reason, .. }
+            | Self::Reconnecting { reason, .. }
+            | Self::Gone { reason, .. } => reason,
+        }
+    }
+
+    /// Two words for the window title and the taskbar.
+    fn headline(&self) -> &'static str {
+        match self {
+            Self::Up => "connected",
+            Self::Lost { .. } => "connection lost",
+            Self::Reconnecting { .. } => "reconnecting",
+            Self::Gone { .. } => "session ended",
+        }
+    }
+}
+
+/// Whether a lost link is worth trying again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    /// Reconnect, with backoff.
+    Retry,
+    /// Stop, and say why.
+    Fatal,
+}
+
+/// Decide whether the reason a link ended is one a reconnection can fix.
+///
+/// Retrying is the default, because the ordinary ways a link dies -- a
+/// sleeping laptop, a changed network, an `ssh` that was killed, a forward
+/// whose far end went away -- all arrive as an I/O error and all recover. The
+/// list below is the set where reconnecting is not merely useless but actively
+/// worse:
+///
+/// * **Another client connected.** The server replaces the attached client
+///   deliberately; that is what makes picking a session up on another machine
+///   work at all. Retry it and two devices evict each other forever, each one
+///   flickering back for the second before the other takes it again, and the
+///   desktop is unusable on both until somebody quits. This case is why the
+///   classifier exists.
+/// * **A rejection.** A version floor, a uid the policy refuses, a session
+///   that could not be started: the answer is a function of the two ends, so
+///   it will be identical every time, and for the policy cases every attempt
+///   is another refusal in the server's log for an administrator to puzzle
+///   over.
+/// * **A protocol error.** The two ends disagree about the wire format. A
+///   fresh connection disagrees in exactly the same way.
+/// * **The desktop ended.** Reconnecting would start a *new* desktop, which
+///   is not what anybody means by reconnecting.
+///
+/// Matching on the server's own wording is not as fragile as it looks: these
+/// strings are the user-visible text of a protocol both halves of this
+/// repository ship together, and the one that is not -- the rejection -- is
+/// read back through [`crate::connection::mentions_rejection`] rather than by
+/// eye. That looks for the marker anywhere in the string rather than at the
+/// front, because what arrives here is a whole `Result` chain formatted with
+/// `{:#}`: one `.context()` added to the connect in [`App::start_attempt`]
+/// would otherwise make every policy refusal retryable again, silently.
+/// `a_refusal_is_still_a_refusal_by_the_time_the_window_sees_it` drives a
+/// really-refusing server through the real worker so that stays true.
+///
+/// A reason that changes wording and is not caught here degrades to a retry
+/// that fails a few times and gives up, which is the safe direction.
+fn classify(reason: &str) -> Fate {
+    if crate::connection::mentions_rejection(reason) {
+        return Fate::Fatal;
+    }
+    let lower = reason.to_ascii_lowercase();
+    const FATAL: [&str; 3] = [
+        "another client connected",
+        "protocol error",
+        "desktop session has ended",
+    ];
+    if FATAL.iter().any(|f| lower.contains(f)) {
+        return Fate::Fatal;
+    }
+    Fate::Retry
+}
+
+/// What the dimmed window says while the link is not up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Notice {
+    /// Two or three words, in the state's colour.
+    headline: String,
+    /// The reason string the connection gave us, verbatim.
+    detail: String,
+    /// What the user can do about it.
+    hint: &'static str,
+    /// Headline colour.
+    colour: u32,
+}
+
+/// A reconnection running on a worker thread.
+///
+/// On a thread because it is not quick and must not be: dialling a live tunnel
+/// takes a moment, but starting `ssh` again can take as long as the user takes
+/// to answer a passphrase prompt. Doing that on the winit thread would freeze
+/// the very window that is supposed to be showing what is going on.
+struct Attempt {
+    /// The endpoint comes back whatever happens, so a failed attempt does not
+    /// take the tunnel with it.
+    done: crossbeam_channel::Receiver<(Endpoint, Result<Client>)>,
 }
 
 /// Event sent through the winit proxy to wake the loop.
@@ -189,13 +422,27 @@ pub struct App {
     /// Wheel remainder, so a trackpad's few-pixel events add up instead of
     /// rounding to nothing.
     scroll: ScrollCarry,
-    /// When the connection was made; the fallback for "last known alive".
-    started: Instant,
-    /// When the last pong arrived.
-    last_pong: Option<Instant>,
     /// Whether the link was answering at the last check, so a change can show
     /// the bar without documentation.
     link_ok: bool,
+    /// What has become of the connection.
+    link: Link,
+    /// How to make another connection, and what to make it with.
+    session: Session,
+    /// A reconnection in flight.
+    attempt: Option<Attempt>,
+    /// Automatic attempts spent since the link was last up.
+    attempts: u32,
+    /// What the notice said last frame, so it is repainted when it changes
+    /// and not four times a second because it might have.
+    notice_shown: Option<Notice>,
+    /// Whole-number magnification of the remote screen.
+    scale: u32,
+    /// Whether `--scale` fixed it, in which case moving between monitors must
+    /// not change it.
+    scale_pinned: bool,
+    /// One expanded row of the magnified blit, reused across frames.
+    row: Vec<u32>,
     /// When the bar was last repainted for its own sake.
     ///
     /// `about_to_wait` runs again as soon as a redraw it asked for has been
@@ -208,7 +455,7 @@ pub struct App {
 
 impl App {
     /// Wrap a connected client.
-    pub fn new(client: Client, opts: AppOptions) -> Self {
+    pub fn new(client: Client, opts: AppOptions, session: Session) -> Self {
         let clipboard = if opts.clipboard {
             match arboard::Clipboard::new() {
                 Ok(c) => Some(c),
@@ -225,6 +472,10 @@ impl App {
         Self {
             client,
             fullscreen: opts.fullscreen,
+            // A pinned scale is known now; an unpinned one is not known until
+            // there is a window to ask which display it opened on.
+            scale: opts.scale.map_or(1, u32::from),
+            scale_pinned: opts.scale.is_some(),
             opts,
             gfx: None,
             cursor,
@@ -260,9 +511,13 @@ impl App {
             bar_press: false,
             remote_buttons: 0,
             scroll: ScrollCarry::default(),
-            started: now,
-            last_pong: None,
             link_ok: true,
+            link: Link::Up,
+            session,
+            attempt: None,
+            attempts: 0,
+            notice_shown: None,
+            row: Vec::new(),
             last_overlay_frame: now,
             frames: 0,
             last_title_update: now,
@@ -273,12 +528,12 @@ impl App {
     ///
     /// `waker` is the slot returned by [`make_waker`]; it is filled with the
     /// event loop proxy so the network reader thread can wake the loop.
-    pub fn run(client: Client, opts: AppOptions, waker: WakerSlot) -> Result<Option<String>> {
+    pub fn run(client: Client, opts: AppOptions, session: Session) -> Result<Option<String>> {
         let event_loop = EventLoop::<Wake>::with_user_event()
             .build()
             .context("creating event loop")?;
-        *waker.lock().unwrap() = Some(event_loop.create_proxy());
-        let mut app = App::new(client, opts);
+        *session.waker.lock().unwrap() = Some(event_loop.create_proxy());
+        let mut app = App::new(client, opts, session);
         event_loop.run_app(&mut app).context("event loop")?;
         Ok(app.exit_reason.take())
     }
@@ -290,6 +545,14 @@ impl App {
             "{} - {}@{} {}x{}",
             self.opts.title, info.username, info.server_name, w, h
         );
+        // A link that is down displaces the figures rather than joining them:
+        // a round-trip time from before the drop is not a measurement any
+        // more, and the window list is where someone with six windows open
+        // looks first to find out which one stopped.
+        if !self.link.is_up() {
+            t.push_str(&format!(" - {}", self.link.headline()));
+            return t;
+        }
         if let Some(rtt) = self.rtt {
             t.push_str(&format!(" - {:.0} ms", rtt.as_secs_f64() * 1000.0));
         }
@@ -328,9 +591,20 @@ impl App {
 
     fn init_window(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let (w, h) = self.client.size();
+        // There is no window yet to ask which display it will open on, so the
+        // primary monitor stands in and the answer is checked below. Getting
+        // it right the first time matters more than it looks: the window is
+        // created at the remote screen's size times the magnification, and a
+        // window created at half the size it wanted is one the user has to
+        // resize by hand.
+        if !self.scale_pinned {
+            self.scale = event_loop
+                .primary_monitor()
+                .map_or(1, |m| display_scale(m.scale_factor()));
+        }
         let mut attrs = Window::default_attributes()
             .with_title(self.title())
-            .with_inner_size(PhysicalSize::new(w, h))
+            .with_inner_size(PhysicalSize::new(w * self.scale, h * self.scale))
             .with_resizable(true);
         if self.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
@@ -352,6 +626,14 @@ impl App {
             );
         }
         let window = Arc::new(event_loop.create_window(attrs).context("creating window")?);
+        // The window may not have opened on the monitor that was guessed at.
+        if !self.scale_pinned {
+            let actual = display_scale(window.scale_factor());
+            if actual != self.scale {
+                self.scale = actual;
+                let _ = window.request_inner_size(PhysicalSize::new(w * actual, h * actual));
+            }
+        }
         let context = softbuffer::Context::new(window.clone())
             .map_err(|e| anyhow::anyhow!("softbuffer context: {e}"))?;
         let surface = softbuffer::Surface::new(&context, window.clone())
@@ -364,6 +646,42 @@ impl App {
 
     fn uses_local_cursor(&self) -> bool {
         self.client.info().features & features::LOCAL_CURSOR != 0
+    }
+
+    /// Whether the pointer on screen right now is ours to draw.
+    ///
+    /// It stops being ours the moment the link goes: the session's pointer is
+    /// not where the session thinks it is any more, nothing the user does with
+    /// it reaches anywhere, and the window has become an ordinary window with
+    /// a notice on it that they need a real cursor to click.
+    fn draws_own_cursor(&self) -> bool {
+        self.uses_local_cursor() && self.link.is_up()
+    }
+
+    /// Whether anything may be sent to the session.
+    fn link_up(&self) -> bool {
+        self.link.is_up()
+    }
+
+    /// Send a message, if there is a link to send it down.
+    ///
+    /// Every send in this file goes through here or [`App::send_key`], and the
+    /// guard is not tidiness. `Client::send` writes straight into the socket
+    /// with a fifteen-second write timeout, from this thread; against a link
+    /// that has half-died -- a sleeping laptop, a forward whose far end is
+    /// gone -- the write succeeds into the kernel buffer until the buffer
+    /// fills and then blocks for the whole timeout. One keystroke would freeze
+    /// the window for fifteen seconds, and the window is the thing that is
+    /// supposed to be telling the user what happened.
+    fn send(&self, msg: &Message) {
+        if self.link_up() {
+            let _ = self.client.send(msg);
+        }
+    }
+
+    /// Send a key event, if there is a link to send it down.
+    fn send_key(&self, keysym: u32, down: bool) {
+        self.send(&Message::KeyEvent { keysym, down });
     }
 
     /// Repaint the window and present what actually changed.
@@ -388,16 +706,24 @@ impl App {
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
             return Ok(());
         };
+        let now = Instant::now();
         let win = Rect::new(0, 0, size.width, size.height);
-        let scale = self.overlay_scale();
-        let status = self.overlay_status(Instant::now());
+        // Two different scales, and they are not the same thing. `bar_s` is
+        // the display's, so the bar's 5x9 font is legible on a 2x screen;
+        // `self.scale` is the remote screen's magnification. They agree by
+        // default and part company the moment `--scale` is given.
+        let bar_s = self.overlay_scale();
+        let status = self.overlay_status(now);
+        let notice = self.link_notice(now);
         // While the pointer is on the bar it is the OS cursor the user is
         // steering, not the session's, so ours is neither drawn nor moved.
         let cursor_now = match (
-            self.uses_local_cursor() && !self.pointer_on_bar,
+            self.draws_own_cursor() && !self.pointer_on_bar,
             &self.cursor,
         ) {
-            (true, Some(cur)) => self.pointer.map(|(px, py)| cursor_bounds(cur, px, py)),
+            (true, Some(cur)) => self.pointer.map(|(px, py)| {
+                cursor_bounds_scaled(cur, px * self.scale, py * self.scale, self.scale)
+            }),
             _ => None,
         };
         // The bar is blended over what is underneath it, so the pixels it
@@ -408,7 +734,7 @@ impl App {
         // than taken from what `Overlay::draw` returns. The prediction is
         // exact: the bar is always the full window width and a fixed height.
         let bar_now = (self.overlay.visible())
-            .then(|| Rect::new(0, 0, size.width, overlay::bar_height(scale)));
+            .then(|| Rect::new(0, 0, size.width, overlay::bar_height(bar_s)));
         // A resize invalidates every buffer the surface holds, and
         // softbuffer's Wayland backend reallocates the mapping without
         // resetting `age`, so this check has to be ours rather than the
@@ -418,7 +744,14 @@ impl App {
         }
         // Snapshot before `gfx` is borrowed; it is at most three short lists.
         let log: Vec<Vec<Rect>> = self.present_log.iter().cloned().collect();
-        let asked_full = self.full_redraw;
+        // A frame with a notice on it is repainted whole, and that is the
+        // whole of the damage bookkeeping for the dimmed state: the dim is
+        // blended over the blit, so a rectangle repainted without being
+        // dimmed again would come back bright against the rest, and the panel
+        // is blended too. Repainting everything is cheap here precisely
+        // because nothing is arriving to repaint -- these frames happen once a
+        // second, when the wording changes.
+        let asked_full = self.full_redraw || notice.is_some();
 
         let Some(gfx) = self.gfx.as_mut() else {
             return Ok(());
@@ -448,20 +781,39 @@ impl App {
         // ever.
         let (regions, changed) = present_plan(win, full, &own, &stale.unwrap_or_default());
         for r in &regions {
-            blit_rect(
+            blit_rect_scaled(
                 &mut buf,
                 size.width,
                 size.height,
                 self.client.framebuffer(),
                 *r,
+                self.scale,
+                &mut self.row,
             );
+            // Per region rather than over the window, so this stays correct
+            // whatever the damage list turns out to be: every pixel painted
+            // this frame is dimmed exactly once, immediately after the blit
+            // that produced it.
+            if notice.is_some() {
+                blend_rect(
+                    &mut buf,
+                    size.width,
+                    size.height,
+                    *r,
+                    0x0000_0000,
+                    DIM_ALPHA,
+                );
+            }
+        }
+        if let Some(n) = &notice {
+            draw_notice(&mut buf, size.width, size.height, bar_s, n);
         }
         // After the blit and before the cursor: the bar sits over the remote
         // screen and under the pointer, and it is drawn into this buffer
         // rather than into the framebuffer the next frame will diff against.
         let (bar, bar_was) = self
             .overlay
-            .draw(&mut buf, size.width, size.height, scale, &status);
+            .draw(&mut buf, size.width, size.height, bar_s, &status);
         debug_assert_eq!(
             bar, bar_now,
             "the predicted bar rectangle must match the painted one, or the \
@@ -470,7 +822,15 @@ impl App {
         debug_assert_eq!(bar_was, self.last_bar, "the bar's own history drifted");
         if cursor_now.is_some() {
             if let (Some(cur), Some((px, py))) = (&self.cursor, self.pointer) {
-                draw_cursor(&mut buf, size.width, size.height, cur, px, py);
+                draw_cursor_scaled(
+                    &mut buf,
+                    size.width,
+                    size.height,
+                    cur,
+                    px * self.scale,
+                    py * self.scale,
+                    self.scale,
+                );
             }
         }
         let damage: Vec<softbuffer::Rect> =
@@ -528,20 +888,79 @@ impl App {
         st
     }
 
+    /// What the dimmed window says while the link is not up.
+    fn link_notice(&self, now: Instant) -> Option<Notice> {
+        let notice = |headline: &str, detail: String, hint, colour| {
+            Some(Notice {
+                headline: headline.to_string(),
+                detail,
+                hint,
+                colour,
+            })
+        };
+        match &self.link {
+            Link::Up => None,
+            Link::Lost { reason, .. } => notice(
+                "Connection lost",
+                reason.clone(),
+                "Ctrl+Alt+R or a click reconnects  -  Ctrl+Alt+Q closes this window",
+                overlay::colour::WARN,
+            ),
+            Link::Reconnecting {
+                reason,
+                attempt,
+                next_try,
+                ..
+            } => {
+                // The wording distinguishes the two halves of the state on
+                // purpose: "trying" is a moment the user waits through, and
+                // "in 8s" is a moment they may not want to wait through, so it
+                // is exactly when the click that skips the wait is worth
+                // offering.
+                // The accelerator and the count lead, because they are what
+                // is still true when a narrow window cuts the line short.
+                let detail = if self.attempt.is_some() {
+                    format!("attempt {attempt} - {reason}")
+                } else {
+                    let wait = next_try.saturating_duration_since(now).as_secs() + 1;
+                    format!("attempt {} in {wait}s - {reason}", attempt + 1)
+                };
+                notice(
+                    "Reconnecting",
+                    detail,
+                    "Ctrl+Alt+R or a click tries now  -  Ctrl+Alt+Q closes this window",
+                    overlay::colour::WARN,
+                )
+            }
+            Link::Gone { reason, .. } => notice(
+                "Session ended",
+                reason.clone(),
+                "Ctrl+Alt+Q closes this window  -  the desktop may still be on the server",
+                overlay::colour::DANGER,
+            ),
+        }
+    }
+
     /// How long the link has been silent, when that is long enough to say so.
     ///
-    /// Before the first pong there is nothing to measure from, so the
-    /// connection's own start stands in: the handshake completing is itself
-    /// proof the link was alive, and calling a three-second-old session
-    /// "stalled" because our first probe has not come back yet would be a lie.
-    ///
-    /// `Client` keeps a better signal -- `last_message_at`, which any message
-    /// refreshes, not only a pong -- but it is private and `connection.rs` is
-    /// not this change's to edit. If it grows an accessor, prefer it here: it
-    /// notices a wedged session without depending on our own probe.
+    /// Measured from [`Client::quiet_for`] rather than from our own probe,
+    /// because *any* message refreshes that -- so a session whose core thread
+    /// has wedged reads as quiet within a couple of server ping intervals,
+    /// while one that is merely not being pinged by us does not read as
+    /// anything at all. It starts at the handshake, which is itself proof the
+    /// link was alive, so a three-second-old session is never called stalled
+    /// because the first probe has not come back yet.
     fn stalled_for(&self, now: Instant) -> Option<Duration> {
-        let quiet = now.saturating_duration_since(self.last_pong.unwrap_or(self.started));
-        (quiet > STALL_AFTER).then_some(quiet)
+        match self.link.since() {
+            // A link that has actually failed is not "quiet", it is down, and
+            // the bar says so from the moment it happens rather than six
+            // seconds later when a probe that was never sent fails to return.
+            Some(since) => Some(now.saturating_duration_since(since)),
+            None => {
+                let quiet = self.client.quiet_for();
+                (quiet > STALL_AFTER).then_some(quiet)
+            }
+        }
     }
 
     fn request_redraw(&mut self) {
@@ -556,8 +975,11 @@ impl App {
         self.remote_buttons != 0
     }
 
-    fn drain_network(&mut self, event_loop: &ActiveEventLoop) {
-        if self.exit_reason.is_some() {
+    fn drain_network(&mut self) {
+        // A closed `Client` answers every poll with the same `Disconnected`,
+        // so draining one that has already been reported is an infinite loop
+        // dressed as a state machine.
+        if self.exit_reason.is_some() || !self.link_up() {
             return;
         }
         loop {
@@ -565,23 +987,18 @@ impl App {
                 Ok(Some(ev)) => match ev {
                     ClientEvent::Frame { dirty, .. } => {
                         self.frames += 1;
+                        // Into window pixels here, once, at the boundary: from
+                        // this point on every rectangle in this file is in the
+                        // coordinates the window is presented in.
+                        let dirty = scale_rect(dirty, self.scale);
                         self.dirty = Some(self.dirty.map(|d| d.union(&dirty)).unwrap_or(dirty));
                         self.request_redraw();
                     }
                     ClientEvent::Resized { width, height } => {
                         log::info!("remote screen is now {width}x{height}");
                         self.full_redraw = true;
-                        if let Some(g) = &self.gfx {
-                            if !self.fullscreen {
-                                let cur = g.window.inner_size();
-                                if (cur.width, cur.height) != (width, height) {
-                                    let _ = g
-                                        .window
-                                        .request_inner_size(PhysicalSize::new(width, height));
-                                }
-                            }
-                            g.window.set_title(&self.title());
-                        }
+                        self.match_window_to_remote(width, height);
+                        self.update_title();
                         self.request_redraw();
                     }
                     ClientEvent::Cursor(c) => {
@@ -626,48 +1043,359 @@ impl App {
                         self.on_clipboard_file(id, None);
                     }
                     ClientEvent::Notice(text) => log::info!("server: {text}"),
-                    ClientEvent::Rtt(rtt) => {
-                        self.rtt = Some(rtt);
-                        self.last_pong = Some(Instant::now());
-                    }
+                    ClientEvent::Rtt(rtt) => self.rtt = Some(rtt),
                     ClientEvent::Disconnected(reason) => {
-                        log::info!("disconnected: {reason}");
-                        self.exit_reason = Some(reason);
-                        event_loop.exit();
+                        self.on_link_lost(reason);
                         return;
                     }
                 },
                 Ok(None) => break,
                 Err(e) => {
-                    log::error!("protocol error: {e:#}");
-                    self.exit_reason = Some(format!("protocol error: {e:#}"));
-                    event_loop.exit();
+                    self.on_link_lost(format!("protocol error: {e:#}"));
                     return;
                 }
             }
         }
     }
 
+    /// Size the window to a remote screen of `width` by `height`.
+    fn match_window_to_remote(&mut self, width: u32, height: u32) {
+        let (Some(g), false) = (self.gfx.as_ref(), self.fullscreen) else {
+            return;
+        };
+        let want = (width * self.scale, height * self.scale);
+        let cur = g.window.inner_size();
+        if (cur.width, cur.height) != want {
+            let _ = g
+                .window
+                .request_inner_size(PhysicalSize::new(want.0, want.1));
+        }
+    }
+
+    /// The link ended. Keep the window, keep the last frame, say what happened.
+    ///
+    /// This used to exit the event loop, which is the bug: the desktop those
+    /// pixels came from is still running on the server, and a laptop that
+    /// slept for a minute closed the window on a session that was in no
+    /// trouble at all.
+    fn on_link_lost(&mut self, reason: String) {
+        if !self.link_up() {
+            return;
+        }
+        let now = Instant::now();
+        log::warn!("connection lost: {reason}");
+        // Not `disconnect`: there is nothing to say goodbye to, and saying it
+        // into a half-open socket costs the write timeout on this thread.
+        self.client.abandon(&reason);
+        self.forget_transfers();
+        let fate = classify(&reason);
+        self.attempts = 0;
+        self.link = match (fate, self.session.endpoint.is_some()) {
+            (Fate::Fatal, _) => Link::Gone { reason, since: now },
+            // Nothing to reconnect through is not a state to offer a retry
+            // from; the window still stays up and still says what happened.
+            (Fate::Retry, false) => Link::Gone {
+                reason: format!("{reason} (this session has no way to reconnect)"),
+                since: now,
+            },
+            (Fate::Retry, true) => Link::Reconnecting {
+                reason,
+                since: now,
+                attempt: 0,
+                next_try: now + retry_delay(0),
+            },
+        };
+        // The OS pointer comes back: ours belonged to a session that is not
+        // listening, and the notice asks for a click.
+        self.restore_cursor();
+        self.full_redraw = true;
+        self.overlay.flash(now);
+        self.update_title();
+        self.request_redraw();
+    }
+
+    /// Let go of transfers that belonged to the connection that just died.
+    ///
+    /// Every id was issued by that connection, and a reconnected client
+    /// numbers its own from one again: a completion arriving on the new link
+    /// would otherwise retire an upload from the old one, and a clipboard
+    /// batch would sit forever holding slots for files that can never arrive.
+    fn forget_transfers(&mut self) {
+        let pending = self.uploads.len() + self.upload_queue.len();
+        if pending > 0 {
+            log::warn!("{pending} upload(s) abandoned with the link");
+        }
+        self.uploads.clear();
+        self.upload_queue.clear();
+        self.upload_done = 0;
+        if self.clipboard_batch.take().is_some() {
+            log::warn!("a clipboard file copy was abandoned with the link");
+        }
+        // The mirrors describe a session this side can no longer see. Clearing
+        // them means a reconnected session is told what is on this clipboard
+        // rather than having the change suppressed as one it already knows
+        // about.
+        self.last_clipboard = None;
+        self.last_image = None;
+    }
+
+    /// Ask for a reconnection now, whatever the backoff was going to say.
+    fn reconnect_now(&mut self) {
+        if self.attempt.is_some() || matches!(self.link, Link::Up | Link::Gone { .. }) {
+            return;
+        }
+        // A person asking is not one of the automatic attempts, and it puts
+        // the budget back: they may have just plugged the network in.
+        self.attempts = 0;
+        self.start_attempt(Instant::now());
+    }
+
+    /// Start a reconnection on a worker thread.
+    fn start_attempt(&mut self, now: Instant) {
+        let Some(since) = self.link.since() else {
+            return;
+        };
+        let reason = self.link.reason().to_string();
+        let Some(endpoint) = self.session.endpoint.take() else {
+            // Only reachable if a worker went away holding it. Saying so beats
+            // a window that offers a retry and then does nothing when asked.
+            self.link = Link::Gone {
+                reason: format!("{reason} (there is no way left to reconnect)"),
+                since,
+            };
+            return;
+        };
+        self.attempts += 1;
+        self.link = Link::Reconnecting {
+            reason,
+            since,
+            attempt: self.attempts,
+            next_try: now,
+        };
+        let opts = self.session.connect.clone();
+        let reader_waker = waker_for(&self.session.waker);
+        let nudge = waker_for(&self.session.waker);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let spawned = std::thread::Builder::new()
+            .name("lynxrdp-reconnect".into())
+            .spawn(move || {
+                let mut endpoint = endpoint;
+                let result = endpoint
+                    .connect()
+                    .and_then(|s| Client::from_stream(s.into_tcp(), &opts, Some(reader_waker)));
+                // The endpoint goes back whatever happened, so a failed
+                // attempt does not take a live tunnel with it.
+                let _ = tx.send((endpoint, result));
+                nudge();
+            });
+        match spawned {
+            Ok(_) => self.attempt = Some(Attempt { done: rx }),
+            Err(e) => {
+                // The endpoint went with the closure. There is no way back
+                // from here, and pretending otherwise would leave the window
+                // counting down to attempts it cannot make.
+                self.link = Link::Gone {
+                    reason: format!("could not start a reconnection: {e}"),
+                    since,
+                };
+            }
+        }
+        self.update_title();
+        self.request_redraw();
+    }
+
+    /// Collect a finished attempt, or start the one that is due.
+    fn poll_reconnect(&mut self, now: Instant) {
+        if let Some(a) = &self.attempt {
+            match a.done.try_recv() {
+                Ok((endpoint, result)) => {
+                    self.attempt = None;
+                    self.session.endpoint = Some(endpoint);
+                    match result {
+                        Ok(client) => self.adopt(client, now),
+                        Err(e) => self.attempt_failed(format!("{e:#}"), now),
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // The worker went away without answering, which takes the
+                    // endpoint with it: there is nothing left to dial.
+                    self.attempt = None;
+                    self.attempt_failed("the reconnection stopped unexpectedly".into(), now);
+                }
+            }
+            return;
+        }
+        if let Link::Reconnecting { next_try, .. } = &self.link {
+            if now >= *next_try {
+                self.start_attempt(now);
+            }
+        }
+    }
+
+    /// One attempt did not work.
+    fn attempt_failed(&mut self, reason: String, now: Instant) {
+        log::warn!("reconnection attempt {} failed: {reason}", self.attempts);
+        let Some(since) = self.link.since() else {
+            return;
+        };
+        // Whatever the attempt hit is more use than the original reason by
+        // now: "connection refused" says the tunnel is up and the session is
+        // not, and "no route to host" says the network still has not come
+        // back.
+        //
+        // It is also classified in its own right. An attempt can fail for a
+        // reason of its own that no repetition will change -- a rejection is the
+        // one that matters, because every repeat of it is another refusal in
+        // the server's log for an administrator to explain.
+        if classify(&reason) == Fate::Fatal {
+            self.link = Link::Gone { reason, since };
+            self.update_title();
+            self.request_redraw();
+            return;
+        }
+        if self.attempts >= RETRY_BUDGET || self.session.endpoint.is_none() {
+            self.link = Link::Lost {
+                reason: format!("{reason} (gave up after {} attempts)", self.attempts),
+                since,
+            };
+        } else {
+            let wait = retry_delay(self.attempts);
+            self.link = Link::Reconnecting {
+                reason,
+                since,
+                attempt: self.attempts,
+                next_try: now + wait,
+            };
+        }
+        self.update_title();
+        self.request_redraw();
+    }
+
+    /// Take over a freshly connected client.
+    fn adopt(&mut self, client: Client, now: Instant) {
+        let (w, h) = client.size();
+        log::info!(
+            "reconnected to {} as {} (session {}), screen {w}x{h}",
+            client.info().server_name,
+            client.info().username,
+            client.info().session_id
+        );
+        // The old one was abandoned when the link failed, so dropping it here
+        // neither writes nor blocks.
+        self.client = client;
+        self.link = Link::Up;
+        self.attempts = 0;
+        self.rtt = None;
+        self.last_ping = now;
+        self.link_ok = true;
+        self.cursor = self.client.cursor().cloned();
+        // A new client is a new framebuffer, and the server invalidates its
+        // encoder for an arriving client precisely so that the first frame
+        // after this is a whole screen. Nothing that was in flight before
+        // describes it.
+        self.dirty = None;
+        self.present_log.clear();
+        self.full_redraw = true;
+        self.resync_input();
+        self.restore_cursor();
+        if self.opts.dynamic_resize && self.client.info().features & features::RESIZE != 0 {
+            // The window may have been resized while the link was down, and
+            // the session still has the size it had. Ask through the ordinary
+            // debounced path rather than inventing a second one.
+            if let Some(g) = &self.gfx {
+                self.pending_size = Some(remote_size_for(g.window.inner_size(), self.scale));
+                self.last_resize_event = Some(now);
+            }
+        } else {
+            self.match_window_to_remote(w, h);
+        }
+        self.overlay.flash(now);
+        self.update_title();
+        self.request_redraw();
+    }
+
+    /// Put the session's idea of the keyboard and pointer back where ours is.
+    ///
+    /// The server releases everything a client was holding when that client
+    /// goes away, and again when a new one replaces it -- but *when* it
+    /// noticed the old link was gone is not something this side can know: a
+    /// half-open socket is only reaped by a timeout. Sending the releases
+    /// ourselves makes the two agree whichever way round it happened, and the
+    /// alternative is a Ctrl the desktop believes is held down for the rest of
+    /// the session.
+    fn resync_input(&mut self) {
+        self.swallowed.clear();
+        // A wheel remainder is part of a gesture that ended when the link did.
+        self.scroll.reset();
+        self.release_all_keys();
+        for b in [
+            MouseButton::Left,
+            MouseButton::Middle,
+            MouseButton::Right,
+            MouseButton::Back,
+            MouseButton::Forward,
+        ] {
+            if let Some((button, bit)) = button_codes(b) {
+                if self.remote_buttons & bit != 0 {
+                    self.send(&Message::PointerButton {
+                        button,
+                        down: false,
+                    });
+                }
+            }
+        }
+        self.remote_buttons = 0;
+        // And where the pointer is, after the buttons are up rather than
+        // before: warping first would drag whatever the old link was holding
+        // across the desktop and drop it somewhere new.
+        //
+        // The session's pointer is where the *old* link left it, and ours is
+        // wherever the mouse has moved to since -- over a dimmed window a
+        // motion event updates our copy and sends nothing. Without this the
+        // next click is delivered to whatever is under the pre-drop position,
+        // and "the user will move the mouse first" does not save it: a motion
+        // that does not change the remote pixel sends nothing, so at a
+        // magnification of two a whole pixel of movement can still leave the
+        // two ends disagreeing.
+        if let Some((x, y)) = self.pointer {
+            // Clamped to the new screen, which may not be the size the old
+            // link had -- the desktop can have been resized by whoever else
+            // attached while this window was dark.
+            let (w, h) = self.client.size();
+            let (x, y) = (x.min(w.saturating_sub(1)), y.min(h.saturating_sub(1)));
+            self.pointer = Some((x, y));
+            self.send(&Message::PointerMotion {
+                x: x as u16,
+                y: y as u16,
+            });
+        }
+    }
+
     fn housekeeping(&mut self) {
         let now = Instant::now();
+        self.poll_reconnect(now);
         if let (Some(t), Some((w, h))) = (self.last_resize_event, self.pending_size) {
             if now.duration_since(t) >= RESIZE_DEBOUNCE {
                 self.last_resize_event = None;
                 self.pending_size = None;
                 if (w, h) != self.client.size() && w >= 64 && h >= 64 {
                     log::debug!("requesting remote resize to {w}x{h}");
-                    let _ = self.client.request_resize(
-                        w.min(u16::MAX as u32) as u16,
-                        h.min(u16::MAX as u32) as u16,
-                    );
+                    self.send(&Message::ResizeRequest {
+                        width: w.min(u16::MAX as u32) as u16,
+                        height: h.min(u16::MAX as u32) as u16,
+                    });
                 }
             }
         }
-        if now.duration_since(self.last_ping) >= PING_INTERVAL {
+        if self.link_up() && now.duration_since(self.last_ping) >= PING_INTERVAL {
             self.last_ping = now;
             let _ = self.client.ping();
         }
-        if self.focused && now.duration_since(self.last_clipboard_poll) >= CLIPBOARD_POLL {
+        if self.link_up()
+            && self.focused
+            && now.duration_since(self.last_clipboard_poll) >= CLIPBOARD_POLL
+        {
             self.last_clipboard_poll = now;
             // Ask before reading. On Windows and macOS this is a change
             // counter and almost every tick stops here; elsewhere the text
@@ -697,6 +1425,16 @@ impl App {
             self.link_ok = ok;
             self.overlay.flash(now);
         }
+        // The notice is repainted when its wording changes and not otherwise.
+        // It carries a countdown, so "has it changed" is asked four times a
+        // second and answered yes about once -- and a repaint while the link
+        // is down is a whole window, which is worth asking before doing.
+        let notice = self.link_notice(now);
+        if notice != self.notice_shown {
+            self.notice_shown = notice;
+            self.full_redraw = true;
+            self.request_redraw();
+        }
         if self.overlay.tick(now) {
             // The bar covers remote pixels, so both showing and hiding it are
             // a full repaint; the blit restores what was underneath.
@@ -723,7 +1461,7 @@ impl App {
     fn restore_cursor(&self) {
         if let Some(g) = &self.gfx {
             g.window
-                .set_cursor_visible(!self.uses_local_cursor() || self.cursor.is_none());
+                .set_cursor_visible(!self.draws_own_cursor() || self.cursor.is_none());
         }
     }
 
@@ -732,12 +1470,23 @@ impl App {
         match action {
             overlay::Action::Fullscreen => self.toggle_fullscreen(),
             overlay::Action::SecureAttention => self.send_secure_attention(),
-            overlay::Action::Disconnect => {
-                // The same path CloseRequested takes, so there is one exit.
-                self.exit_reason = Some("disconnected by the user".into());
-                event_loop.exit();
-            }
+            overlay::Action::Disconnect => self.close(event_loop, "disconnected by the user"),
         }
+    }
+
+    /// End the window. The one exit, whatever asked for it.
+    ///
+    /// A link that failed keeps its own reason: it is what the command line
+    /// reports, and it is what the user was reading on the dimmed window when
+    /// they closed it. "Window closed" would replace the only account of what
+    /// happened with a description of the click that dismissed it.
+    fn close(&mut self, event_loop: &ActiveEventLoop, reason: &str) {
+        let reason = match &self.link {
+            Link::Up => reason.to_string(),
+            other => other.reason().to_string(),
+        };
+        self.exit_reason.get_or_insert(reason);
+        event_loop.exit();
     }
 
     /// Send Ctrl+Alt+Del into the session.
@@ -754,6 +1503,9 @@ impl App {
     /// end so `release_all_keys` does not send a second release for a key that
     /// is already up.
     fn send_secure_attention(&mut self) {
+        if !self.link_up() {
+            return;
+        }
         let held = |a: u32, b: u32| self.pressed_keys.iter().any(|&k| k == a || k == b);
         let mut synth = Vec::new();
         if !held(keysym::CONTROL_L, keysym::CONTROL_R) {
@@ -764,13 +1516,13 @@ impl App {
         }
         for &ks in &synth {
             self.pressed_keys.push(ks);
-            let _ = self.client.key(ks, true);
+            self.send_key(ks, true);
         }
-        let _ = self.client.key(keysym::DELETE, true);
-        let _ = self.client.key(keysym::DELETE, false);
+        self.send_key(keysym::DELETE, true);
+        self.send_key(keysym::DELETE, false);
         for &ks in synth.iter().rev() {
             self.pressed_keys.retain(|&k| k != ks);
-            let _ = self.client.key(ks, false);
+            self.send_key(ks, false);
         }
     }
 
@@ -785,6 +1537,10 @@ impl App {
     /// dropping the rest produces a directory in the session that looks
     /// complete and is not.
     fn on_dropped_file(&mut self, path: &std::path::Path) {
+        if !self.link_up() {
+            log::warn!("the link is down; ignoring dropped file");
+            return;
+        }
         if self.client.info().features & features::FILE_TRANSFER == 0 {
             log::warn!("the server did not enable file transfer; ignoring dropped file");
             return;
@@ -818,7 +1574,7 @@ impl App {
 
     /// Start as many queued uploads as the concurrency limit allows.
     fn pump_uploads(&mut self) {
-        while self.uploads.len() < MAX_CONCURRENT_UPLOADS {
+        while self.link_up() && self.uploads.len() < MAX_CONCURRENT_UPLOADS {
             let Some((local, dest)) = self.upload_queue.pop_front() else {
                 break;
             };
@@ -844,7 +1600,7 @@ impl App {
 
     /// The session copied files: download them, then offer them locally.
     fn on_remote_files(&mut self, files: Vec<lynxrdp_proto::FileEntry>) {
-        if files.is_empty() {
+        if files.is_empty() || !self.link_up() {
             return;
         }
         // A copy in the session replaces whatever the last one was staging.
@@ -877,6 +1633,11 @@ impl App {
     /// Issue what the batch is allowed to have in flight, and publish it once
     /// every file in it has either arrived or failed.
     fn pump_clipboard_batch(&mut self) {
+        if !self.link_up() {
+            // Nothing can be asked for and nothing can arrive. The batch goes
+            // with the link rather than being published half empty.
+            return;
+        }
         while let Some((remote, dest, slot)) = self
             .clipboard_batch
             .as_mut()
@@ -1007,7 +1768,7 @@ impl App {
     /// before, which is what tells [`ClipboardWatcher`] whether looking was
     /// worth it.
     fn poll_clipboard_image(&mut self) -> bool {
-        if self.client.info().features & features::CLIPBOARD_IMAGE == 0 {
+        if !self.link_up() || self.client.info().features & features::CLIPBOARD_IMAGE == 0 {
             return false;
         }
         let Some(cb) = self.clipboard.as_mut() else {
@@ -1056,6 +1817,9 @@ impl App {
     }
 
     fn poll_clipboard(&mut self) {
+        if !self.link_up() {
+            return;
+        }
         let Some(cb) = self.clipboard.as_mut() else {
             return;
         };
@@ -1066,7 +1830,7 @@ impl App {
             Ok(text) => {
                 if !text.is_empty() && self.last_clipboard.as_deref() != Some(text.as_str()) {
                     if text.len() <= 4 * 1024 * 1024 {
-                        let _ = self.client.set_clipboard(&text);
+                        self.send(&Message::ClipboardText { text: text.clone() });
                     }
                     self.last_clipboard = Some(text);
                 }
@@ -1094,8 +1858,17 @@ impl App {
     /// here -- Esc, Tab, the function keys, everything -- belongs to the
     /// session. The bar prints these next to the matching button, which is the
     /// whole of its keyboard story.
-    fn accelerator(&self, event: &KeyEvent) -> Option<Accelerator> {
-        accelerator_for(self.modifiers, &event.logical_key, event.physical_key)
+    fn accelerator(&self, logical: &Key, physical: PhysicalKey) -> Option<Accelerator> {
+        let acc = accelerator_for(self.modifiers, logical, physical)?;
+        // Ctrl+Alt+R is ours only while there is nothing to send it to. Taking
+        // a shortcut away from the desktop for the whole session, to run a
+        // command that does nothing for all but a few seconds of it, is a
+        // worse trade than the other four make -- and while the link is down
+        // the session is not receiving keys anyway, so nothing is lost.
+        if acc == Accelerator::Reconnect && self.link_up() {
+            return None;
+        }
+        Some(acc)
     }
 
     fn on_key(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
@@ -1103,7 +1876,7 @@ impl App {
             return;
         };
         if event.state == ElementState::Pressed {
-            if let Some(acc) = self.accelerator(&event) {
+            if let Some(acc) = self.accelerator(&event.logical_key, event.physical_key) {
                 self.swallowed.push(ks);
                 match acc {
                     Accelerator::Fullscreen => self.toggle_fullscreen(),
@@ -1114,6 +1887,7 @@ impl App {
                         // unpinning wants a last look before it goes.
                         self.overlay.flash(Instant::now());
                     }
+                    Accelerator::Reconnect => self.reconnect_now(),
                     Accelerator::Disconnect => {
                         self.run_overlay_action(overlay::Action::Disconnect, event_loop)
                     }
@@ -1122,6 +1896,15 @@ impl App {
             }
         } else if let Some(i) = self.swallowed.iter().position(|&k| k == ks) {
             self.swallowed.swap_remove(i);
+            return;
+        }
+        // Nothing else reaches the session while the link is down, and
+        // nothing is recorded either: `pressed_keys` is this side's copy of
+        // what the *session* believes is held, and the session believes what
+        // it was told before the link failed. Recording a press it never saw
+        // would have `resync_input` release a key it is not holding, and
+        // dropping a release it never saw is what leaves a modifier stuck.
+        if !self.link_up() {
             return;
         }
         // Numpad digits should arrive as KP_ keysyms.
@@ -1143,12 +1926,12 @@ impl App {
         } else {
             self.pressed_keys.retain(|&k| k != ks);
         }
-        let _ = self.client.key(ks, down);
+        self.send_key(ks, down);
     }
 
     fn release_all_keys(&mut self) {
         for ks in std::mem::take(&mut self.pressed_keys) {
-            let _ = self.client.key(ks, false);
+            self.send_key(ks, false);
         }
         // The releases for these will arrive with the window unfocused, or not
         // at all; either way there is nothing left to match them against.
@@ -1193,13 +1976,21 @@ impl App {
         if resync {
             self.restore_cursor();
         }
+        // Down into remote pixels: the pointer is kept in the session's
+        // coordinates because that is what is sent, what arrives back in a
+        // `CursorPosition`, and what has to be clamped to the remote screen.
+        // Window pixels are re-derived where it is drawn.
         let (w, h) = self.client.size();
-        let x = pos.x.max(0.0).min(f64::from(w.saturating_sub(1))) as u32;
-        let y = pos.y.max(0.0).min(f64::from(h.saturating_sub(1))) as u32;
+        let s = f64::from(self.scale);
+        let x = (pos.x.max(0.0) / s).min(f64::from(w.saturating_sub(1))) as u32;
+        let y = (pos.y.max(0.0) / s).min(f64::from(h.saturating_sub(1))) as u32;
         if resync || self.pointer != Some((x, y)) {
             self.pointer = Some((x, y));
-            let _ = self.client.pointer_move(x as u16, y as u16);
-            if self.uses_local_cursor() {
+            self.send(&Message::PointerMotion {
+                x: x as u16,
+                y: y as u16,
+            });
+            if self.draws_own_cursor() {
                 self.request_redraw();
             }
         }
@@ -1248,6 +2039,7 @@ fn accelerator_for(
         Key::Named(NamedKey::Enter) => return Some(Accelerator::Fullscreen),
         Key::Named(NamedKey::End) => return Some(Accelerator::SecureAttention),
         Key::Character(c) if c.eq_ignore_ascii_case("b") => return Some(Accelerator::Pin),
+        Key::Character(c) if c.eq_ignore_ascii_case("r") => return Some(Accelerator::Reconnect),
         Key::Character(c) if c.eq_ignore_ascii_case("q") => return Some(Accelerator::Disconnect),
         // A letter the layout produced that is not one of ours is the
         // layout's final word; the session gets it.
@@ -1256,6 +2048,7 @@ fn accelerator_for(
     }
     match physical {
         PhysicalKey::Code(KeyCode::KeyB) => Some(Accelerator::Pin),
+        PhysicalKey::Code(KeyCode::KeyR) => Some(Accelerator::Reconnect),
         PhysicalKey::Code(KeyCode::KeyQ) => Some(Accelerator::Disconnect),
         _ => None,
     }
@@ -1270,6 +2063,9 @@ enum Accelerator {
     SecureAttention,
     /// Ctrl+Alt+B.
     Pin,
+    /// Ctrl+Alt+R, and only while the link is down -- see
+    /// [`App::accelerator`].
+    Reconnect,
     /// Ctrl+Alt+Q.
     Disconnect,
 }
@@ -1336,14 +2132,42 @@ impl ScrollCarry {
 /// The window rectangle a cursor image covers at `(px, py)`, clamped to the
 /// positive quadrant. Used to present the pixels the pointer leaves behind.
 pub fn cursor_bounds(cur: &CursorImage, px: u32, py: u32) -> Rect {
-    let x = i64::from(px) - i64::from(cur.hot_x);
-    let y = i64::from(py) - i64::from(cur.hot_y);
+    cursor_bounds_scaled(cur, px, py, 1)
+}
+
+/// What [`draw_cursor_scaled`] will touch, in window pixels.
+///
+/// Exactly the same arithmetic as the drawing, because a rectangle that is
+/// even one pixel short of what was painted leaves a line of the old pointer
+/// on screen until something else happens to repaint it.
+pub fn cursor_bounds_scaled(cur: &CursorImage, px: u32, py: u32, scale: u32) -> Rect {
+    let s = i64::from(scale.max(1));
+    let x = i64::from(px) - i64::from(cur.hot_x) * s;
+    let y = i64::from(py) - i64::from(cur.hot_y) * s;
     let (x0, y0) = (x.max(0), y.max(0));
     Rect::new(
         x0 as u32,
         y0 as u32,
-        (x + i64::from(cur.width) - x0).max(0) as u32,
-        (y + i64::from(cur.height) - y0).max(0) as u32,
+        (x + i64::from(cur.width) * s - x0).max(0) as u32,
+        (y + i64::from(cur.height) * s - y0).max(0) as u32,
+    )
+}
+
+/// A rectangle of the remote screen, in window pixels.
+///
+/// The only conversion between the two coordinate systems, and the reason it
+/// is a named function: everything the window presents -- decoded damage, the
+/// cursor's box, the bar, the notice -- has to be in *window* pixels by the
+/// time it reaches the damage list, and a damage rectangle left in remote
+/// pixels does not fail, it just presents a quarter of the area that changed
+/// and leaves stale bands on screen wherever the rest of it was.
+pub fn scale_rect(r: Rect, scale: u32) -> Rect {
+    let s = scale.max(1);
+    Rect::new(
+        r.x.saturating_mul(s),
+        r.y.saturating_mul(s),
+        r.width.saturating_mul(s),
+        r.height.saturating_mul(s),
     )
 }
 
@@ -1455,13 +2279,192 @@ pub type WakerSlot = Arc<std::sync::Mutex<Option<EventLoopProxy<Wake>>>>;
 /// installed the proxy in the returned slot.
 pub fn make_waker() -> (Box<dyn Fn() + Send>, WakerSlot) {
     let slot: WakerSlot = Arc::new(std::sync::Mutex::new(None));
-    let s2 = slot.clone();
-    let f: Box<dyn Fn() + Send> = Box::new(move || {
-        if let Some(p) = s2.lock().unwrap().as_ref() {
-            let _ = p.send_event(Wake);
-        }
-    });
+    let f = waker_for(&slot);
     (f, slot)
+}
+
+/// Another wake callback for a slot that already exists.
+///
+/// A reconnection needs two: one for the new client's reader thread and one
+/// for the worker itself, so the answer is noticed when it arrives rather than
+/// at the next quarter-second tick.
+pub fn waker_for(slot: &WakerSlot) -> Box<dyn Fn() + Send> {
+    let slot = slot.clone();
+    Box::new(move || {
+        if let Ok(guard) = slot.lock() {
+            if let Some(p) = guard.as_ref() {
+                let _ = p.send_event(Wake);
+            }
+        }
+    })
+}
+
+/// How long to wait before the attempt after `spent` of them.
+///
+/// The last entry of [`RETRY_BACKOFF`] repeats, so the wait grows and then
+/// stops growing rather than running off into hours -- the budget, not the
+/// delay, is what ends the attempts.
+fn retry_delay(spent: u32) -> Duration {
+    RETRY_BACKOFF[(spent as usize).min(RETRY_BACKOFF.len() - 1)]
+}
+
+/// The remote screen size a window of this size can show at `scale`.
+///
+/// Floored, and that is a requirement rather than a rounding preference: the
+/// remote screen has to be a whole number of magnified pixels, or the session
+/// is asked for a size the window cannot show without scaling something. The
+/// few pixels the division loses are the black margin the blit already paints
+/// down the right and bottom edges.
+fn remote_size_for(size: PhysicalSize<u32>, scale: u32) -> (u32, u32) {
+    let s = scale.max(1);
+    (size.width / s, size.height / s)
+}
+
+/// The magnification a display of this scale factor asks for.
+///
+/// Rounded, because the magnification is a whole number or it is resampling;
+/// clamped to [`MAX_SCALE`], which is the same ceiling the saved connections
+/// use, so a profile and a display cannot disagree about what is possible.
+pub fn display_scale(window_scale: f64) -> u32 {
+    if !window_scale.is_finite() {
+        return 1;
+    }
+    window_scale.round().clamp(1.0_f64, f64::from(MAX_SCALE)) as u32
+}
+
+/// Blend a colour over a rectangle of the window buffer.
+///
+/// The same integer form as the cursor compositor and the bar's, so all three
+/// agree pixel for pixel over the same background.
+pub fn blend_rect(dst: &mut [u32], dst_w: u32, dst_h: u32, r: Rect, colour: u32, alpha: u32) {
+    if alpha == 0 || dst.len() < (dst_w as usize) * (dst_h as usize) {
+        return;
+    }
+    let r = r.intersect(&Rect::new(0, 0, dst_w, dst_h));
+    let inv = 255 - alpha.min(255);
+    let a = alpha.min(255);
+    for y in r.y..r.bottom() {
+        let row = (y as usize) * (dst_w as usize);
+        for x in r.x..r.right() {
+            let i = row + x as usize;
+            let d = dst[i];
+            let ch = |shift: u32| -> u32 {
+                let sc = (colour >> shift) & 0xff;
+                let dc = (d >> shift) & 0xff;
+                ((sc * a + dc * inv + 127) / 255).min(255)
+            };
+            dst[i] = (ch(16) << 16) | (ch(8) << 8) | ch(0);
+        }
+    }
+}
+
+/// How many glyphs of the bar's font fit in `w` pixels at scale `s`.
+///
+/// The font is fixed width: five columns and a one-column gap, all at `s`,
+/// with no gap after the last glyph. Arithmetic rather than a decision, which
+/// is why it is repeated here instead of exported from [`overlay`] -- and
+/// `the_text_metric_matches_the_font_that_paints_it` checks it against real
+/// painted pixels, so the two cannot drift apart quietly.
+fn chars_fitting(w: u32, s: u32) -> usize {
+    ((w + s) / (6 * s)) as usize
+}
+
+/// Height of the strip the link notice is drawn in.
+fn notice_height(s: u32) -> u32 {
+    44 * s
+}
+
+/// Draw one line of text with the bar's font, at `(x, y)` in window pixels.
+///
+/// [`overlay`] owns the only bitmap font in this window and exports no text
+/// call of its own -- but `paint` becomes one when it is handed a layout with
+/// no bar, no state square and no buttons: every rectangle it fills is then
+/// empty and clips away, and the spans are all that reach the buffer.
+/// Borrowing it keeps one font in the window; a second copy of a 96-entry
+/// glyph table here would be a second thing to keep in step for no gain.
+fn draw_text_line(
+    dst: &mut [u32],
+    w: u32,
+    h: u32,
+    s: u32,
+    at: (u32, u32),
+    text: &str,
+    colour: u32,
+) {
+    let layout = overlay::Layout {
+        bar: Rect::default(),
+        dot: Rect::default(),
+        dot_colour: 0,
+        spans: vec![overlay::Span {
+            x: at.0,
+            text: text.to_string(),
+            colour,
+        }],
+        buttons: Vec::new(),
+        s,
+        text_y: at.1,
+    };
+    overlay::paint(dst, w, h, &layout, None, None);
+}
+
+/// Shorten `text` to what will fit in `w` pixels, marking it if it was cut.
+///
+/// Marked because a silently clipped reason is a different reason: "no route
+/// to host" and "no route" are not the same sentence, and the second one looks
+/// deliberate.
+fn fit_text(text: &str, w: u32, s: u32) -> String {
+    let room = chars_fitting(w, s);
+    if text.chars().count() <= room {
+        return text.to_string();
+    }
+    if room < 3 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(room - 2).collect();
+    out.push_str("..");
+    out
+}
+
+/// Draw the strip that says what happened to the link.
+///
+/// Along the bottom edge, which is not decoration: the bar lives along the top
+/// and the two must never fight over the same pixels, and the bottom is also
+/// where a full-screen session's own panel usually is not.
+fn draw_notice(dst: &mut [u32], w: u32, h: u32, s: u32, n: &Notice) -> Rect {
+    let height = notice_height(s).min(h);
+    let panel = Rect::new(0, h.saturating_sub(height), w, height);
+    blend_rect(
+        dst,
+        w,
+        h,
+        panel,
+        overlay::colour::SCRIM,
+        overlay::colour::SCRIM_ALPHA,
+    );
+    // A hairline along the top edge, the way the bar has one along its bottom:
+    // over a pale desktop the scrim alone does not read as an edge.
+    blend_rect(
+        dst,
+        w,
+        h,
+        Rect::new(panel.x, panel.y, panel.width, s),
+        overlay::colour::HAIRLINE,
+        overlay::colour::HAIRLINE_ALPHA,
+    );
+    let pad = 4 * s;
+    let avail = w.saturating_sub(2 * pad);
+    for (i, (text, colour)) in [
+        (n.headline.as_str(), n.colour),
+        (n.detail.as_str(), overlay::colour::TEXT),
+        (n.hint, overlay::colour::DIM),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let y = panel.y + 6 * s + i as u32 * 12 * s;
+        draw_text_line(dst, w, h, s, (pad, y), &fit_text(text, avail, s), *colour);
+    }
+    panel
 }
 
 impl ApplicationHandler<Wake> for App {
@@ -1478,17 +2481,17 @@ impl ApplicationHandler<Wake> for App {
         ));
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
-        self.drain_network(event_loop);
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: Wake) {
+        self.drain_network();
+        // A wake also arrives when a reconnection worker has an answer, and
+        // the answer is worth having before the next quarter-second tick.
+        self.poll_reconnect(Instant::now());
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::DroppedFile(path) => self.on_dropped_file(&path),
-            WindowEvent::CloseRequested => {
-                self.exit_reason = Some("window closed".into());
-                event_loop.exit();
-            }
+            WindowEvent::CloseRequested => self.close(event_loop, "window closed"),
             WindowEvent::RedrawRequested => {
                 // A redraw nobody asked for is an expose. Our own state says
                 // nothing changed, so the damage list would name at most the
@@ -1498,7 +2501,7 @@ impl ApplicationHandler<Wake> for App {
                 if !std::mem::take(&mut self.redraw_asked) {
                     self.full_redraw = true;
                 }
-                self.drain_network(event_loop);
+                self.drain_network();
                 if let Err(e) = self.redraw() {
                     log::error!("redraw failed: {e:#}");
                 }
@@ -1506,9 +2509,26 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::Resized(size) => {
                 self.full_redraw = true;
                 if self.opts.dynamic_resize && self.client.info().features & features::RESIZE != 0 {
-                    self.pending_size = Some((size.width, size.height));
+                    self.pending_size = Some(remote_size_for(size, self.scale));
                     self.last_resize_event = Some(Instant::now());
                 }
+                self.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Dragged to a monitor with a different DPI. The window keeps
+                // its logical size, so its physical size has just changed by
+                // the same ratio as the magnification is about to -- which
+                // means the remote screen size works out unchanged and the
+                // desktop stays the size it looks. A pinned `--scale` is left
+                // alone: it was an instruction, not a guess.
+                if !self.scale_pinned {
+                    let want = display_scale(scale_factor);
+                    if want != self.scale {
+                        log::info!("display scale is now {scale_factor}; magnifying {want}x");
+                        self.scale = want;
+                    }
+                }
+                self.full_redraw = true;
                 self.request_redraw();
             }
             WindowEvent::Focused(f) => {
@@ -1523,7 +2543,14 @@ impl ApplicationHandler<Wake> for App {
                     self.clipwatch.wake(Instant::now());
                     self.poll_clipboard();
                 } else {
-                    self.release_all_keys();
+                    // Only while there is a link to release them on. With one
+                    // down, `pressed_keys` is the record of what the session
+                    // was left holding and the note `resync_input` replays
+                    // when a new link comes up; clearing it here would throw
+                    // that away and leave the modifier held.
+                    if self.link_up() {
+                        self.release_all_keys();
+                    }
                     // A wheel remainder from before the window lost focus is
                     // not part of whatever gesture comes next.
                     self.scroll.reset();
@@ -1546,12 +2573,7 @@ impl ApplicationHandler<Wake> for App {
                     g.window.set_cursor_visible(true);
                 }
             }
-            WindowEvent::CursorEntered { .. } => {
-                if let Some(g) = &self.gfx {
-                    g.window
-                        .set_cursor_visible(!self.uses_local_cursor() || self.cursor.is_none());
-                }
-            }
+            WindowEvent::CursorEntered { .. } => self.restore_cursor(),
             WindowEvent::MouseInput {
                 state, button: b, ..
             } => {
@@ -1574,6 +2596,15 @@ impl ApplicationHandler<Wake> for App {
                     }
                     return;
                 }
+                // A click on a dimmed window is not input for a session that
+                // cannot hear it; it is the most obvious way there is to ask
+                // for the connection back, and the notice says so.
+                if !self.link_up() {
+                    if down && b == MouseButton::Left {
+                        self.reconnect_now();
+                    }
+                    return;
+                }
                 let Some((btn, bit)) = button_codes(b) else {
                     return;
                 };
@@ -1582,16 +2613,16 @@ impl ApplicationHandler<Wake> for App {
                 } else {
                     self.remote_buttons &= !bit;
                 }
-                let _ = self.client.pointer_button(btn, down);
+                self.send(&Message::PointerButton { button: btn, down });
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.pointer_on_bar {
+                if self.pointer_on_bar || !self.link_up() {
                     return;
                 }
                 let (dx, dy) = scroll_units(delta);
                 let (sx, sy) = self.scroll.feed(dx, dy);
                 if sx != 0 || sy != 0 {
-                    let _ = self.client.send(&Message::Scroll { dx: sx, dy: sy });
+                    self.send(&Message::Scroll { dx: sx, dy: sy });
                 }
             }
             _ => {}
@@ -1599,7 +2630,7 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.drain_network(event_loop);
+        self.drain_network();
         self.housekeeping();
         if self.dirty.is_some() || self.full_redraw {
             self.request_redraw();
@@ -1610,9 +2641,26 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // A reconnection worker holds the endpoint, and an SSH endpoint owns
+        // the `ssh` child: leaving while it is out there orphans a process
+        // that would go on forwarding a port with no window behind it. Waiting
+        // a moment gets it back in the ordinary case, where the attempt is one
+        // connection to a tunnel that is already up; anything slower than that
+        // is ssh authenticating, and the exit does not wait on a passphrase.
+        if let Some(a) = self.attempt.take() {
+            let _ = a.done.recv_timeout(Duration::from_millis(250));
+        }
+        // Nothing is said down a link that has already failed. `Client::send`
+        // would block for the write timeout against a half-open socket, and
+        // this is the path a user takes when they close a window that is
+        // *already* telling them the connection is gone -- so the freeze would
+        // land exactly where it is least deserved.
+        if !self.link_up() {
+            return;
+        }
         self.release_all_keys();
         // Release Shift/Control keysym remnants explicitly for safety.
-        let _ = self.client.key(keysym::SHIFT_L, false);
+        self.send_key(keysym::SHIFT_L, false);
         self.client
             .disconnect(self.exit_reason.as_deref().unwrap_or("client exiting"));
     }
@@ -2053,40 +3101,137 @@ pub fn blit_rect(dst: &mut [u32], dst_w: u32, dst_h: u32, fb: &Framebuffer, rect
     }
 }
 
-/// Alpha-blend a premultiplied ARGB cursor onto the buffer.
-pub fn draw_cursor(dst: &mut [u32], dst_w: u32, dst_h: u32, cur: &CursorImage, px: u32, py: u32) {
-    if cur.width == 0 || cur.height == 0 {
+/// Copy one rectangle of the framebuffer into the window buffer, magnified.
+///
+/// `rect` is in *window* pixels; each remote pixel becomes a `scale`-by-`scale`
+/// block of itself. Nearest-neighbour at a whole factor is the only
+/// magnification this client does, and the reason is the promise at the top of
+/// this file: duplicating a pixel invents nothing, so text stays exactly as
+/// the server drew it and a screenful of 9 px terminal type is still the same
+/// glyphs, four times the area. Anything fractional would resample, and a
+/// resampled remote desktop is a blurry one.
+///
+/// `row` is scratch space, reused across calls. Each *source* row is expanded
+/// once into it and then memcpy'd into the `scale` window rows that share it,
+/// so the total writes stay proportional to the output rather than being
+/// re-derived per pixel per row; at scale 4 that is one expansion instead of
+/// four and three memcpys instead of three more passes of division.
+///
+/// Padding follows [`blit_rect`] exactly: black wherever the window reaches
+/// past the magnified remote screen, which is the ordinary state of a window
+/// that has been resized and whose session has not caught up yet.
+pub fn blit_rect_scaled(
+    dst: &mut [u32],
+    dst_w: u32,
+    dst_h: u32,
+    fb: &Framebuffer,
+    rect: Rect,
+    scale: u32,
+    row: &mut Vec<u32>,
+) {
+    if scale <= 1 {
+        blit_rect(dst, dst_w, dst_h, fb, rect);
         return;
     }
-    let ox = px as i64 - i64::from(cur.hot_x);
-    let oy = py as i64 - i64::from(cur.hot_y);
-    for cy in 0..i64::from(cur.height) {
-        let y = oy + cy;
-        if y < 0 || y >= i64::from(dst_h) {
-            continue;
-        }
-        for cx in 0..i64::from(cur.width) {
-            let x = ox + cx;
-            if x < 0 || x >= i64::from(dst_w) {
-                continue;
+    if dst.len() < (dst_w as usize) * (dst_h as usize) {
+        return;
+    }
+    let r = rect.intersect(&Rect::new(0, 0, dst_w, dst_h));
+    if r.is_empty() {
+        return;
+    }
+    row.clear();
+    row.resize(r.width as usize, 0);
+    let mut y = r.y;
+    while y < r.bottom() {
+        let sy = y / scale;
+        // The window rows this source row covers, clipped to the rectangle:
+        // one expansion serves all of them.
+        let band = ((sy + 1) * scale).min(r.bottom());
+        if sy < fb.height() {
+            let mut x = r.x;
+            while x < r.right() {
+                let sx = x / scale;
+                let end = ((sx + 1) * scale).min(r.right());
+                let v = if sx < fb.width() { fb.get(sx, sy) } else { 0 };
+                row[(x - r.x) as usize..(end - r.x) as usize].fill(v);
+                x = end;
             }
-            let s = cur.argb[(cy as usize) * usize::from(cur.width) + cx as usize];
-            let a = s >> 24;
+        } else {
+            row.fill(0);
+        }
+        for yy in y..band {
+            let start = (yy as usize) * (dst_w as usize) + (r.x as usize);
+            dst[start..start + r.width as usize].copy_from_slice(row);
+        }
+        y = band;
+    }
+}
+
+/// Alpha-blend a premultiplied ARGB cursor onto the buffer, 1:1.
+pub fn draw_cursor(dst: &mut [u32], dst_w: u32, dst_h: u32, cur: &CursorImage, px: u32, py: u32) {
+    draw_cursor_scaled(dst, dst_w, dst_h, cur, px, py, 1);
+}
+
+/// Alpha-blend a premultiplied ARGB cursor, magnified `scale` times.
+///
+/// `(px, py)` is the hotspot in *window* pixels, and the image is magnified
+/// about it: at scale 2 a cursor whose hotspot is 4 px into its own image
+/// starts 8 window pixels left of the pointer. Anything else would put the
+/// point of the arrow somewhere other than where the user is pointing, which
+/// is the one thing a pointer has to get right.
+///
+/// The magnification is the remote screen's, not the display's: the cursor is
+/// part of the picture the session drew, so it grows with the rest of it. Each
+/// source pixel becomes a `scale`-by-`scale` block of the same colour --
+/// nothing is resampled and no colour appears that the server did not send.
+pub fn draw_cursor_scaled(
+    dst: &mut [u32],
+    dst_w: u32,
+    dst_h: u32,
+    cur: &CursorImage,
+    px: u32,
+    py: u32,
+    scale: u32,
+) {
+    if cur.width == 0 || cur.height == 0 || scale == 0 {
+        return;
+    }
+    let s = i64::from(scale);
+    let ox = i64::from(px) - i64::from(cur.hot_x) * s;
+    let oy = i64::from(py) - i64::from(cur.hot_y) * s;
+    for cy in 0..i64::from(cur.height) {
+        for cx in 0..i64::from(cur.width) {
+            let src = cur.argb[(cy as usize) * usize::from(cur.width) + cx as usize];
+            let a = src >> 24;
             if a == 0 {
                 continue;
             }
-            let idx = (y as usize) * (dst_w as usize) + x as usize;
-            if a == 255 {
-                dst[idx] = s & 0x00FF_FFFF;
-                continue;
+            for by in 0..s {
+                let y = oy + cy * s + by;
+                if y < 0 || y >= i64::from(dst_h) {
+                    continue;
+                }
+                for bx in 0..s {
+                    let x = ox + cx * s + bx;
+                    if x < 0 || x >= i64::from(dst_w) {
+                        continue;
+                    }
+                    let idx = (y as usize) * (dst_w as usize) + x as usize;
+                    if a == 255 {
+                        dst[idx] = src & 0x00FF_FFFF;
+                        continue;
+                    }
+                    let d = dst[idx];
+                    let inv = 255 - a;
+                    let blend =
+                        |sc: u32, dc: u32| -> u32 { (sc + (dc * inv + 127) / 255).min(255) };
+                    let r = blend((src >> 16) & 0xff, (d >> 16) & 0xff);
+                    let g = blend((src >> 8) & 0xff, (d >> 8) & 0xff);
+                    let b = blend(src & 0xff, d & 0xff);
+                    dst[idx] = (r << 16) | (g << 8) | b;
+                }
             }
-            let d = dst[idx];
-            let inv = 255 - a;
-            let blend = |sc: u32, dc: u32| -> u32 { (sc + (dc * inv + 127) / 255).min(255) };
-            let r = blend((s >> 16) & 0xff, (d >> 16) & 0xff);
-            let g = blend((s >> 8) & 0xff, (d >> 8) & 0xff);
-            let b = blend(s & 0xff, d & 0xff);
-            dst[idx] = (r << 16) | (g << 8) | b;
         }
     }
 }
@@ -2094,6 +3239,7 @@ pub fn draw_cursor(dst: &mut [u32], dst_w: u32, dst_h: u32, cur: &CursorImage, p
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
 
     #[test]
     fn dropping_a_file_uploads_it_under_its_own_name() {
@@ -2845,6 +3991,768 @@ mod tests {
         assert!(root.path().join("batch-notanumber").exists());
         // Pruning an absent directory is not an error.
         prune_batches(&root.path().join("missing"), 2);
+    }
+
+    // ---------------------------------------------- magnification (B3)
+
+    /// What a magnified window must hold, pixel for pixel: every window pixel
+    /// is the remote pixel under it at this factor, and black past the edge.
+    fn reference_scaled(dst_w: u32, dst_h: u32, fb: &Framebuffer, s: u32) -> Vec<u32> {
+        let mut out = vec![0u32; (dst_w * dst_h) as usize];
+        for y in 0..dst_h {
+            for x in 0..dst_w {
+                let (sx, sy) = (x / s, y / s);
+                out[(y * dst_w + x) as usize] = if sx < fb.width() && sy < fb.height() {
+                    fb.get(sx, sy)
+                } else {
+                    0
+                };
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn magnifying_by_one_is_the_unmagnified_blit() {
+        // The scaled path is the only one `redraw` calls now, so at scale 1 it
+        // has to be indistinguishable from the code it replaced -- which is
+        // itself tested against the full blit above.
+        let fb = ramp(7, 5);
+        let mut row = Vec::new();
+        for (w, h) in [(7u32, 5u32), (10, 8), (4, 3)] {
+            for rect in [
+                Rect::new(0, 0, w, h),
+                Rect::new(2, 1, 4, 4),
+                Rect::new(5, 0, 3, 6),
+                Rect::new(3, 2, 100, 9),
+                Rect::default(),
+            ] {
+                let mut a = vec![0xDEADu32; (w * h) as usize];
+                let mut b = a.clone();
+                blit_rect(&mut a, w, h, &fb, rect);
+                blit_rect_scaled(&mut b, w, h, &fb, rect, 1, &mut row);
+                assert_eq!(a, b, "{w}x{h} {rect}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_magnified_window_holds_whole_duplicated_pixels() {
+        // Nearest neighbour at a whole factor: every output pixel is a pixel
+        // the server sent, never a blend of two. That is the promise the top
+        // of this file makes, and the reason the option is an integer.
+        let fb = ramp(5, 3);
+        let mut row = Vec::new();
+        for s in 2..=4u32 {
+            // A window both larger and smaller than the magnified screen, so
+            // the padding and the clipping are both covered.
+            for (w, h) in [
+                (5 * s, 3 * s),
+                (5 * s + 7, 3 * s + 5),
+                (5 * s - 3, 3 * s - 1),
+            ] {
+                let want = reference_scaled(w, h, &fb, s);
+                let mut got = vec![0xBADDu32; (w * h) as usize];
+                blit_rect_scaled(&mut got, w, h, &fb, Rect::new(0, 0, w, h), s, &mut row);
+                assert_eq!(got, want, "scale {s}, window {w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_damage_rectangle_repaints_exactly_its_own_pixels() {
+        // The half of the mapping that is easy to get wrong and invisible in a
+        // screenshot: a rectangle that is not on a multiple of the scale, and
+        // one that straddles the edge of the remote screen. Painting the whole
+        // window and painting it rectangle by rectangle must agree, or a
+        // damaged present leaves a stale band behind.
+        let fb = ramp(5, 3);
+        let mut row = Vec::new();
+        let s = 3u32;
+        let (w, h) = (5 * s + 4, 3 * s + 4);
+        let want = reference_scaled(w, h, &fb, s);
+        for rect in [
+            Rect::new(0, 0, w, h),
+            Rect::new(1, 1, 4, 4),
+            Rect::new(2, 2, s, s),
+            Rect::new(s * 4, 0, s * 3, h),
+            Rect::new(0, s * 2 + 1, w, s + 1),
+            Rect::new(w - 2, h - 2, 50, 50),
+        ] {
+            let mut got = want.clone();
+            let clipped = rect.intersect(&Rect::new(0, 0, w, h));
+            for y in clipped.y..clipped.bottom() {
+                for x in clipped.x..clipped.right() {
+                    got[(y * w + x) as usize] = 0xBADD;
+                }
+            }
+            blit_rect_scaled(&mut got, w, h, &fb, rect, s, &mut row);
+            assert_eq!(got, want, "{rect} at scale {s}");
+        }
+    }
+
+    #[test]
+    fn a_magnified_blit_touches_nothing_outside_itself() {
+        let fb = ramp(6, 6);
+        let s = 2u32;
+        let (w, h) = (12u32, 12u32);
+        let mut row = Vec::new();
+        let mut buf = vec![0xBADDu32; (w * h) as usize];
+        let rect = Rect::new(3, 5, 4, 3);
+        blit_rect_scaled(&mut buf, w, h, &fb, rect, s, &mut row);
+        for y in 0..h {
+            for x in 0..w {
+                let got = buf[(y * w + x) as usize];
+                if rect.contains(&Rect::new(x, y, 1, 1)) {
+                    assert_eq!(got, fb.get(x / s, y / s), "({x},{y})");
+                } else {
+                    assert_eq!(got, 0xBADD, "({x},{y}) was overwritten");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remote_damage_becomes_window_damage() {
+        assert_eq!(scale_rect(Rect::new(3, 4, 5, 6), 1), Rect::new(3, 4, 5, 6));
+        assert_eq!(
+            scale_rect(Rect::new(3, 4, 5, 6), 2),
+            Rect::new(6, 8, 10, 12)
+        );
+        // A scale of zero is not a thing, and must not turn damage into
+        // nothing at all.
+        assert_eq!(scale_rect(Rect::new(3, 4, 5, 6), 0), Rect::new(3, 4, 5, 6));
+    }
+
+    #[test]
+    fn a_magnified_cursor_stays_inside_the_rectangle_that_presents_it() {
+        // The pixels the pointer leaves behind are presented by naming this
+        // rectangle, so anything drawn outside it stays on screen until
+        // something else happens to repaint that part of the window.
+        let cur = CursorImage {
+            width: 3,
+            height: 2,
+            hot_x: 1,
+            hot_y: 1,
+            argb: vec![0xFF00_FF00; 6],
+        };
+        let (w, h) = (40u32, 30u32);
+        for s in 1..=4u32 {
+            for (px, py) in [(20, 15), (0, 0), (1, 1), (39, 29), (2, 2)] {
+                let mut buf = vec![0u32; (w * h) as usize];
+                draw_cursor_scaled(&mut buf, w, h, &cur, px, py, s);
+                let bounds =
+                    cursor_bounds_scaled(&cur, px, py, s).intersect(&Rect::new(0, 0, w, h));
+                let mut painted = 0u32;
+                for y in 0..h {
+                    for x in 0..w {
+                        if buf[(y * w + x) as usize] != 0 {
+                            painted += 1;
+                            assert!(
+                                bounds.contains(&Rect::new(x, y, 1, 1)),
+                                "({x},{y}) painted outside {bounds} at scale {s}"
+                            );
+                        }
+                    }
+                }
+                // And tight, when the whole thing is on screen: a rectangle
+                // that is too large is a cost, one that is too small is an
+                // artefact, and only the exact one is neither.
+                if bounds.area() == u64::from(3 * 2 * s * s) {
+                    assert_eq!(painted, 3 * 2 * s * s, "at scale {s}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_magnification_follows_the_display_and_stays_whole() {
+        // A 2x screen gets 2, which is the whole point: the window is sized in
+        // physical pixels against a fixed 96 DPI server, so 1:1 there is a
+        // window half the size the desktop should be.
+        assert_eq!(display_scale(1.0), 1);
+        assert_eq!(display_scale(2.0), 2);
+        assert_eq!(display_scale(3.0), 3);
+        // Fractional factors round rather than resampling.
+        assert_eq!(display_scale(1.25), 1);
+        assert_eq!(display_scale(1.5), 2);
+        assert_eq!(display_scale(2.75), 3);
+        // Clamped at both ends, and a nonsense factor is not a crash.
+        assert_eq!(display_scale(0.5), 1);
+        assert_eq!(display_scale(0.0), 1);
+        assert_eq!(display_scale(99.0), u32::from(MAX_SCALE));
+        // A factor that is not a number at all falls back to 1:1 rather than
+        // to the largest window the machine cannot draw.
+        assert_eq!(display_scale(f64::NAN), 1);
+        assert_eq!(display_scale(f64::INFINITY), 1);
+    }
+
+    #[test]
+    fn a_window_size_divides_by_the_magnification() {
+        // What the resize path asks the session for. A size that does not
+        // divide is one the window cannot show without scaling something, and
+        // the session would be serving pixels nobody can present.
+        for (w, h, s, want) in [
+            (1920u32, 1080u32, 1u32, (1920u32, 1080u32)),
+            (1920, 1080, 2, (960, 540)),
+            // The awkward sizes: an odd window at 2x, and one that divides
+            // into nothing at all.
+            (1921, 1081, 2, (960, 540)),
+            (100, 60, 3, (33, 20)),
+            (10, 10, 4, (2, 2)),
+            // A scale of zero is not a thing, and must not divide by it.
+            (800, 600, 0, (800, 600)),
+        ] {
+            let got = remote_size_for(PhysicalSize::new(w, h), s);
+            assert_eq!(got, want, "{w}x{h} at scale {s}");
+            assert!(got.0 * s.max(1) <= w && got.1 * s.max(1) <= h);
+        }
+    }
+
+    // ------------------------------------------------ a dropped link (B1)
+
+    /// A server that completes the handshake `connections` times over and
+    /// records everything each client sends afterwards.
+    ///
+    /// Two connections is the whole of the reconnection story from the far
+    /// end's point of view, and it is what the real server does: the second
+    /// one replaces the first on a session that never stopped running.
+    fn fake_session(connections: usize) -> (SocketAddr, Arc<std::sync::Mutex<Vec<Message>>>) {
+        use lynxrdp_proto::frame::{read_message, write_message};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let theirs = seen.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().take(connections) {
+                let Ok(mut s) = conn else { break };
+                if read_message(&mut s).is_err() {
+                    break;
+                }
+                let hello = Message::ServerHello {
+                    version: lynxrdp_proto::PROTOCOL_VERSION,
+                    server_name: "fake".into(),
+                    features: features::LOCAL_CURSOR,
+                    session_id: 7,
+                    username: "bob".into(),
+                    width: 64,
+                    height: 48,
+                };
+                if write_message(&mut s, &hello).is_err() {
+                    break;
+                }
+                while let Ok(m) = read_message(&mut s) {
+                    theirs.lock().unwrap().push(m);
+                }
+            }
+        });
+        (addr, seen)
+    }
+
+    /// A server that holds one session and refuses everyone after it: a
+    /// policy that changed, or a version floor, seen from the client side.
+    fn fake_session_then_rejecting(code: u16, reason: &str) -> SocketAddr {
+        use lynxrdp_proto::frame::{read_message, write_message};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reason = reason.to_string();
+        std::thread::spawn(move || {
+            let mut first = true;
+            for conn in listener.incoming() {
+                let Ok(mut s) = conn else { break };
+                if read_message(&mut s).is_err() {
+                    break;
+                }
+                let reply = if std::mem::take(&mut first) {
+                    Message::ServerHello {
+                        version: lynxrdp_proto::PROTOCOL_VERSION,
+                        server_name: "fake".into(),
+                        features: 0,
+                        session_id: 7,
+                        username: "bob".into(),
+                        width: 64,
+                        height: 48,
+                    }
+                } else {
+                    Message::Rejected {
+                        code,
+                        reason: reason.clone(),
+                    }
+                };
+                if write_message(&mut s, &reply).is_err() {
+                    break;
+                }
+                // Held open until the client lets go, so the first session
+                // ends when this side is told to end it and not before.
+                while read_message(&mut s).is_ok() {}
+            }
+        });
+        addr
+    }
+
+    /// A window's state without a window: `App::new` opens nothing, so every
+    /// path below that touches `gfx` is a no-op and the state machine is what
+    /// is left.
+    fn test_app(addr: SocketAddr, endpoint: Option<Endpoint>) -> App {
+        let connect = ConnectOptions::default();
+        let client = Client::connect(addr, &connect, None).expect("handshake");
+        App::new(
+            client,
+            AppOptions {
+                fullscreen: false,
+                title: "LynxRDP".into(),
+                dynamic_resize: false,
+                // Not the system clipboard: these tests have no business
+                // reading or writing the one the developer is using.
+                clipboard: false,
+                scale: Some(1),
+            },
+            Session {
+                endpoint,
+                connect,
+                waker: make_waker().1,
+            },
+        )
+    }
+
+    /// A loopback address with nothing behind it: every connection is refused
+    /// at once, which is what a tunnel that is up and a session that is not
+    /// looks like.
+    fn refusing_addr() -> SocketAddr {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        drop(l);
+        addr
+    }
+
+    #[test]
+    fn a_dropped_link_keeps_the_window_and_says_what_happened() {
+        // The bug this replaces: any `Disconnected` left the event loop, so a
+        // laptop that slept for a minute closed the window on a desktop that
+        // was still running on the server, untouched.
+        let (addr, _seen) = fake_session(1);
+        let mut app = test_app(addr, Some(Endpoint::direct(addr).unwrap()));
+        assert!(app.link_up());
+        app.on_link_lost("connection closed".into());
+
+        assert!(!app.link_up());
+        assert!(
+            app.exit_reason.is_none(),
+            "the window must outlive the link"
+        );
+        // The last frame is still there to dim.
+        assert_eq!(app.client.size(), (64, 48));
+        let notice = app.link_notice(Instant::now()).expect("a notice");
+        assert!(
+            notice.detail.contains("connection closed"),
+            "the reason that arrived has to be the reason shown: {notice:?}"
+        );
+        // And the bar is told the real state rather than our ping bookkeeping.
+        assert!(app.overlay_status(Instant::now()).stalled.is_some());
+        assert!(!app.draws_own_cursor(), "the pointer is the user's again");
+    }
+
+    #[test]
+    fn a_fatal_reason_is_not_retried_by_hand_either() {
+        let (addr, _seen) = fake_session(1);
+        let mut app = test_app(addr, Some(Endpoint::direct(addr).unwrap()));
+        app.on_link_lost("Another client connected to this session.".into());
+        assert!(matches!(app.link, Link::Gone { .. }));
+        assert!(app.attempt.is_none(), "nothing may be scheduled");
+        // Even asked directly. Two devices taking turns at evicting each other
+        // is worse than the disconnection they are each recovering from.
+        app.reconnect_now();
+        assert!(app.attempt.is_none());
+        assert!(matches!(app.link, Link::Gone { .. }));
+    }
+
+    #[test]
+    fn a_link_that_dies_takes_its_transfers_with_it() {
+        // Transfer ids belong to the connection that issued them and a
+        // reconnected client numbers its own from one again, so a completion
+        // on the new link would retire an upload from the old one.
+        let (addr, _seen) = fake_session(1);
+        let mut app = test_app(addr, Some(Endpoint::direct(addr).unwrap()));
+        app.uploads.push((1, "a.txt".into()));
+        app.upload_queue
+            .push_back((PathBuf::from("/tmp/b.txt"), "b.txt".into()));
+        app.clipboard_batch = Some(ClipBatch::new(
+            PathBuf::from("/staging"),
+            &entries(&["/a/one.txt"]),
+        ));
+        app.last_clipboard = Some("stale".into());
+
+        app.on_link_lost("connection closed".into());
+        assert!(app.uploads.is_empty());
+        assert!(app.upload_queue.is_empty());
+        assert!(app.clipboard_batch.is_none());
+        assert_eq!(app.last_clipboard, None);
+
+        // And a drop onto a dimmed window queues nothing rather than failing
+        // one file at a time.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("notes.txt");
+        std::fs::write(&f, b"x").unwrap();
+        app.on_dropped_file(&f);
+        assert!(app.upload_queue.is_empty() && app.uploads.is_empty());
+    }
+
+    #[test]
+    fn a_reconnection_takes_over_and_unsticks_the_keyboard() {
+        // The whole of stage one, end to end: the link drops, the window
+        // stays, a worker reconnects through the endpoint, and the session is
+        // told to let go of what the old link left held. Without that last
+        // part a Ctrl that was down when the network went is down for ever.
+        let (addr, seen) = fake_session(2);
+        let mut app = test_app(addr, Some(Endpoint::direct(addr).unwrap()));
+        app.pressed_keys.push(keysym::CONTROL_L);
+        app.remote_buttons = 1;
+        app.on_link_lost("connection closed".into());
+        assert!(matches!(app.link, Link::Reconnecting { .. }));
+        // The mouse moved while the window was dark, which sends nothing --
+        // so the session's pointer is somewhere else entirely until the
+        // reconnection says where ours is.
+        app.on_pointer_moved(PhysicalPosition::new(11.0, 7.0));
+        assert_eq!(app.pointer, Some((11, 7)));
+
+        // Drive the machine the way `about_to_wait` does, with a clock that
+        // runs faster than the backoff.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut now = Instant::now();
+        while !app.link_up() {
+            assert!(
+                Instant::now() < deadline,
+                "never reconnected: {:?}",
+                app.link
+            );
+            now += Duration::from_millis(500);
+            app.poll_reconnect(now);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.attempts, 0, "the budget is restored by success");
+        assert!(app.pressed_keys.is_empty());
+        assert_eq!(app.remote_buttons, 0);
+        assert!(
+            app.full_redraw,
+            "the new client's first frame is a whole one"
+        );
+        assert!(app.session.endpoint.is_some(), "the endpoint came back");
+
+        // And the session was actually told, on the new link.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = seen.lock().unwrap().clone();
+            let released_key = got.iter().any(|m| {
+                matches!(
+                    m,
+                    Message::KeyEvent {
+                        keysym: k,
+                        down: false
+                    } if *k == keysym::CONTROL_L
+                )
+            });
+            let released_button = got.iter().any(|m| {
+                matches!(
+                    m,
+                    Message::PointerButton {
+                        button: button::LEFT,
+                        down: false
+                    }
+                )
+            });
+            // And where the pointer ended up, after the releases rather than
+            // before: warping first would drag what the old link was holding.
+            let placed = got
+                .iter()
+                .position(|m| matches!(m, Message::PointerMotion { x: 11, y: 7 }));
+            if released_key && released_button {
+                if let Some(at) = placed {
+                    assert!(
+                        got[..at]
+                            .iter()
+                            .any(|m| matches!(m, Message::PointerButton { down: false, .. })),
+                        "the pointer was warped before the drag was let go: {got:?}"
+                    );
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the reconnected session was never told to let go: {got:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_link_that_will_not_come_back_stops_trying_and_waits_to_be_asked() {
+        // The budget: an automatic retry is only polite while there is reason
+        // to think it will work. After that the window says what happened and
+        // waits, rather than dialling a dead host until the battery runs out.
+        let (addr, _seen) = fake_session(1);
+        let mut app = test_app(addr, Some(Endpoint::direct(addr).unwrap()));
+        app.session.endpoint = Some(Endpoint::direct(refusing_addr()).unwrap());
+        app.on_link_lost("connection closed".into());
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut now = Instant::now();
+        while !matches!(app.link, Link::Lost { .. }) {
+            assert!(Instant::now() < deadline, "still trying: {:?}", app.link);
+            now += Duration::from_secs(60);
+            app.poll_reconnect(now);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.attempts, RETRY_BUDGET);
+        assert!(app.attempt.is_none());
+        let notice = app.link_notice(now).expect("a notice");
+        assert_eq!(notice.headline, "Connection lost");
+        assert!(notice.hint.contains("Ctrl+Alt+R"), "{}", notice.hint);
+        // Asking by hand puts the budget back: the user may have just plugged
+        // the network in.
+        app.reconnect_now();
+        assert_eq!(app.attempts, 1);
+        assert!(matches!(app.link, Link::Reconnecting { .. }));
+    }
+
+    #[test]
+    fn an_attempt_that_is_refused_stops_attempting() {
+        // A reconnection can fail for a reason of its own, and a rejection is
+        // the one that matters: repeating it achieves nothing and writes
+        // another refusal into the server's log every time.
+        let (addr, _seen) = fake_session(1);
+        let mut app = test_app(addr, Some(Endpoint::direct(addr).unwrap()));
+        app.on_link_lost("connection closed".into());
+        assert!(matches!(app.link, Link::Reconnecting { .. }));
+        app.attempt_failed(
+            crate::connection::rejection_reason(2, "user not allowed"),
+            Instant::now(),
+        );
+        assert!(
+            matches!(app.link, Link::Gone { .. }),
+            "{:?} would have been retried",
+            app.link
+        );
+        assert!(app.link.reason().contains("not allowed"));
+    }
+
+    #[test]
+    fn a_refusal_is_still_a_refusal_by_the_time_the_window_sees_it() {
+        // The classifier reads the rejection back out of a string, and the
+        // string it is handed is whatever the worker's error formats to --
+        // not the one `rejection_reason` returned. One `.context()` added to
+        // the connect chain in `start_attempt` would prefix it, `rejection_code`
+        // would stop recognising it, and every policy refusal would quietly
+        // become eight of them in the server's log. So this drives the real
+        // worker against a server that really refuses, rather than calling
+        // `attempt_failed` with a string composed by the test.
+        let addr = fake_session_then_rejecting(3, "this user may not open a session");
+        let mut app = test_app(addr, Some(Endpoint::direct(addr).unwrap()));
+        app.on_link_lost("connection closed".into());
+        assert!(matches!(app.link, Link::Reconnecting { .. }));
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut now = Instant::now();
+        while matches!(app.link, Link::Reconnecting { .. }) {
+            assert!(Instant::now() < deadline, "still trying: {:?}", app.link);
+            now += Duration::from_secs(5);
+            app.poll_reconnect(now);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(app.link, Link::Gone { .. }),
+            "a refusal was retried: {:?}",
+            app.link
+        );
+        assert_eq!(app.attempts, 1, "one attempt, not the whole budget");
+        assert!(
+            app.link.reason().contains("may not open a session"),
+            "{}",
+            app.link.reason()
+        );
+    }
+
+    #[test]
+    fn the_reconnect_accelerator_belongs_to_the_session_while_the_link_is_up() {
+        // Ctrl+Alt+R is a shortcut inside plenty of desktop applications.
+        // Swallowing it for the whole session to serve a command that does
+        // nothing for all but a few seconds of it would be a bad trade, so it
+        // is ours only while there is nothing to send it to.
+        use winit::keyboard::SmolStr;
+        let ctrl_alt = ModifiersState::CONTROL | ModifiersState::ALT;
+        assert_eq!(
+            accelerator_for(
+                ctrl_alt,
+                &Key::Character(SmolStr::new("r")),
+                PhysicalKey::Code(KeyCode::KeyR)
+            ),
+            Some(Accelerator::Reconnect)
+        );
+        let (addr, _seen) = fake_session(1);
+        let mut app = test_app(addr, Some(Endpoint::direct(addr).unwrap()));
+        app.modifiers = ctrl_alt;
+        let key = Key::Character(SmolStr::new("r"));
+        let code = PhysicalKey::Code(KeyCode::KeyR);
+        assert_eq!(app.accelerator(&key, code), None);
+        app.on_link_lost("connection closed".into());
+        assert_eq!(app.accelerator(&key, code), Some(Accelerator::Reconnect));
+        // The other four are the window's whatever the link is doing.
+        assert_eq!(
+            app.accelerator(
+                &Key::Named(NamedKey::Enter),
+                PhysicalKey::Code(KeyCode::Enter)
+            ),
+            Some(Accelerator::Fullscreen)
+        );
+    }
+
+    #[test]
+    fn two_devices_must_not_ping_pong_a_session() {
+        // The one classification that has to be right. The server replaces an
+        // attached client on purpose; retrying that turns two machines into a
+        // loop where each evicts the other for ever, which is worse than the
+        // bug the reconnection exists to fix.
+        assert_eq!(
+            classify("Another client connected to this session."),
+            Fate::Fatal
+        );
+        // Authentication and policy: the answer will be the same every time,
+        // and every attempt is another refusal in the server's log.
+        for code in [1u16, 2, 3, 4] {
+            let text = crate::connection::rejection_reason(code, "no");
+            assert_eq!(classify(&text), Fate::Fatal);
+            // And still, once a `Result` chain has wrapped it in context on
+            // the way up here, which is the form the reconnect worker's
+            // failures actually arrive in.
+            assert_eq!(classify(&format!("reconnecting: {text}")), Fate::Fatal);
+        }
+        assert_eq!(classify("protocol error: bad tile"), Fate::Fatal);
+        assert_eq!(classify("The desktop session has ended."), Fate::Fatal);
+        // And the ordinary ways a link dies, all of which recover.
+        for retryable in [
+            "connection closed",
+            "reader stopped",
+            "no response from the session for 30s",
+            "The server is shutting down.",
+            "Connection reset by peer (os error 54)",
+            "",
+        ] {
+            assert_eq!(classify(retryable), Fate::Retry, "{retryable}");
+        }
+    }
+
+    #[test]
+    fn the_backoff_grows_and_then_stops_growing() {
+        let mut last = Duration::ZERO;
+        for spent in 0..RETRY_BUDGET {
+            let d = retry_delay(spent);
+            assert!(d >= last, "attempt {spent} waits less than the one before");
+            assert!(d <= *RETRY_BACKOFF.last().unwrap());
+            last = d;
+        }
+        // Past the table it repeats rather than running off.
+        assert_eq!(retry_delay(u32::MAX), *RETRY_BACKOFF.last().unwrap());
+        // The whole budget is spent in a bounded, human amount of time.
+        let total: Duration = (0..RETRY_BUDGET).map(retry_delay).sum();
+        assert!(total <= Duration::from_secs(180), "{total:?}");
+    }
+
+    // ------------------------------------------------------ the notice
+
+    #[test]
+    fn the_text_metric_matches_the_font_that_paints_it() {
+        // `chars_fitting` is the bar's arithmetic written out a second time,
+        // so it is checked against pixels the font actually painted rather
+        // than against itself.
+        for s in 1..=3u32 {
+            for n in 1..=6u32 {
+                let (w, h) = (6 * s * n, 16 * s);
+                let mut buf = vec![0u32; (w * h) as usize];
+                let text = "M".repeat(n as usize);
+                draw_text_line(&mut buf, w, h, s, (0, 0), &text, 0x00FF_FFFF);
+                let right = (0..w)
+                    .rev()
+                    .find(|&x| (0..h).any(|y| buf[(y * w + x) as usize] != 0))
+                    .expect("the font drew nothing");
+                // The advance the metric assumes: six columns per glyph, with
+                // no gap after the last one.
+                assert!(right < 6 * s * n - s, "{n} glyphs at scale {s} ran over");
+                assert_eq!(chars_fitting(w, s), n as usize);
+                assert_eq!(chars_fitting(6 * s * n - s, s), n as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn a_shortened_reason_says_that_it_was_shortened() {
+        // A silently clipped reason is a different reason, and reads as if it
+        // were the whole of what happened.
+        let long = "no route to host after the network changed";
+        let cut = fit_text(long, 6 * 10, 1);
+        assert!(cut.ends_with(".."), "{cut}");
+        assert!(cut.chars().count() <= 10, "{cut}");
+        // What fits is left exactly alone.
+        assert_eq!(fit_text("short", 6 * 20, 1), "short");
+        // And a space too small for anything readable draws nothing rather
+        // than two dots on their own.
+        assert_eq!(fit_text(long, 6, 1), "");
+    }
+
+    #[test]
+    fn the_notice_stays_in_its_own_strip() {
+        // It is drawn over the last frame, and the bar owns the top edge: a
+        // notice that wandered would either cover the remote screen or fight
+        // the bar for the same pixels.
+        let (w, h) = (300u32, 200u32);
+        let mut buf = vec![0u32; (w * h) as usize];
+        let n = Notice {
+            headline: "Connection lost".into(),
+            detail: "connection closed".into(),
+            hint: "Ctrl+Alt+R",
+            colour: overlay::colour::WARN,
+        };
+        let panel = draw_notice(&mut buf, w, h, 2, &n);
+        assert_eq!(panel.bottom(), h, "the strip sits on the bottom edge");
+        assert!(panel.height <= h);
+        for y in 0..h {
+            for x in 0..w {
+                if buf[(y * w + x) as usize] != 0 {
+                    assert!(
+                        panel.contains(&Rect::new(x, y, 1, 1)),
+                        "({x},{y}) is outside {panel}"
+                    );
+                }
+            }
+        }
+        // A window shorter than the strip is covered rather than overrun.
+        let mut small = vec![0u32; (w * 10) as usize];
+        let panel = draw_notice(&mut small, w, 10, 2, &n);
+        assert_eq!(panel, Rect::new(0, 0, w, 10));
+    }
+
+    #[test]
+    fn dimming_leaves_the_last_frame_recognisable() {
+        // The point of keeping the frame at all: what is on screen is what the
+        // session still has, and it is the user's evidence that nothing was
+        // lost. Dimmed to nothing would say the opposite.
+        let mut buf = vec![0x00FF_FFFFu32; 4];
+        blend_rect(
+            &mut buf,
+            2,
+            2,
+            Rect::new(0, 0, 2, 2),
+            0x0000_0000,
+            DIM_ALPHA,
+        );
+        let v = buf[0] & 0xff;
+        assert!(v > 0x30 && v < 0xC0, "white went to {v:02x}");
+        assert!(buf.iter().all(|&p| p == buf[0]));
+        // Alpha zero is a no-op, and the whole thing clips to the buffer.
+        let mut buf = vec![0x0012_3456u32; 4];
+        blend_rect(&mut buf, 2, 2, Rect::new(0, 0, 2, 2), 0, 0);
+        blend_rect(&mut buf, 2, 2, Rect::new(5, 5, 9, 9), 0, 255);
+        assert!(buf.iter().all(|&p| p == 0x0012_3456));
     }
 
     #[test]

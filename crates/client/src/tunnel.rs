@@ -607,7 +607,7 @@ impl Tunnel {
             if let Some(status) = child.try_wait()? {
                 bail!("ssh exited before the tunnel came up ({status})");
             }
-            if let Some(stream) = connect_local(&local) {
+            if let Ok(stream) = connect_local(&local) {
                 // A successful connect means ssh has bound the forward, which
                 // it only does after authentication succeeded.
                 //
@@ -671,6 +671,25 @@ impl Tunnel {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// Open another connection to a tunnel that is already up.
+    ///
+    /// This is what a session reconnects through, and it deliberately makes a
+    /// *new* connection rather than reusing anything: the far end treats each
+    /// one as a client arriving, so this is exactly the "another client
+    /// connected" path the server already implements -- it replaces the
+    /// stale client on the running session and invalidates its encoder, and a
+    /// full frame comes back. Nothing about the desktop is disturbed.
+    ///
+    /// A dead `ssh` is reported rather than dialled into, because the socket
+    /// or the port outlives the process by a moment and connecting to it
+    /// would fail later and less clearly.
+    pub fn redial(&mut self) -> Result<LocalStream> {
+        if !self.is_alive() {
+            bail!("the ssh process for this tunnel has exited");
+        }
+        connect_local(&self.local).with_context(|| format!("connecting to {}", self.local))
+    }
+
     /// Stop the tunnel.
     pub fn close(&mut self) {
         let _ = self.child.kill();
@@ -683,6 +702,104 @@ impl Drop for Tunnel {
         // Before the fields drop, so ssh is gone by the time the socket
         // directory is removed and cannot recreate the socket behind us.
         self.close();
+    }
+}
+
+/// How a session reaches the server, and how it reaches it *again*.
+///
+/// A dropped link is only recoverable if something still knows the way back,
+/// and that is two different answers. A tunnel this process started can be
+/// dialled again while `ssh` lives and started afresh from the configuration
+/// it was built from when `ssh` does not; a loopback address someone else is
+/// forwarding (`--connect`) can only be dialled, because restarting whatever
+/// is behind it is not ours to do.
+///
+/// Both the first connection and every later one go through
+/// [`Endpoint::connect`], so the reconnect path cannot drift from the path
+/// that is exercised every time the client starts.
+#[derive(Debug)]
+pub enum Endpoint {
+    /// An SSH tunnel of our own. Boxed because it is an order of magnitude
+    /// larger than the other variant and every `Endpoint` would otherwise pay
+    /// for it.
+    Ssh(Box<SshEndpoint>),
+    /// A loopback address that is already forwarded.
+    Direct(SocketAddr),
+}
+
+/// The SSH half of an [`Endpoint`]: the tunnel, when there is one, and what
+/// it takes to start another.
+#[derive(Debug)]
+pub struct SshEndpoint {
+    tunnel: Option<Tunnel>,
+    cfg: TunnelConfig,
+    timeout: Duration,
+}
+
+impl Endpoint {
+    /// Reach the server through an SSH tunnel of our own. `timeout` bounds
+    /// the whole of one `ssh` start, prompts included.
+    pub fn ssh(cfg: TunnelConfig, timeout: Duration) -> Self {
+        Self::Ssh(Box::new(SshEndpoint {
+            tunnel: None,
+            cfg,
+            timeout,
+        }))
+    }
+
+    /// Reach an address that is already tunnelled.
+    ///
+    /// Loopback only, and refused here rather than at the call site: this is
+    /// the one place a connection is made, so it is the one place the
+    /// invariant cannot be walked around by a later caller.
+    pub fn direct(addr: SocketAddr) -> Result<Self> {
+        if !addr.ip().is_loopback() {
+            bail!("only loopback addresses can be connected to directly; use an SSH tunnel for remote hosts");
+        }
+        Ok(Self::Direct(addr))
+    }
+
+    /// A connection to the server, starting or restarting `ssh` if that is
+    /// what it takes.
+    pub fn connect(&mut self) -> Result<LocalStream> {
+        match self {
+            Self::Direct(addr) => TcpStream::connect_timeout(addr, Duration::from_secs(5))
+                .map(LocalStream::Tcp)
+                .with_context(|| format!("connecting to {addr}")),
+            Self::Ssh(e) => {
+                // An exited ssh is forgotten before anything is tried, so the
+                // next line is always "dial a tunnel that is up" or "start
+                // one", never "dial one that died while nobody was looking".
+                if e.tunnel.as_mut().is_some_and(|t| !t.is_alive()) {
+                    log::info!("the ssh tunnel has exited; starting another");
+                    e.tunnel = None;
+                }
+                if let Some(t) = e.tunnel.as_mut() {
+                    return t.redial();
+                }
+                let mut t = Tunnel::open(&e.cfg, e.timeout)?;
+                // The readiness check's own connection, handed on rather than
+                // dropped -- dropping it is a client connecting and leaving,
+                // which evicts whoever else is attached to the session.
+                let stream = t
+                    .take_stream()
+                    .context("the tunnel came up without a connection")?;
+                e.tunnel = Some(t);
+                Ok(stream)
+            }
+        }
+    }
+
+    /// Whether a further [`Endpoint::connect`] would reuse what is already
+    /// running, rather than starting `ssh` again.
+    ///
+    /// The distinction is worth showing a user: reusing a live tunnel is
+    /// instant and silent, and starting one may ask for a passphrase.
+    pub fn is_ready(&mut self) -> bool {
+        match self {
+            Self::Direct(_) => true,
+            Self::Ssh(e) => e.tunnel.as_mut().is_some_and(Tunnel::is_alive),
+        }
     }
 }
 
@@ -723,20 +840,24 @@ type SocketDirOpt = SocketDir;
 #[cfg(not(unix))]
 type SocketDirOpt = std::convert::Infallible;
 
-/// One attempt to reach the local end. `None` means "not up yet".
-fn connect_local(local: &LocalAddr) -> Option<LocalStream> {
+/// One attempt to reach the local end.
+///
+/// The error is returned rather than swallowed because this is used twice for
+/// two different reasons: the readiness loop polls through the failures while
+/// ssh authenticates, and a reconnection makes one attempt against a tunnel
+/// that is already up, where *why* it was refused is the whole of what the
+/// user has to go on.
+fn connect_local(local: &LocalAddr) -> std::io::Result<LocalStream> {
     match local {
         LocalAddr::Port(p) => {
             let addr: SocketAddr = ([127, 0, 0, 1], *p).into();
-            TcpStream::connect_timeout(&addr, Duration::from_millis(200))
-                .ok()
-                .map(LocalStream::Tcp)
+            TcpStream::connect_timeout(&addr, Duration::from_millis(200)).map(LocalStream::Tcp)
         }
         // No timeout is needed or available: connecting to a Unix socket that
         // is listening does not block, and one that is not there fails at
         // once with ENOENT, which is the state this polls through.
         #[cfg(unix)]
-        LocalAddr::Socket(path) => UnixStream::connect(path).ok().map(LocalStream::Unix),
+        LocalAddr::Socket(path) => UnixStream::connect(path).map(LocalStream::Unix),
     }
 }
 
@@ -1220,6 +1341,112 @@ mod tests {
         drop(tunnel);
         assert!(!path.exists(), "the socket outlived the tunnel");
         assert!(!parent.exists(), "the directory outlived the tunnel");
+    }
+
+    #[test]
+    fn a_direct_endpoint_is_loopback_only() {
+        // The invariant lives where connections are made, so no caller can
+        // reach a non-loopback address by taking a different route to it.
+        assert!(Endpoint::direct("127.0.0.1:3390".parse().unwrap()).is_ok());
+        assert!(Endpoint::direct("[::1]:3390".parse().unwrap()).is_ok());
+        let err = Endpoint::direct("10.0.0.5:3390".parse().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("loopback"), "{err}");
+    }
+
+    #[test]
+    fn a_direct_endpoint_connects_and_reconnects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = std::thread::spawn(move || {
+            let mut n = 0;
+            for s in listener.incoming().take(2) {
+                if s.is_err() {
+                    break;
+                }
+                n += 1;
+                // Held: dropping the accepted socket would race the client's
+                // own read of it, which is not what this is measuring.
+                std::mem::forget(s);
+            }
+            n
+        });
+        let mut e = Endpoint::direct(addr).unwrap();
+        assert!(e.connect().is_ok());
+        assert!(e.is_ready());
+        assert!(e.connect().is_ok(), "a second connection is a reconnection");
+        assert_eq!(accepted.join().unwrap(), 2);
+    }
+
+    /// Reconnecting must reuse a live tunnel rather than starting another.
+    ///
+    /// Starting one is not merely slower: it can prompt for a passphrase, and
+    /// two `ssh` processes forwarding the same local end is a race over who
+    /// owns the socket. The fake ssh records each invocation, so "was it
+    /// started twice" is a fact rather than an inference.
+    #[cfg(unix)]
+    #[test]
+    fn a_reconnection_reuses_a_live_tunnel() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let script = fake_ssh(
+            dir.path(),
+            &format!("echo run >> {}\nexec sleep 30", runs.display()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+                std::mem::forget(stream);
+            }
+        });
+
+        let cfg = TunnelConfig {
+            destination: "x".into(),
+            ssh_program: script.display().to_string(),
+            local_port: port,
+            ..Default::default()
+        };
+        let mut e = Endpoint::ssh(cfg, Duration::from_secs(10));
+        assert!(!e.is_ready(), "nothing is running before the first connect");
+        assert!(e.connect().is_ok());
+        assert!(e.is_ready());
+        assert!(e.connect().is_ok());
+        assert!(e.connect().is_ok());
+        // The test's own listener is what answers, so `connect` can return
+        // before the script has written its line; wait for the first one
+        // rather than racing it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ran = loop {
+            match std::fs::read_to_string(&runs) {
+                Ok(s) if !s.is_empty() => break s,
+                _ if Instant::now() > deadline => panic!("the fake ssh never ran"),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let ran = std::fs::read_to_string(&runs).unwrap_or(ran);
+        assert_eq!(ran.lines().count(), 1, "ssh was started again: {ran:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_endpoint_that_cannot_start_ssh_says_so() {
+        let cfg = TunnelConfig {
+            destination: "x".into(),
+            ssh_program: "false".into(),
+            ..Default::default()
+        };
+        let mut e = Endpoint::ssh(cfg, Duration::from_secs(5));
+        let err = e.connect().unwrap_err().to_string();
+        assert!(err.contains("exited"), "{err}");
+        // And it is still not ready, so a caller retrying knows it will be
+        // starting ssh again rather than dialling something that is up.
+        assert!(!e.is_ready());
     }
 
     /// The listen half of the `-L` argument in a recorded command line.
