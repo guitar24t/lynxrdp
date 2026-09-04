@@ -34,13 +34,23 @@
 //!
 //! Scrolling a terminal or editor moves a large region without changing
 //! its pixels. Re-encoding it would be wasteful, so before diffing, the
-//! encoder looks for a vertical translation between the previous and
-//! current frame ([`detect_scroll`]) and emits a [`CopyRect`] instead: a
-//! dozen bytes that tell the client to move pixels it already has. The
-//! candidate shift is found with row hashes and then **verified pixel by
-//! pixel**, so a hash collision can never corrupt the screen.
+//! encoder looks for a vertical translation ([`detect_scroll_runs`]) and
+//! emits [`CopyRect`]s instead: a dozen bytes that tell the client to move
+//! pixels it already has. The candidate shift is found with row hashes and
+//! then **verified pixel by pixel**, so a hash collision can never corrupt
+//! the screen.
+//!
+//! Detection runs per damage region, and a region can yield several copies:
+//! one shift, but every run of rows it explains, because a highlighted line
+//! or a cursor row splits an otherwise clean scroll in two. All of a frame's
+//! copies are applied in one batch on both sides — [`apply_copies`] reads
+//! every source before it writes any destination, so a batch and the same
+//! copies applied one at a time are different pictures.
 
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
+use std::sync::OnceLock;
 
 use crate::image::{Framebuffer, Rect};
 use crate::wire::DecodeError;
@@ -65,6 +75,22 @@ pub const MIN_SCROLL_ROWS: u32 = 16;
 /// Small edits such as typing never benefit from it, and this keeps the
 /// row-hashing cost off the common path.
 pub const SCROLL_MIN_AREA: u64 = 128 * 128;
+
+/// Ceiling on the pixels one frame may move or repaint, as a multiple of the
+/// framebuffer area.
+///
+/// A [`CopyRect`] costs twelve bytes on the wire and may name the whole
+/// screen, and [`apply_copies`] reads every source before it writes any
+/// destination — so the wire limit of 4096 copies in one update would have
+/// the client snapshot tens of gigabytes for a 50 KiB message. An honest
+/// frame stays under 1x: the tile pass touches each pixel at most once, and
+/// the copies found in one damage region cover disjoint rows of it.
+pub const MAX_FRAME_PIXEL_FACTOR: u64 = 4;
+
+/// Pixels [`apply_copies`] or [`Decoder::apply`] will handle for one frame.
+fn frame_pixel_budget(fb: &Framebuffer) -> u64 {
+    fb.bounds().area().saturating_mul(MAX_FRAME_PIXEL_FACTOR)
+}
 
 /// How the pixel data of a [`TileUpdate`] is encoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +196,8 @@ pub enum CodecError {
     Corrupt(&'static str),
     /// Tile rectangle lies outside the framebuffer.
     OutOfBounds(Rect),
+    /// The update asks for more work than [`MAX_FRAME_PIXEL_FACTOR`] allows.
+    Excessive(&'static str),
 }
 
 impl std::fmt::Display for CodecError {
@@ -177,6 +205,7 @@ impl std::fmt::Display for CodecError {
         match self {
             CodecError::Corrupt(what) => write!(f, "corrupt tile data: {what}"),
             CodecError::OutOfBounds(r) => write!(f, "tile {r} outside framebuffer"),
+            CodecError::Excessive(what) => write!(f, "update exceeds the {what} budget"),
         }
     }
 }
@@ -242,25 +271,67 @@ fn unpack_indices(data: &[u8], count: usize, bpi: u8) -> Result<Vec<u16>, CodecE
     Ok(out)
 }
 
+/// Per-process seed for the palette lookup table.
+///
+/// Dropping SipHash for a multiply-shift probe would otherwise hand anyone
+/// who can paint the screen a hash-flooding primitive: a tile of colours
+/// chosen to land in one bucket turns the palette build quadratic. The seed
+/// comes from `RandomState`, so the buckets are unpredictable; it is taken
+/// once because the cost belongs to neither the frame nor the tile.
+fn palette_hash_seed() -> u64 {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    // Odd, so the multiply is invertible and no colour is mapped away.
+    *SEED.get_or_init(|| RandomState::new().hash_one(0u64) | 1)
+}
+
 /// Build the palette payload for `pixels`, or `None` if the tile has more
 /// than [`MAX_PALETTE`] distinct colours.
 ///
 /// Layout: `u16` colour count, then that many `R G B` triples, then one
 /// index per pixel packed at 1, 2, 4 or 8 bits.
 pub fn encode_palette(pixels: &[u32]) -> Option<Vec<u8>> {
-    let mut lookup: HashMap<u32, u16> = HashMap::new();
+    // Colour to index, as a function-local open-addressed table rather than a
+    // `HashMap`: this is one lookup per *pixel*, and a fresh SipHash map per
+    // tile was about three quarters of encode time. 1024 slots for at most
+    // 256 colours holds the load factor at a quarter, so probes stay short
+    // and the table never fills (the bail below caps it at 256 entries).
+    const SLOTS: usize = 1024;
+    const SHIFT: u32 = 64 - SLOTS.trailing_zeros();
+    // Every key is masked to 24 bits below, which is the only reason an
+    // all-ones word is safe to mean "empty": it can never be a colour.
+    const EMPTY: u32 = u32::MAX;
+    let mut keys = [EMPTY; SLOTS];
+    let mut vals = [0u16; SLOTS];
+    let seed = palette_hash_seed();
+
     let mut colors: Vec<u32> = Vec::new();
     let mut indices: Vec<u16> = Vec::with_capacity(pixels.len());
     for &p in pixels {
         let c = p & 0x00FF_FFFF;
-        let next = colors.len() as u16;
-        let idx = *lookup.entry(c).or_insert_with(|| {
-            colors.push(c);
-            next
-        });
-        if colors.len() > MAX_PALETTE {
-            return None;
-        }
+        // Multiply-shift: the high bits of the product are the well mixed
+        // ones, so shifting them down is the bucket.
+        let mut slot = (u64::from(c).wrapping_mul(seed) >> SHIFT) as usize;
+        let idx = loop {
+            let k = keys[slot];
+            if k == c {
+                break vals[slot];
+            }
+            if k == EMPTY {
+                // Bail *before* handing out index 256. `pack_indices` casts
+                // the index to `u8`, so a 257th colour would become index 0
+                // and produce a tile that decodes cleanly and wrong; a tile
+                // of exactly 256 colours must still encode.
+                if colors.len() == MAX_PALETTE {
+                    return None;
+                }
+                let idx = colors.len() as u16;
+                keys[slot] = c;
+                vals[slot] = idx;
+                colors.push(c);
+                break idx;
+            }
+            slot = (slot + 1) & (SLOTS - 1);
+        };
         indices.push(idx);
     }
     let bpi = bits_for(colors.len());
@@ -327,10 +398,13 @@ pub fn encode_pixels(rect: Rect, pixels: &[u32]) -> TileUpdate {
     }
 
     // Choose the cheaper representation before spending any time compressing.
-    let rgb = pack_rgb(pixels);
+    // Packed RGB is exactly three bytes per pixel, so the palette can be
+    // judged against that number rather than against a buffer built only to
+    // be measured and, on text, thrown away.
+    let rgb_len = pixels.len() * 3;
     let (base, palette) = match encode_palette(pixels) {
-        Some(p) if p.len() < rgb.len() => (p, true),
-        _ => (rgb, false),
+        Some(p) if p.len() < rgb_len => (p, true),
+        _ => (pack_rgb(pixels), false),
     };
 
     let base_len = base.len();
@@ -404,11 +478,18 @@ pub fn decode_pixels(tile: &TileUpdate) -> Result<Vec<u32>, CodecError> {
     let payload = match tile.encoding {
         TileEncoding::Raw | TileEncoding::Palette => std::borrow::Cow::Borrowed(&tile.data[..]),
         TileEncoding::Lz4 | TileEncoding::PaletteLz4 => {
-            let raw = lz4_flex::block::decompress_size_prepended(&tile.data)
-                .map_err(|_| CodecError::Corrupt("lz4 decompression failed"))?;
-            if raw.len() > cap {
+            // `decompress_size_prepended` trusts the four-byte size prefix and
+            // allocates it up front, so an eight-byte tile can ask for 4 GiB
+            // and be refused only after the allocation. Read the declaration
+            // and check it first; `decompress` then writes into a buffer we
+            // have already agreed to.
+            let (declared, body) = lz4_flex::block::uncompressed_size(&tile.data)
+                .map_err(|_| CodecError::Corrupt("lz4 size prefix missing"))?;
+            if declared > cap {
                 return Err(CodecError::Corrupt("lz4 payload too large"));
             }
+            let raw = lz4_flex::block::decompress(body, declared)
+                .map_err(|_| CodecError::Corrupt("lz4 decompression failed"))?;
             std::borrow::Cow::Owned(raw)
         }
         TileEncoding::Zstd | TileEncoding::PaletteZstd => {
@@ -445,12 +526,24 @@ pub fn apply_tile(fb: &mut Framebuffer, tile: &TileUpdate) -> Result<(), CodecEr
 /// overlapping copies (the usual case when scrolling) behave as if they
 /// all read the frame as it was before this call. Returns the union of the
 /// destination rectangles.
+///
+/// The whole batch is validated before anything is written, so an error
+/// leaves `fb` exactly as it was; that is what lets the encoder drop a
+/// rejected batch and fall back to tiles. Copying more than
+/// [`MAX_FRAME_PIXEL_FACTOR`] framebuffers' worth of pixels is refused
+/// before the sources are snapshotted rather than after.
 pub fn apply_copies(fb: &mut Framebuffer, copies: &[CopyRect]) -> Result<Rect, CodecError> {
     let bounds = fb.bounds();
+    let budget = frame_pixel_budget(fb);
+    let mut spent = 0u64;
     let mut sources = Vec::with_capacity(copies.len());
     for c in copies {
         if c.dest.is_empty() || !bounds.contains(&c.dest) || !bounds.contains(&c.src()) {
             return Err(CodecError::OutOfBounds(c.dest));
+        }
+        spent += c.dest.area();
+        if spent > budget {
+            return Err(CodecError::Excessive("copy"));
         }
         sources.push(fb.extract(&c.src()));
     }
@@ -463,60 +556,102 @@ pub fn apply_copies(fb: &mut Framebuffer, copies: &[CopyRect]) -> Result<Rect, C
 }
 
 /// FNV-1a over one row of pixels, used to find candidate scroll offsets.
+///
+/// Four lanes over four-pixel groups, folded at the end: FNV is a serial
+/// multiply chain and four of them retire in roughly the latency of one.
+///
+/// The four seeds must differ. Sharing one seed drives every lane of a
+/// flat-coloured row to the same value, and folding equal lanes with
+/// rotations then cancels most of the bits — that shape produced 14,854
+/// distinct hashes for 16,828 distinct flat colours. It cannot corrupt the
+/// screen, because a run is confirmed pixel by pixel before it is sent, but
+/// it silently loses copies on flat content, which is most of a desktop.
 fn row_hash(row: &[u32]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &p in row {
-        h ^= u64::from(p & 0x00FF_FFFF);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    // Lane 0 is the FNV-1a offset basis; the rest are arbitrary odd constants
+    // (the golden ratio and two murmur3 finalisers) picked only to differ.
+    let mut h: [u64; 4] = [
+        0xcbf2_9ce4_8422_2325,
+        0x9e37_79b9_7f4a_7c15,
+        0xff51_afd7_ed55_8ccd,
+        0xc4ce_b9fe_1a85_ec53,
+    ];
+    let mut groups = row.chunks_exact(4);
+    for g in &mut groups {
+        for (lane, &p) in h.iter_mut().zip(g) {
+            *lane = (*lane ^ u64::from(p & 0x00FF_FFFF)).wrapping_mul(PRIME);
+        }
     }
-    h
+    for (lane, &p) in h.iter_mut().zip(groups.remainder()) {
+        *lane = (*lane ^ u64::from(p & 0x00FF_FFFF)).wrapping_mul(PRIME);
+    }
+    h[0] ^ h[1].rotate_left(16) ^ h[2].rotate_left(32) ^ h[3].rotate_left(48)
 }
 
-/// Longest run of rows consistent with shift `dy`, judged by row hashes.
-/// Indices are relative to the region; the source row must also lie inside
-/// it, which keeps the resulting copy in bounds by construction.
-fn longest_hash_run(prev_h: &[u64], cur_h: &[u64], dy: i64) -> Option<(usize, usize)> {
+/// Every run of at least `min_rows` rows consistent with shift `dy`, judged
+/// by row hashes. Indices are relative to the region; the source row must
+/// also lie inside it, which keeps the resulting copy in bounds by
+/// construction.
+///
+/// All the runs, not just the longest: a highlighted current line, a
+/// blinking cursor row or a scrollbar thumb splits an otherwise clean
+/// scroll, and keeping one half re-encodes the other half as tiles.
+fn hash_runs(prev_h: &[u64], cur_h: &[u64], dy: i64, min_rows: usize) -> Vec<(usize, usize)> {
     let rows = cur_h.len();
-    let mut best: Option<(usize, usize)> = None;
+    let mut runs = Vec::new();
     let mut start: Option<usize> = None;
-    let close = |start: &mut Option<usize>, end: usize, best: &mut Option<(usize, usize)>| {
-        if let Some(s) = start.take() {
-            if best.map(|(a, b)| b - a).unwrap_or(0) < end - s {
-                *best = Some((s, end));
-            }
-        }
-    };
     for (i, &h) in cur_h.iter().enumerate() {
         let p = i as i64 - dy;
         let matches = p >= 0 && (p as usize) < rows && prev_h[p as usize] == h;
         if matches {
             start.get_or_insert(i);
-        } else {
-            close(&mut start, i, &mut best);
+        } else if let Some(s) = start.take() {
+            if i - s >= min_rows {
+                runs.push((s, i));
+            }
         }
     }
-    close(&mut start, rows, &mut best);
-    best
+    if let Some(s) = start {
+        if rows - s >= min_rows {
+            runs.push((s, rows));
+        }
+    }
+    runs
 }
 
 /// Look for a vertical translation of `region` between `prev` and `cur`.
 ///
 /// Row hashes propose candidate shifts and rank them, then the best
-/// candidate is confirmed by comparing the actual pixels, so the returned
-/// copy is always exact — a hash collision can shorten a copy but can never
-/// corrupt the screen. Only runs of at least `min_rows` rows are reported.
-pub fn detect_scroll(
+/// candidate is confirmed by comparing the actual pixels, so every returned
+/// copy is exact — a hash collision can shorten a copy but can never corrupt
+/// the screen. Only runs of at least `min_rows` rows are reported.
+///
+/// All the copies share one shift and cover disjoint rows, so they describe
+/// one partial translation of the region and must be applied as one batch;
+/// see [`apply_copies`].
+pub fn detect_scroll_runs(
     prev: &Framebuffer,
     cur: &Framebuffer,
     region: &Rect,
     min_rows: u32,
-) -> Option<CopyRect> {
+) -> Vec<CopyRect> {
     if prev.width() != cur.width() || prev.height() != cur.height() {
-        return None;
+        return Vec::new();
     }
     let r = region.intersect(&cur.bounds());
     if r.width == 0 || r.height < min_rows.saturating_mul(2) {
-        return None;
+        return Vec::new();
+    }
+
+    // Hashing both frames is unconditional work on every frame that gets
+    // this far, and most of them are not scrolls: about 4.4 ms for a 1080p
+    // region. Pixel-equal rows hash equal, so a region whose rows all match
+    // cannot yield a non-zero shift, and answering that case with a memcmp
+    // per row costs 0.17 ms instead — and `all` stops at the first changed
+    // row, so a region that did move barely pays for the question. The
+    // clamped rect, not the caller's: `region` may run past the buffer.
+    if (r.y..r.bottom()).all(|y| cur.row(y, r.x, r.width) == prev.row(y, r.x, r.width)) {
+        return Vec::new();
     }
 
     let rows = r.height as usize;
@@ -557,40 +692,64 @@ pub fn detect_scroll(
         }
     }
     if tally.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    // Rank the most-voted shifts by the length of the row run they explain.
+    // Rank the most-voted shifts by every row they explain, not by their
+    // longest single run: a scroll interrupted by one repainted line would
+    // otherwise lose to a shift that happens to explain one long stretch.
+    // Ties go to the better-voted shift, which sorts first here.
     const MAX_SHIFTS_CONSIDERED: usize = 8;
     let mut shifts: Vec<(i64, u32)> = tally.into_iter().collect();
     shifts.sort_unstable_by_key(|&(dy, votes)| (std::cmp::Reverse(votes), dy.abs()));
-    let (dy, span) = shifts
+    let min = min_rows as usize;
+    let best = shifts
         .into_iter()
         .take(MAX_SHIFTS_CONSIDERED)
-        .filter_map(|(dy, _)| longest_hash_run(&prev_h, &cur_h, dy).map(|run| (dy, run)))
-        .max_by_key(|(_, (a, b))| b - a)?;
-    if (span.1 - span.0) < min_rows as usize {
-        return None;
-    }
+        .enumerate()
+        .map(|(rank, (dy, _))| (dy, hash_runs(&prev_h, &cur_h, dy, min), rank))
+        .max_by_key(|(_, runs, rank)| {
+            let covered: usize = runs.iter().map(|(a, b)| b - a).sum();
+            (covered, std::cmp::Reverse(*rank))
+        });
+    let Some((dy, runs, _)) = best else {
+        return Vec::new();
+    };
 
-    // Confirm the run pixel by pixel, shrinking it to the verified prefix.
-    let y0 = r.y + span.0 as u32;
-    let mut end = y0;
-    for y in y0..r.y + span.1 as u32 {
-        let sy = (i64::from(y) - dy) as u32;
-        if cur.row(y, r.x, r.width) != prev.row(sy, r.x, r.width) {
-            break;
+    // Confirm each run pixel by pixel, shrinking it to the verified prefix.
+    let mut copies = Vec::with_capacity(runs.len());
+    for (a, b) in runs {
+        let y0 = r.y + a as u32;
+        let mut end = y0;
+        for y in y0..r.y + b as u32 {
+            let sy = (i64::from(y) - dy) as u32;
+            if cur.row(y, r.x, r.width) != prev.row(sy, r.x, r.width) {
+                break;
+            }
+            end = y + 1;
         }
-        end = y + 1;
+        if end - y0 >= min_rows {
+            copies.push(CopyRect {
+                src_x: r.x,
+                src_y: (i64::from(y0) - dy) as u32,
+                dest: Rect::new(r.x, y0, r.width, end - y0),
+            });
+        }
     }
-    if end - y0 < min_rows {
-        return None;
-    }
-    Some(CopyRect {
-        src_x: r.x,
-        src_y: (i64::from(y0) - dy) as u32,
-        dest: Rect::new(r.x, y0, r.width, end - y0),
-    })
+    copies
+}
+
+/// The largest single run [`detect_scroll_runs`] finds, for callers that
+/// want the dominant motion of a region rather than all of it.
+pub fn detect_scroll(
+    prev: &Framebuffer,
+    cur: &Framebuffer,
+    region: &Rect,
+    min_rows: u32,
+) -> Option<CopyRect> {
+    detect_scroll_runs(prev, cur, region, min_rows)
+        .into_iter()
+        .max_by_key(|c| c.dest.height)
 }
 
 /// Find the bounding box of pixels that differ between `a` and `b` within `rect`.
@@ -734,18 +893,40 @@ impl Encoder {
     ) -> FrameUpdate {
         let mut copies = Vec::new();
         if allow_copy {
-            let bbox = regions
-                .iter()
-                .fold(Rect::default(), |acc, r| acc.union(r))
-                .intersect(&self.prev.bounds());
-            if bbox.area() >= SCROLL_MIN_AREA {
-                if let Some(copy) = detect_scroll(&self.prev, current, &bbox, MIN_SCROLL_ROWS) {
-                    // Keep the reference in step so the tile pass only sees
-                    // what the copy did not already account for.
-                    if apply_copies(&mut self.prev, &[copy]).is_ok() {
-                        copies.push(copy);
-                    }
+            let bounds = self.prev.bounds();
+            for region in regions {
+                // Per region, never the union of them: a scrolling pane and
+                // a small unrelated change to one side fold into a box whose
+                // every row also spans pixels that changed for other reasons,
+                // and then no shift explains a single row. Folding does not
+                // weaken detection, it ends it.
+                let region = region.intersect(&bounds);
+                if region.area() < SCROLL_MIN_AREA {
+                    continue;
                 }
+                // Rows that did not change are equally consistent with "no
+                // scroll" and hashing them is the expensive part, so narrow
+                // to what actually differs first — a memcmp per row.
+                let Some(changed) = changed_bbox(current, &self.prev, &region) else {
+                    continue;
+                };
+                copies.extend(detect_scroll_runs(
+                    &self.prev,
+                    current,
+                    &changed,
+                    MIN_SCROLL_ROWS,
+                ));
+            }
+            // One batch, never one copy at a time. The client reads every
+            // source before it writes any destination, so applying these
+            // singly here would leave the reference holding a different
+            // picture from the client's framebuffer wherever two copies
+            // overlap — a desynchronisation that is silent, permanent and
+            // invisible to the tile pass. On error nothing was written, so
+            // dropping the copies leaves the reference untouched and the
+            // tiles resend those pixels.
+            if !copies.is_empty() && apply_copies(&mut self.prev, &copies).is_err() {
+                copies.clear();
             }
         }
         let tiles = self.encode_regions(current, regions);
@@ -773,9 +954,20 @@ impl Decoder {
     }
 
     /// Apply all tiles; returns the union rectangle that changed.
+    ///
+    /// Painting more than [`MAX_FRAME_PIXEL_FACTOR`] framebuffers' worth of
+    /// pixels is refused: a tile names its rectangle in sixteen bytes and
+    /// carries three for a solid colour, so the wire limit of 65,536 tiles
+    /// per update is otherwise 65,536 full-screen decodes.
     pub fn apply(&mut self, tiles: &[TileUpdate]) -> Result<Rect, CodecError> {
+        let budget = frame_pixel_budget(&self.fb);
+        let mut spent = 0u64;
         let mut dirty = Rect::default();
         for t in tiles {
+            spent += t.rect.area();
+            if spent > budget {
+                return Err(CodecError::Excessive("tile"));
+            }
             apply_tile(&mut self.fb, t)?;
             dirty = dirty.union(&t.rect);
         }
@@ -836,6 +1028,59 @@ mod tests {
             }
         }
         fb
+    }
+
+    /// `base` with `region` moved up by `dy` rows, the strip that vacates
+    /// filled with `fill`.
+    fn scroll_up(base: &Framebuffer, region: &Rect, dy: u32, fill: u32) -> Framebuffer {
+        let mut out = base.clone();
+        for y in region.y..region.bottom() - dy {
+            let row = base.row(y + dy, region.x, region.width).to_vec();
+            out.row_mut(y, region.x, region.width).copy_from_slice(&row);
+        }
+        out.fill(
+            &Rect::new(region.x, region.bottom() - dy, region.width, dy),
+            fill,
+        );
+        out
+    }
+
+    /// Give every row of `rect` a colour of its own, so no row can match a
+    /// shifted copy of another by accident and a test may assert exactly
+    /// which runs a scroll should produce.
+    fn number_rows(fb: &mut Framebuffer, rect: &Rect) {
+        for y in rect.y..rect.bottom() {
+            fb.fill(&Rect::new(rect.x, y, rect.width, 1), 0x20_3040 + y * 0x37);
+        }
+    }
+
+    /// The obvious palette build, kept as the definition of the output the
+    /// open-addressed one has to reproduce byte for byte.
+    fn naive_palette(pixels: &[u32]) -> Option<Vec<u8>> {
+        let mut lookup: HashMap<u32, u16> = HashMap::new();
+        let mut colors: Vec<u32> = Vec::new();
+        let mut indices: Vec<u16> = Vec::with_capacity(pixels.len());
+        for &p in pixels {
+            let c = p & 0x00FF_FFFF;
+            let next = colors.len() as u16;
+            let idx = *lookup.entry(c).or_insert_with(|| {
+                colors.push(c);
+                next
+            });
+            if colors.len() > MAX_PALETTE {
+                return None;
+            }
+            indices.push(idx);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&(colors.len() as u16).to_le_bytes());
+        for c in &colors {
+            out.push((c >> 16) as u8);
+            out.push((c >> 8) as u8);
+            out.push(*c as u8);
+        }
+        out.extend_from_slice(&pack_indices(&indices, bits_for(colors.len())));
+        Some(out)
     }
 
     #[test]
@@ -1239,6 +1484,235 @@ mod tests {
         );
     }
 
+    #[test]
+    fn flat_rows_of_different_colours_hash_apart() {
+        // Four lanes seeded alike make every lane of a flat row equal, and
+        // the rotate-and-xor fold then cancels most of the bits: that shape
+        // gave 14,854 distinct hashes for 16,828 distinct flat colours, which
+        // quietly loses copies on the flat content a desktop is mostly made
+        // of. Distinct seeds keep flat rows distinct.
+        let mut seen = std::collections::HashSet::new();
+        for c in 0..16_384u32 {
+            seen.insert(row_hash(&[c; 12]));
+        }
+        assert_eq!(seen.len(), 16_384);
+    }
+
+    #[test]
+    fn a_scroll_is_found_beside_unrelated_damage() {
+        // Two damage rectangles: a pane that scrolls, and a small unrelated
+        // change to its right. Their union is a box whose every row also
+        // spans the static pane, so no shift explains any row of it — folding
+        // the regions together does not weaken detection, it ends it.
+        let mut before = texty(512, 512, 0);
+        number_rows(&mut before, &Rect::new(256, 0, 256, 512));
+        let pane = Rect::new(0, 0, 256, 512);
+        let mut after = scroll_up(&before, &pane, 32, 0xFFFFFF);
+        let elsewhere = Rect::new(400, 464, 32, 32);
+        after.fill(&elsewhere, 0x336699);
+
+        assert!(
+            detect_scroll(&before, &after, &pane.union(&elsewhere), MIN_SCROLL_ROWS).is_none(),
+            "the folded bounding box is what per-region detection replaced"
+        );
+
+        let mut enc = Encoder::new(512, 512);
+        let mut dec = Decoder::new(512, 512);
+        let f1 = enc.encode_frame(&before, &[before.bounds()], false);
+        dec.apply_frame(&f1.copies, &f1.tiles).unwrap();
+
+        let f2 = enc.encode_frame(&after, &[pane, elsewhere], true);
+        assert_eq!(f2.copies.len(), 1, "copies: {:?}", f2.copies);
+        assert!(pane.contains(&f2.copies[0].dest));
+        assert!(
+            f2.copies[0].dest.height >= 400,
+            "only {} rows moved",
+            f2.copies[0].dest.height
+        );
+        dec.apply_frame(&f2.copies, &f2.tiles).unwrap();
+        assert_eq!(dec.framebuffer(), &after);
+        assert_eq!(enc.reference(), &after);
+    }
+
+    #[test]
+    fn a_scroll_split_by_a_repainted_line_keeps_both_runs() {
+        // A highlighted current line, a blinking cursor row or a scrollbar
+        // thumb interrupts the translation. Keeping only the longer side
+        // re-encodes the other side as ordinary tiles.
+        let mut before = texty(320, 384, 0);
+        number_rows(&mut before, &Rect::new(0, 0, 4, 384));
+        let mut after = scroll_up(&before, &before.bounds(), 32, 0xFFFFFF);
+        after.fill(&Rect::new(0, 180, 320, 12), 0x2255AA);
+
+        let runs = detect_scroll_runs(&before, &after, &before.bounds(), MIN_SCROLL_ROWS);
+        assert_eq!(runs.len(), 2, "runs: {runs:?}");
+        assert!(runs.iter().all(|c| c.src_y == c.dest.y + 32));
+        assert_eq!((runs[0].dest.y, runs[0].dest.height), (0, 180));
+        assert_eq!((runs[1].dest.y, runs[1].dest.height), (192, 160));
+        // What the one-run form still reports: the longer of the two.
+        let one = detect_scroll(&before, &after, &before.bounds(), MIN_SCROLL_ROWS).unwrap();
+        assert_eq!(one.dest.height, 180);
+
+        // End to end, through a single full-screen damage rectangle: the
+        // interruption must not cost the frame either half of the scroll.
+        let mut enc = Encoder::new(320, 384);
+        let mut dec = Decoder::new(320, 384);
+        let f1 = enc.encode_frame(&before, &[before.bounds()], false);
+        dec.apply_frame(&f1.copies, &f1.tiles).unwrap();
+        let f2 = enc.encode_frame(&after, &[after.bounds()], true);
+        assert_eq!(f2.copies.len(), 2, "copies: {:?}", f2.copies);
+        dec.apply_frame(&f2.copies, &f2.tiles).unwrap();
+        assert_eq!(dec.framebuffer(), &after);
+        assert_eq!(enc.reference(), &after);
+    }
+
+    #[test]
+    fn copies_from_overlapping_regions_are_applied_as_one_batch() {
+        // Damage coalescing is allowed to emit overlapping rectangles (see
+        // `coalesce_within` on the server), so one motion routinely arrives
+        // as two regions that both explain it. Applying each region's copies
+        // as they are found would make the second region's detection compare
+        // against a reference the client has not been told about yet: the
+        // encoder ends up right, the client ends up wrong, and the tile pass
+        // never notices because it only resends what the *reference* still
+        // disagrees with. Rows of a repeating background make the wrong
+        // answer reachable, because more than one shift explains them.
+        let mut before = Framebuffer::new(128, 256);
+        for y in 0..256u32 {
+            let grey = [0x101010, 0x808080, 0xFFFFFF][y as usize % 3];
+            before.fill(&Rect::new(0, y, 128, 1), grey);
+        }
+        // The whole screen slides down sixteen rows; the strip it vacates is
+        // repainted, which is the only part a tile has to carry.
+        let mut after = before.clone();
+        for y in 16..256u32 {
+            let row = before.row(y - 16, 0, 128).to_vec();
+            after.row_mut(y, 0, 128).copy_from_slice(&row);
+        }
+        after.fill(&Rect::new(0, 0, 128, 16), 0x2255AA);
+
+        let mut enc = Encoder::new(128, 256);
+        let mut dec = Decoder::new(128, 256);
+        let f1 = enc.encode_frame(&before, &[before.bounds()], false);
+        dec.apply_frame(&f1.copies, &f1.tiles).unwrap();
+
+        let f2 = enc.encode_frame(&after, &[Rect::new(0, 0, 128, 160), after.bounds()], true);
+        assert!(f2.copies.len() >= 2, "copies: {:?}", f2.copies);
+        dec.apply_frame(&f2.copies, &f2.tiles).unwrap();
+        // The encoder alone proves nothing here: its reference is correct
+        // either way, because whatever the copies leave wrong the tile pass
+        // repairs. Only the client's screen tells the two apart.
+        assert_eq!(enc.reference(), &after, "encoder reference");
+        assert_eq!(dec.framebuffer(), &after, "client screen");
+    }
+
+    #[test]
+    fn palette_takes_256_colours_and_declines_257() {
+        // 256 is the largest palette there is, and an existing tile relies on
+        // that boundary being inclusive.
+        let pixels: Vec<u32> = (0..256u32).collect();
+        let payload = encode_palette(&pixels).expect("256 colours fit");
+        assert_eq!(&payload[..2], &256u16.to_le_bytes());
+        assert_eq!(decode_palette(&payload, pixels.len()).unwrap(), pixels);
+
+        // One more must be refused outright. Handing out index 256 instead
+        // would truncate to 0 in `pack_indices` and yield a tile that decodes
+        // cleanly and wrong, which no later check would catch.
+        let mut too_many = pixels.clone();
+        too_many.push(256);
+        assert!(encode_palette(&too_many).is_none());
+        let t = encode_pixels(Rect::new(0, 0, 257, 1), &too_many);
+        assert!(!t.encoding.is_palette());
+        assert_eq!(decode_pixels(&t).unwrap(), too_many);
+    }
+
+    #[test]
+    fn palette_bytes_match_a_first_appearance_build() {
+        let cases: Vec<Vec<u32>> = vec![
+            vec![0xFFFFFF; 64],
+            (0..1024).map(|i| ((i % 3) * 0x4080C0) & 0xFFFFFF).collect(),
+            (0..1024u32)
+                .map(|i| i.wrapping_mul(2_654_435_761) & 0xFF)
+                .collect(),
+            (0..256).rev().collect(),
+            (0..4096).map(|i| (i * 7919) & 0xFFFFFF).collect(),
+            texty(64, 64, 3).extract(&Rect::new(0, 0, 64, 64)),
+        ];
+        for px in cases {
+            assert_eq!(
+                encode_palette(&px),
+                naive_palette(&px),
+                "{} pixels",
+                px.len()
+            );
+        }
+    }
+
+    #[test]
+    fn lz4_size_prefix_is_checked_before_it_is_allocated() {
+        // The prefix is attacker-controlled and `decompress_size_prepended`
+        // allocates it before anything is validated, so eight bytes of tile
+        // can ask for four gibibytes.
+        let mut data = 4_000_000_000u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&[0x10, 0xAA, 0xBB, 0xCC]);
+        let t = TileUpdate {
+            rect: Rect::new(0, 0, 4, 4),
+            encoding: TileEncoding::Lz4,
+            data,
+        };
+        assert_eq!(
+            decode_pixels(&t),
+            Err(CodecError::Corrupt("lz4 payload too large"))
+        );
+        // A prefix too short to read at all is not a panic either.
+        let t = TileUpdate {
+            rect: Rect::new(0, 0, 4, 4),
+            encoding: TileEncoding::Lz4,
+            data: vec![1, 2],
+        };
+        assert!(decode_pixels(&t).is_err());
+        // An honest tile of the same shape still decodes.
+        let px = vec![0x00FF_00FFu32; 16];
+        let t = TileUpdate {
+            rect: Rect::new(0, 0, 4, 4),
+            encoding: TileEncoding::Lz4,
+            data: lz4_flex::block::compress_prepend_size(&pack_rgb(&px)),
+        };
+        assert_eq!(decode_pixels(&t).unwrap(), px);
+    }
+
+    #[test]
+    fn a_frame_may_not_copy_the_screen_over_and_over() {
+        // 4096 copies fit in one 48 KiB update, and each is snapshotted
+        // before any is written; unbounded, that is tens of gigabytes.
+        let mut fb = Framebuffer::new(64, 64);
+        let full = CopyRect {
+            src_x: 0,
+            src_y: 0,
+            dest: fb.bounds(),
+        };
+        let flood = vec![full; MAX_FRAME_PIXEL_FACTOR as usize + 1];
+        assert!(matches!(
+            apply_copies(&mut fb, &flood),
+            Err(CodecError::Excessive(_))
+        ));
+        // The honest shape is nowhere near the ceiling.
+        assert!(apply_copies(&mut fb, &[full]).is_ok());
+    }
+
+    #[test]
+    fn a_frame_may_not_repaint_the_screen_over_and_over() {
+        let mut dec = Decoder::new(64, 64);
+        let solid = TileUpdate {
+            rect: dec.framebuffer().bounds(),
+            encoding: TileEncoding::Solid,
+            data: vec![1, 2, 3],
+        };
+        let flood = vec![solid.clone(); MAX_FRAME_PIXEL_FACTOR as usize + 1];
+        assert!(matches!(dec.apply(&flood), Err(CodecError::Excessive(_))));
+        assert!(dec.apply(&[solid]).is_ok());
+    }
+
     proptest! {
         #[test]
         fn encode_decode_roundtrip(
@@ -1315,6 +1789,47 @@ mod tests {
                 // A little fresh content so frames are not pure translations.
                 next.fill(&Rect::new(0, (i as u32 * 8) % 120, 128, 6), 0x3366AA);
                 let f = enc.encode_frame(&next, &[next.bounds()], true);
+                dec.apply_frame(&f.copies, &f.tiles).unwrap();
+                prop_assert_eq!(dec.framebuffer(), &next);
+                prop_assert_eq!(enc.reference(), &next);
+                screen = next;
+            }
+        }
+
+        /// The same guarantee when the damage arrives as several rectangles:
+        /// a pane scrolling, the same pane again as a shorter rectangle, and
+        /// a small badge repainted elsewhere. Two of those three regions
+        /// explain the scroll, so two of them yield copies -- which is the
+        /// point, since copies found in different regions are applied as one
+        /// batch and the client must still reach the identical screen. Drop
+        /// the shorter rectangle and the case stops being exercised: the
+        /// badge is under `SCROLL_MIN_AREA` and never yields a copy at all.
+        #[test]
+        fn multi_region_frames_stay_exact(
+            shifts in proptest::collection::vec(-24i32..24, 1..6),
+        ) {
+            let pane = Rect::new(0, 0, 96, 256);
+            let badge = Rect::new(112, 60, 24, 24);
+            let mut screen = texty(160, 256, 0);
+            let mut enc = Encoder::new(160, 256).with_tile_size(32);
+            let mut dec = Decoder::new(160, 256);
+            let first = enc.encode_frame(&screen, &[screen.bounds()], false);
+            dec.apply_frame(&first.copies, &first.tiles).unwrap();
+            prop_assert_eq!(dec.framebuffer(), &screen);
+
+            for (i, dy) in shifts.into_iter().enumerate() {
+                let mut next = screen.clone();
+                for y in 0..pane.height as i32 {
+                    let sy = y + dy;
+                    let row = if (0..pane.height as i32).contains(&sy) {
+                        screen.row(sy as u32, pane.x, pane.width).to_vec()
+                    } else {
+                        vec![0xFFFFFF; pane.width as usize]
+                    };
+                    next.row_mut(y as u32, pane.x, pane.width).copy_from_slice(&row);
+                }
+                next.fill(&badge, 0x3366AA + i as u32 * 0x1111);
+                let f = enc.encode_frame(&next, &[Rect::new(0, 0, 96, 176), pane, badge], true);
                 dec.apply_frame(&f.copies, &f.tiles).unwrap();
                 prop_assert_eq!(dec.framebuffer(), &next);
                 prop_assert_eq!(enc.reference(), &next);

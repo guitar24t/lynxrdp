@@ -6,6 +6,11 @@
 //! or terminal full of text — rather than photographic or video content,
 //! and each scenario is measured twice: once with copy detection enabled
 //! and once without, so the contribution of each feature is visible.
+//!
+//! Every scenario declares its own damage rectangles. That is not a detail:
+//! a benchmark that always hands the encoder one full-screen rectangle
+//! exercises none of the per-region work, which is how four milliseconds a
+//! frame of scroll detection once sat here unnoticed.
 
 use std::time::Instant;
 
@@ -22,6 +27,16 @@ const BG: u32 = 0xFDFDFD;
 const GUTTER: u32 = 0xF0F0F0;
 const CHROME: u32 = 0x2B2B3B;
 const INK: [u32; 5] = [0x202020, 0x0B5FA5, 0x8B1A1A, 0x0A7A32, 0x7A3FA5];
+
+/// The scrolling half of a split window.
+fn left_pane() -> Rect {
+    Rect::new(0, 28, W / 2 - 2, H - 52)
+}
+
+/// A cursor blinking in the other half, well to the right of the scroll.
+fn cursor() -> Rect {
+    Rect::new(W / 2 + 220, 460, 10, 14)
+}
 
 /// Draw a screen of "code": a chrome bar, a gutter, and lines of coloured
 /// word-shaped blocks. `scroll` shifts which text lands on which line.
@@ -59,7 +74,23 @@ fn editor(scroll: u32) -> Framebuffer {
     fb
 }
 
-struct Result {
+/// A split window: the left pane scrolls, the right pane holds a second
+/// file that does nothing but blink a cursor.
+///
+/// The two damage rectangles sit side by side, so their union spans the
+/// static pane as well — every row of that box then contains pixels that did
+/// not move, and detection over the union finds nothing at all.
+fn split_panes(scroll: u32, tick: u32) -> Framebuffer {
+    let mut fb = editor(scroll);
+    let other = editor(500);
+    let right = Rect::new(W / 2, 28, W / 2, H - 52);
+    fb.copy_rect_from(&other, &right);
+    fb.fill(&Rect::new(W / 2 - 2, 28, 2, H - 52), CHROME);
+    fb.fill(&cursor(), if tick % 2 == 0 { INK[0] } else { BG });
+    fb
+}
+
+struct Measurement {
     label: &'static str,
     frames: usize,
     bytes: usize,
@@ -67,22 +98,27 @@ struct Result {
     micros: u128,
 }
 
-fn run(label: &'static str, frames: &[Framebuffer], allow_copy: bool) -> Result {
+fn run(
+    label: &'static str,
+    frames: &[Framebuffer],
+    regions: &[Rect],
+    allow_copy: bool,
+) -> Measurement {
     let mut enc = Encoder::new(W, H);
-    let bounds = Rect::new(0, 0, W, H);
     // Prime the encoder with the first frame; only later frames are measured.
-    enc.encode_frame(&frames[0], &[bounds], false);
+    // A first frame is a full refresh whatever the scenario's damage is.
+    enc.encode_frame(&frames[0], &[Rect::new(0, 0, W, H)], false);
 
     let mut bytes = 0usize;
     let mut copies = 0usize;
     let start = Instant::now();
     for f in &frames[1..] {
-        let FrameUpdate { copies: c, tiles } = enc.encode_frame(f, &[bounds], allow_copy);
+        let FrameUpdate { copies: c, tiles } = enc.encode_frame(f, regions, allow_copy);
         bytes += tiles.iter().map(|t| t.data.len()).sum::<usize>() + c.len() * 12;
         copies += c.len();
     }
     let micros = start.elapsed().as_micros();
-    Result {
+    Measurement {
         label,
         frames: frames.len() - 1,
         bytes,
@@ -91,30 +127,37 @@ fn run(label: &'static str, frames: &[Framebuffer], allow_copy: bool) -> Result 
     }
 }
 
-fn report(with: &Result, without: &Result) {
-    let per_frame = |r: &Result| r.bytes as f64 / r.frames as f64 / 1024.0;
-    let ms = |r: &Result| r.micros as f64 / r.frames as f64 / 1000.0;
+fn report(with: &Measurement, without: &Measurement) {
+    let per_frame = |r: &Measurement| r.bytes as f64 / r.frames as f64 / 1024.0;
+    let ms = |r: &Measurement| r.micros as f64 / r.frames as f64 / 1000.0;
     let saving = if with.bytes > 0 {
         without.bytes as f64 / with.bytes as f64
     } else {
         0.0
     };
     println!(
-        "{:<28} {:>10.1} {:>12.1} {:>9.1}x {:>8} {:>9.2}",
+        "{:<30} {:>11.1} {:>13.1} {:>7.1}x {:>7} {:>11.2} {:>8.2}",
         with.label,
         per_frame(without),
         per_frame(with),
         saving,
         with.copies,
+        ms(without),
         ms(with),
     );
 }
 
 fn main() {
+    let bounds = vec![Rect::new(0, 0, W, H)];
+    let split = vec![left_pane(), cursor()];
+
     // Scrolling a file one line at a time, the commonest editor motion.
     let line_scroll: Vec<Framebuffer> = (0..25).map(editor).collect();
     // Paging through a file.
     let page_scroll: Vec<Framebuffer> = (0..10).map(|i| editor(i * 40)).collect();
+    // The same scroll in one pane of a split window, with a cursor blinking
+    // in the other: two damage rectangles, side by side.
+    let split_scroll: Vec<Framebuffer> = (0..25).map(|i| split_panes(i, i)).collect();
     // Typing: one line changes, everything else is still.
     let typing: Vec<Framebuffer> = (0..25)
         .map(|i| {
@@ -133,20 +176,21 @@ fn main() {
 
     println!("LynxRDP codec, {W}x{H} synthetic editor content");
     println!(
-        "{:<28} {:>10} {:>12} {:>10} {:>8} {:>9}",
-        "scenario", "no-copy KiB", "with-copy KiB", "saving", "copies", "ms/frame"
+        "{:<30} {:>11} {:>13} {:>8} {:>7} {:>11} {:>8}",
+        "scenario", "no-copy KiB", "with-copy KiB", "saving", "copies", "ms no-copy", "ms copy"
     );
-    println!("{}", "-".repeat(82));
+    println!("{}", "-".repeat(93));
 
-    for (label, frames) in [
-        ("scroll, one line at a time", &line_scroll),
-        ("scroll, one page at a time", &page_scroll),
-        ("typing on one line", &typing),
-        ("switching between screens", &switching),
-        ("idle (no changes)", &idle),
+    for (label, frames, regions) in [
+        ("scroll, one line at a time", &line_scroll, &bounds),
+        ("scroll, one page at a time", &page_scroll, &bounds),
+        ("split panes, 2 damage rects", &split_scroll, &split),
+        ("typing on one line", &typing, &bounds),
+        ("switching between screens", &switching, &bounds),
+        ("idle (no changes)", &idle, &bounds),
     ] {
-        let with = run(label, frames, true);
-        let without = run(label, frames, false);
+        let with = run(label, frames, regions, true);
+        let without = run(label, frames, regions, false);
         report(&with, &without);
     }
 
