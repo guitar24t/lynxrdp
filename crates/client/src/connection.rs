@@ -14,7 +14,9 @@ use lynxrdp_proto::codec::Decoder;
 use lynxrdp_proto::frame::{frame_message, read_message, FrameError};
 use lynxrdp_proto::message::{clipboard_format, features, CursorImage};
 use lynxrdp_proto::transfer::{Completed, Sink, TransferManager, TransferPolicy, TransferPurpose};
-use lynxrdp_proto::{Framebuffer, Message, Rect, PROTOCOL_VERSION};
+use lynxrdp_proto::{
+    can_speak, Framebuffer, Message, Rect, MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION,
+};
 
 /// Options for connecting.
 #[derive(Clone, Debug)]
@@ -274,37 +276,44 @@ impl Client {
         (&stream).write_all(&buf).context("sending hello")?;
 
         let mut reader = BufReader::with_capacity(256 * 1024, stream.try_clone()?);
-        let (info, width, height) = match read_message(&mut reader)
-            .map_err(|e| anyhow!("handshake failed: {e}"))?
-        {
-            Message::ServerHello {
-                version,
-                server_name,
-                features,
-                session_id,
-                username,
-                width,
-                height,
-            } => {
-                if version != PROTOCOL_VERSION {
-                    bail!("server speaks protocol version {version}, this client speaks {PROTOCOL_VERSION}");
+        let (info, width, height) =
+            match read_message(&mut reader).map_err(|e| anyhow!("handshake failed: {e}"))? {
+                Message::ServerHello {
+                    version,
+                    server_name,
+                    features,
+                    session_id,
+                    username,
+                    width,
+                    height,
+                } => {
+                    // The server answers with the version the two of us agreed on,
+                    // which is the older of the pair -- so this is a range check,
+                    // not an equality one. `can_speak` refuses a server below our
+                    // floor (too old to hold a session with) and one above our own
+                    // version (which would mean it ignored the hello we sent).
+                    if !can_speak(version) {
+                        bail!(
+                            "server speaks protocol version {version}; this client supports \
+                         {MIN_COMPATIBLE_VERSION} to {PROTOCOL_VERSION}"
+                        );
+                    }
+                    (
+                        ServerInfo {
+                            server_name,
+                            features,
+                            session_id,
+                            username,
+                        },
+                        u32::from(width),
+                        u32::from(height),
+                    )
                 }
-                (
-                    ServerInfo {
-                        server_name,
-                        features,
-                        session_id,
-                        username,
-                    },
-                    u32::from(width),
-                    u32::from(height),
-                )
-            }
-            Message::Rejected { code, reason } => {
-                bail!("server rejected the connection (code {code}): {reason}")
-            }
-            other => bail!("unexpected message {:?} during handshake", other.kind()),
-        };
+                Message::Rejected { code, reason } => {
+                    bail!("server rejected the connection (code {code}): {reason}")
+                }
+                other => bail!("unexpected message {:?} during handshake", other.kind()),
+            };
         stream.set_read_timeout(None)?;
 
         let (tx, rx) = crossbeam_channel::unbounded::<Message>();
@@ -1047,6 +1056,39 @@ mod tests {
         let _server = fake_server(listener, vec![h]);
         let err = Client::connect(addr, &ConnectOptions::default(), None).unwrap_err();
         assert!(err.to_string().contains("version"), "{err}");
+    }
+
+    /// A server too old to hold a session with is refused; one merely older
+    /// than us is not.
+    ///
+    /// The check used to be plain equality, which made every protocol bump a
+    /// flag day -- server packages are installed by administrators on RHEL 9
+    /// while clients update on three platforms, so some skew is guaranteed.
+    /// The server answers with the version the two sides agreed on, so this is
+    /// a range check against the floor rather than an equality test.
+    #[test]
+    fn a_server_below_the_floor_is_refused_but_an_older_one_is_not() {
+        let refuse = |v: u16| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut h = hello(1, 1);
+            if let Message::ServerHello { version, .. } = &mut h {
+                *version = v;
+            }
+            let _server = fake_server(listener, vec![h]);
+            Client::connect(addr, &ConnectOptions::default(), None)
+        };
+
+        if MIN_COMPATIBLE_VERSION > 0 {
+            let err = refuse(MIN_COMPATIBLE_VERSION - 1)
+                .expect_err("a server below the floor must be refused");
+            assert!(err.to_string().contains("version"), "{err}");
+        }
+        // Every version from the floor up to ours inclusive must be accepted;
+        // today that is a single value, and it will not stay that way.
+        for v in MIN_COMPATIBLE_VERSION..=PROTOCOL_VERSION {
+            assert!(refuse(v).is_ok(), "version {v} should have been accepted");
+        }
     }
 
     #[test]

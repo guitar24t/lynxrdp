@@ -36,7 +36,9 @@ use lynxrdp_proto::message::{clipboard_format, features, reject, CursorImage};
 use lynxrdp_proto::transfer::{
     safe_relative_path, Completed, Sink, TransferManager, TransferPolicy, TransferPurpose,
 };
-use lynxrdp_proto::{Framebuffer, Message, Rect, PROTOCOL_VERSION, TILE_SIZE};
+use lynxrdp_proto::{
+    agreed_version, peer_meets_floor, Framebuffer, Message, Rect, MIN_COMPATIBLE_VERSION, TILE_SIZE,
+};
 use x11rb::protocol::randr;
 use x11rb::protocol::Event;
 
@@ -1151,14 +1153,22 @@ impl Core {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        if version != PROTOCOL_VERSION {
+        // A floor rather than equality. Refusing anything but our own version
+        // makes every release a flag day, which is the wrong trade when server
+        // packages are installed by administrators on RHEL 9 while clients
+        // update on three platforms. A client *newer* than us is accepted too:
+        // it is the newer side's job to decline if it cannot manage, and it
+        // knows what changed between the two versions where we cannot.
+        if !peer_meets_floor(version) {
             return self.reject(
                 reject::VERSION,
                 &format!(
-                    "protocol version {version} not supported (server speaks {PROTOCOL_VERSION})"
+                    "protocol version {version} is below the minimum this server \
+                     supports ({MIN_COMPATIBLE_VERSION})"
                 ),
             );
         }
+        let agreed = agreed_version(version);
         let features = want & SUPPORTED_FEATURES;
         // Apply the requested size (or the default) before the first frame.
         // Compared against the real root, not the size we serve: when the two
@@ -1188,7 +1198,10 @@ impl Core {
             c.description
         );
         c.send(&Message::ServerHello {
-            version: PROTOCOL_VERSION,
+            // The agreed version, not ours: an older client checks this for
+            // equality with its own, so announcing a newer number would have it
+            // hang up on a session it could have had.
+            version: agreed,
             server_name: SERVER_NAME.to_string(),
             features,
             session_id: self.opts.session_id,
