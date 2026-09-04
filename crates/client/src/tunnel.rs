@@ -1411,12 +1411,21 @@ mod tests {
             local_port: port,
             ..Default::default()
         };
-        let mut e = Endpoint::ssh(cfg, Duration::from_secs(10));
+        // Thirty seconds, not ten. The listener above is already accepting, so
+        // a healthy run breaks out of the readiness loop on its first pass and
+        // this bound is never approached -- it only has to be longer than the
+        // worst scheduling delay a loaded CI runner can put between spawning a
+        // process and that process being able to run, which is what made this
+        // fail once on the two-core aarch64 runner and nowhere else.
+        let mut e = Endpoint::ssh(cfg, Duration::from_secs(30));
         assert!(!e.is_ready(), "nothing is running before the first connect");
-        assert!(e.connect().is_ok());
+        // `unwrap` rather than `is_ok`: when this fails in CI the reason is the
+        // whole of the evidence, and `assertion failed: e.connect().is_ok()`
+        // discards it.
+        e.connect().expect("first connect");
         assert!(e.is_ready());
-        assert!(e.connect().is_ok());
-        assert!(e.connect().is_ok());
+        e.connect().expect("second connect");
+        e.connect().expect("third connect");
         // The test's own listener is what answers, so `connect` can return
         // before the script has written its line; wait for the first one
         // rather than racing it.
