@@ -52,6 +52,15 @@ contents:
     dst: /usr/lib/tmpfiles.d/lynxrdpd.conf
     file_info:
       mode: 0644
+  # Marked config|noreplace like the other two: the size and generation count
+  # are a policy an admin is expected to tune, and an upgrade must not quietly
+  # reset it. logrotate ignores snippets that are group- or world-writable, so
+  # the mode is load-bearing rather than habit.
+  - src: packaging/lynxrdp.logrotate
+    dst: /etc/logrotate.d/lynxrdp
+    type: config|noreplace
+    file_info:
+      mode: 0644
   - src: README.md
     dst: /usr/share/doc/lynxrdp-server/README.md
     file_info:
@@ -69,6 +78,10 @@ overrides:
       - libpam0g
       - libc6
     recommends:
+      # Not a hard dependency: without logrotate the server still works, it
+      # just grows session logs forever. Making it a dependency would drag
+      # cron/systemd-timer machinery onto minimal images for a hygiene job.
+      - logrotate
       - dbus-x11
       - xterm
       - x11-xserver-utils
@@ -80,6 +93,9 @@ overrides:
       - xorg-x11-server-Xvfb
       - pam
     recommends:
+      # Same reasoning as the deb: a weak dependency, because a missing
+      # logrotate degrades disk hygiene rather than breaking the server.
+      - logrotate
       - dbus-x11
       - xterm
       - xorg-x11-server-utils

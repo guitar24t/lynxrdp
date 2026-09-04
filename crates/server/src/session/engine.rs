@@ -5,12 +5,21 @@
 //!
 //! * Damage events only set a flag; pixels are fetched lazily right before
 //!   a frame is sent, so a frame always carries the newest content.
-//! * At most `max_in_flight` frames are unacknowledged. When the client is
+//! * A bounded number of frames may be unacknowledged. When the client is
 //!   slow, changes accumulate and are sent as one frame once an ack arrives,
 //!   so the client never falls behind the screen by more than one frame's
-//!   worth of transmission time.
+//!   worth of transmission time. The bound starts at the configured
+//!   `max_in_flight` and, unless the operator turned that off, grows towards
+//!   the number of frames that actually fit in the measured round trip --
+//!   see [`adapt_in_flight`].
 //! * Frames are rate limited to `max_fps`.
 //! * Input is applied the moment it arrives, ahead of any frame work.
+//! * No transfer byte is read or written here. Opening, creating, reading and
+//!   writing all go through [`super::fileio`], on a thread of their own,
+//!   because this one cannot afford to wait on a disk. One `stat` per path is
+//!   still taken inline when the *session* copies files to the clipboard --
+//!   see [`Core::on_clipboard_event`] -- and is the last filesystem call left
+//!   on this thread.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -27,9 +36,13 @@ use lynxrdp_proto::message::{clipboard_format, features, reject, CursorImage};
 use lynxrdp_proto::transfer::{
     safe_relative_path, Completed, Sink, TransferManager, TransferPolicy, TransferPurpose,
 };
-use lynxrdp_proto::{Framebuffer, Message, Rect, PROTOCOL_VERSION, TILE_SIZE};
+use lynxrdp_proto::{
+    agreed_version, peer_meets_floor, Framebuffer, Message, Rect, MIN_COMPATIBLE_VERSION, TILE_SIZE,
+};
+use x11rb::protocol::randr;
 use x11rb::protocol::Event;
 
+use super::fileio::{FileIo, FileOpened, FileReader};
 use super::listener::spawn_client_reader;
 use super::socket::ClientSocket;
 use super::{CoreEvent, NewClient, SessionOptions};
@@ -51,6 +64,24 @@ const PONG_TIMEOUT: Duration = Duration::from_secs(30);
 const HOUSEKEEPING: Duration = Duration::from_millis(250);
 /// Outgoing message queue depth per client.
 const WRITE_QUEUE: usize = 256;
+/// How long `drop_client` lets the writer finish flushing before it shuts the
+/// socket down underneath it. Long enough that a healthy client still receives
+/// the queued `Disconnect` reason -- two end-to-end tests assert exactly that --
+/// and short enough that a wedged one cannot hold the session core hostage.
+const WRITER_FLUSH_GRACE: Duration = Duration::from_millis(500);
+/// Hard ceiling on the in-flight window, matching the upper bound `config.rs`
+/// accepts for the configured floor. Past this the window is buffering, not
+/// pipelining: eight frames of a screen the user is no longer looking at.
+const MAX_IN_FLIGHT_CAP: u32 = 8;
+/// How far back the base round-trip estimate looks.
+///
+/// Long enough to keep a genuinely quiet moment in view across a burst of
+/// heavy frames, short enough that a path that really did get longer -- a
+/// laptop moving to a worse network -- is believed within a few seconds.
+const RTT_WINDOW: Duration = Duration::from_secs(10);
+/// Samples kept for the base estimate regardless of age. At 240 fps ten
+/// seconds is 2400 of them and the minimum is no better for having them all.
+const RTT_SAMPLES: usize = 256;
 
 /// Supported feature bits.
 const SUPPORTED_FEATURES: u32 = features::LOCAL_CURSOR
@@ -70,7 +101,15 @@ struct Client {
     connected_at: Instant,
     ready: bool,
     features: u32,
-    in_flight: u32,
+    /// Frames sent but not yet acknowledged, oldest first, with the moment
+    /// each went out. The length is the in-flight count; keeping the two as
+    /// one thing means they cannot drift apart.
+    frames_in_flight: VecDeque<(u64, Instant)>,
+    /// Round-trip samples behind the base estimate the window rule needs.
+    rtt: RttWindow,
+    /// How many frames may be in flight right now. Starts at the configured
+    /// `max_in_flight` and only ever moves above it.
+    window: u32,
     next_frame_id: u64,
     last_frame_at: Option<Instant>,
     full_refresh: bool,
@@ -111,11 +150,18 @@ impl Client {
 /// The session runs as the user, so an upload cannot reach anything the user
 /// could not already write. It still refuses path traversal, so a malicious
 /// or buggy offer cannot escape the upload directory into, say, `~/.ssh`.
+///
+/// Note what is and is not decided here. The questions of *whether* we are
+/// willing to write -- the path traversal check, and whether a download was
+/// solicited -- are the security ones, and they are answered right here, on
+/// the spot, out of memory. Only the filesystem work itself is handed to the
+/// worker, so a wedged mount can cost a transfer but never a frame.
 struct SessionTransferPolicy {
     upload_dir: PathBuf,
     /// Downloads the session asked the client for, while staging a clipboard
     /// file copy. Anything else in that direction is refused.
     staging: std::collections::HashMap<u64, PathBuf>,
+    fileio: FileIo,
 }
 
 impl TransferPolicy for SessionTransferPolicy {
@@ -132,28 +178,20 @@ impl TransferPolicy for SessionTransferPolicy {
                 let rel = safe_relative_path(name)
                     .ok_or_else(|| format!("refusing unsafe upload path {name:?}"))?;
                 let dest = self.upload_dir.join(&rel);
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-                }
-                let file = std::fs::File::create(&dest)
-                    .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
                 log::info!("receiving upload into {}", dest.display());
-                Ok(Sink::Stream(Box::new(file)))
+                // The directory and the file are created on the worker, so a
+                // refusal to write is reported when the transfer finishes
+                // rather than when it is offered. The peer is told either way.
+                Ok(Sink::Stream(Box::new(self.fileio.create(dest))))
             }
             TransferPurpose::FileDownload => {
                 // Only files we asked for while staging a clipboard copy.
                 let dest = self
                     .staging
                     .get(&id)
+                    .cloned()
                     .ok_or_else(|| "unsolicited download offer".to_string())?;
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-                }
-                let f = std::fs::File::create(dest)
-                    .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
-                Ok(Sink::Stream(Box::new(f)))
+                Ok(Sink::Stream(Box::new(self.fileio.create(dest))))
             }
         }
     }
@@ -194,6 +232,20 @@ pub struct Core {
     staging_downloads: std::collections::HashMap<u64, PathBuf>,
     /// Files staged so far in the current batch.
     staging_batch: Vec<PathBuf>,
+    /// Every file the session opens or writes goes through here, on a thread
+    /// of its own.
+    fileio: FileIo,
+    /// Readers for files a client asked to download, held between asking the
+    /// worker to open one and hearing back. Dropping one closes the file.
+    pending_downloads: std::collections::HashMap<u64, FileReader>,
+    /// The screen size we are actually serving, which is the root size clamped
+    /// to what the capture can reach. Everything about framing reads this and
+    /// not `display.size()`, because the two can differ -- see
+    /// [`Core::adopt_size`].
+    served: (u32, u32),
+    /// Largest screen the capture can serve. `ScreenCapture` sizes its shared
+    /// memory segment once, at construction, and cannot grow it afterwards.
+    capture_max: (u32, u32),
 }
 
 /// Why the core loop stopped.
@@ -219,12 +271,36 @@ impl Core {
         events_tx: Sender<CoreEvent>,
         events_rx: Receiver<CoreEvent>,
     ) -> Result<Self> {
+        // Ask to hear about root-window resizes we did not make. An `xrandr`
+        // run inside the session, or a desktop applying the display layout it
+        // saved at last logout, changes the screen under us; without this the
+        // core keeps its old size, and the next `GetImage` after a screen that
+        // *shrank* asks for pixels outside the root. That is a BadMatch, which
+        // becomes `Exit::XError`, which SIGTERMs the user's whole desktop.
+        //
+        // Before the size is read, not after, and the order is the whole point.
+        // Everything below this -- the SHM segment, the damage tracker, the
+        // keymap, the clipboard atoms -- is round trips, and it runs at exactly
+        // the moment the settings daemon is applying the saved display layout.
+        // Selecting first means a change in that window arrives as an event we
+        // will process; reading first would mean a change in that window was
+        // invisible in both directions at once. The event thread is not running
+        // yet, but the connection queues events until it is.
+        if display.ext.randr {
+            let selected = randr::select_input(
+                display.conn(),
+                display.root(),
+                randr::NotifyMask::SCREEN_CHANGE,
+            )
+            .map_err(anyhow::Error::from)
+            .and_then(|c| c.check().map_err(anyhow::Error::from));
+            if let Err(e) = selected {
+                log::warn!("cannot subscribe to RANDR screen changes: {e:#}");
+            }
+        }
         let (w, h) = display.refresh_size()?;
-        let capture = ScreenCapture::new(
-            display.clone(),
-            opts.max_width.max(w),
-            opts.max_height.max(h),
-        )?;
+        let capture_max = (opts.max_width.max(w), opts.max_height.max(h));
+        let capture = ScreenCapture::new(display.clone(), capture_max.0, capture_max.1)?;
         let damage = DamageTracker::new(display.clone())?;
         let input = InputInjector::new(display.clone())?;
         let cursor = match CursorTracker::new(display.clone()) {
@@ -246,13 +322,20 @@ impl Core {
         // Clipboard files from the client are staged here so the session can
         // paste them as ordinary local files.
         let staging_dir = std::env::temp_dir().join(format!("lynxrdp-clip-{}", std::process::id()));
+        let fileio = FileIo::spawn().context("starting the session file worker")?;
         log::info!(
-            "session core ready: {w}x{h}, shm={}, cursor={}, clipboard={}, max_fps={}, in_flight={}",
+            "session core ready: {w}x{h}, shm={}, cursor={}, clipboard={}, max_fps={}, \
+             in_flight={}{}",
             capture.uses_shm(),
             cursor.is_some(),
             clipboard.is_some(),
             opts.max_fps,
-            opts.max_in_flight
+            opts.max_in_flight,
+            if opts.max_in_flight_auto {
+                " (adaptive)"
+            } else {
+                ""
+            }
         );
         Ok(Self {
             display,
@@ -279,6 +362,10 @@ impl Core {
             staging_dir,
             staging_downloads: std::collections::HashMap::new(),
             staging_batch: Vec::new(),
+            fileio,
+            pending_downloads: std::collections::HashMap::new(),
+            served: (w, h),
+            capture_max,
         })
     }
 
@@ -349,7 +436,7 @@ impl Core {
 
     fn next_frame_delay(&self) -> Option<Duration> {
         let c = self.client.as_ref()?;
-        if !c.ready || c.in_flight >= self.opts.max_in_flight {
+        if !c.ready || c.frames_in_flight.len() as u32 >= c.window {
             return None;
         }
         if !(self.damage.is_dirty() || c.full_refresh) {
@@ -396,6 +483,10 @@ impl Core {
                 self.drop_client(Some("The server is shutting down."))?;
                 Ok(Some(Exit::Shutdown(reason)))
             }
+            CoreEvent::FileOpened(opened) => {
+                self.on_file_opened(*opened);
+                Ok(None)
+            }
         }
     }
 
@@ -412,19 +503,47 @@ impl Core {
                     log::warn!("keymap reload failed: {e:#}");
                 }
             }
+            Event::RandrScreenChangeNotify(_) => {
+                // Somebody resized the root. The size is taken from the server
+                // rather than out of the event because `refresh_size` is also
+                // what updates the cached size the rest of the code reads; the
+                // event's own fields would leave that stale. Not fatal on
+                // failure, for the reason spelled out below the match: only a
+                // lost connection should be able to end a desktop session, and
+                // that arrives by another route.
+                let size = self.display.refresh_size();
+                match size {
+                    Ok((w, h)) => self.adopt_size(w, h),
+                    Err(e) => log::warn!("cannot read the root size after a resize: {e:#}"),
+                }
+            }
             Event::Error(e) => {
                 log::debug!("X error: {e:?}");
             }
             _ => {}
         }
         if self.clipboard.is_some() {
-            let events = self
-                .clipboard
-                .as_mut()
-                .expect("checked")
-                .handle_event(&ev)?;
+            // Clipboard failures are logged, never propagated. `?` here reaches
+            // `Core::run` as `Exit::XError`, which SIGTERMs the desktop -- so a
+            // conversion this session could not perform ended the user's whole
+            // login and their unsaved work with it. Pasting an image larger
+            // than one X request is ordinary user action, not an attack.
+            //
+            // Losing the X connection for real is still fatal, but it arrives
+            // as `CoreEvent::XError` from the event reader thread rather than
+            // through here, so nothing is being swallowed that should not be.
+            // The neighbouring `MappingNotify` arm already takes this view.
+            let events = match self.clipboard.as_mut().expect("checked").handle_event(&ev) {
+                Ok(events) => events,
+                Err(e) => {
+                    log::warn!("clipboard: {e:#}");
+                    Vec::new()
+                }
+            };
             for event in events {
-                self.on_clipboard_event(event)?;
+                if let Err(e) = self.on_clipboard_event(event) {
+                    log::warn!("clipboard: {e:#}");
+                }
             }
         }
         // Keep the queue type in use for future ordering needs.
@@ -462,6 +581,15 @@ impl Core {
                 }
                 let mut files = Vec::new();
                 for p in &paths {
+                    // The one filesystem call left on this thread, and it is a
+                    // known gap rather than an oversight: an offer has to carry
+                    // a size, and answering that from the worker would mean a
+                    // second asynchronous round trip for a path the user just
+                    // copied by hand. A `stat` per file is orders of magnitude
+                    // cheaper than the reads and writes this module moved off,
+                    // but on a mount that has stopped answering it hitches the
+                    // frame loop just the same.
+                    //
                     // Directories would need recursive listing; skip them
                     // rather than offering something we cannot deliver.
                     match std::fs::metadata(p) {
@@ -505,13 +633,13 @@ impl Core {
         // A new copy supersedes any half-staged one.
         self.staging_downloads.clear();
         self.staging_batch.clear();
+        // The directory is not created here: each staged file is written
+        // through the file worker, which makes its parents. One `mkdir` is
+        // cheap on a local disk and is not cheap on a mount that has stopped
+        // answering, and this runs on the frame thread.
         let dir = self
             .staging_dir
             .join(format!("{}", self.transfers.next_id()));
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            log::warn!("cannot create the clipboard staging directory: {e}");
-            return;
-        }
         let mut requests = Vec::new();
         for f in &files {
             let Some(rel) = safe_relative_path(&f.path) else {
@@ -534,31 +662,71 @@ impl Core {
     }
 
     /// Answer a client's request to download a file from the session.
+    ///
+    /// The `open` and the `stat` both happen on the file worker, because the
+    /// offer needs the file's size and a `stat` of a path on a hung mount is
+    /// precisely what must not run here. The answer comes back through the
+    /// core loop as [`CoreEvent::FileOpened`], so a request for an unreachable
+    /// path costs the client its download and costs the desktop nothing.
     fn on_file_request(&mut self, id: u64, path: &str) {
-        let reply = match std::fs::File::open(path).and_then(|f| {
-            let len = f.metadata()?.len();
-            Ok((f, len))
-        }) {
-            Ok((file, size)) => {
-                log::info!("sending {path} ({size} bytes) to the client");
-                let name = std::path::Path::new(path)
+        let Some(generation) = self.client.as_ref().map(|c| c.generation) else {
+            return;
+        };
+        // One open per id at a time. The answer comes back asynchronously and
+        // carries only the id, so a second request that reused an id still in
+        // flight would be paired with the *first* request's reply: the client
+        // would be offered the second file's bytes under the first file's name
+        // and length. Refusing costs a client nothing -- it chooses these ids
+        // and has no reason to collide with itself -- and it is the only way
+        // the reply can be matched to the request that produced it.
+        if self.pending_downloads.contains_key(&id) {
+            log::warn!("transfer id {id} is already opening; refusing {path}");
+            self.send_to_client(vec![Message::TransferEnd {
+                id,
+                ok: false,
+                message: format!("{path}: transfer {id} is already in progress"),
+            }]);
+            return;
+        }
+        let reader = self
+            .fileio
+            .open(id, generation, path.to_string(), self.events_tx.clone());
+        // Held only until the worker reports back. Dropping it closes the file,
+        // which is what happens if the open failed or the client went away.
+        self.pending_downloads.insert(id, reader);
+    }
+
+    /// The worker has opened (or failed to open) a file a client asked for.
+    fn on_file_opened(&mut self, opened: FileOpened) {
+        let Some(reader) = self.pending_downloads.remove(&opened.id) else {
+            return;
+        };
+        if self.client.as_ref().map(|c| c.generation) != Some(opened.generation) {
+            // The client that asked is gone. Offering the file to whoever
+            // replaced it would be handing one client another's request.
+            return;
+        }
+        let reply = match opened.result {
+            Ok(size) => {
+                log::info!("sending {} ({size} bytes) to the client", opened.path);
+                let name = std::path::Path::new(&opened.path)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string());
+                    .unwrap_or_else(|| opened.path.clone());
                 self.transfers.offer_stream_with_id(
-                    id,
+                    opened.id,
                     TransferPurpose::FileDownload,
                     name,
                     size,
-                    Box::new(file),
+                    Box::new(reader),
                 )
             }
             Err(e) => {
-                log::warn!("cannot open {path} for download: {e}");
+                log::warn!("cannot open {} for download: {e}", opened.path);
                 Message::TransferEnd {
-                    id,
+                    id: opened.id,
                     ok: false,
-                    message: format!("{path}: {e}"),
+                    message: format!("{}: {e}", opened.path),
                 }
             }
         };
@@ -600,6 +768,7 @@ impl Core {
         let mut policy = SessionTransferPolicy {
             upload_dir: self.upload_dir.clone(),
             staging: self.staging_downloads.clone(),
+            fileio: self.fileio.clone(),
         };
         let Some(outcome) = self.transfers.handle(msg, &mut policy) else {
             return false;
@@ -622,7 +791,9 @@ impl Core {
                 let Some(png) = done.data else { return Ok(()) };
                 log::debug!("clipboard image <- client ({} bytes)", png.len());
                 if let Some(cb) = self.clipboard.as_mut() {
-                    cb.set_image(png)?;
+                    if let Err(e) = cb.set_image(png) {
+                        log::warn!("clipboard: setting the image failed: {e:#}");
+                    }
                 }
             }
             TransferPurpose::FileUpload => {
@@ -642,7 +813,9 @@ impl Core {
                         files.len()
                     );
                     if let Some(cb) = self.clipboard.as_mut() {
-                        cb.set_files(files)?;
+                        if let Err(e) = cb.set_files(files) {
+                            log::warn!("clipboard: offering staged files failed: {e:#}");
+                        }
                     }
                 }
             }
@@ -717,7 +890,9 @@ impl Core {
             connected_at: now,
             ready: false,
             features: 0,
-            in_flight: 0,
+            frames_in_flight: VecDeque::new(),
+            rtt: RttWindow::default(),
+            window: self.opts.max_in_flight.clamp(1, MAX_IN_FLIGHT_CAP),
             next_frame_id: 1,
             last_frame_at: None,
             full_refresh: false,
@@ -730,6 +905,7 @@ impl Core {
             bytes_sent: 0,
             frames_sent: 0,
         });
+        self.input.suppress_auto_repeat();
         self.last_client_seen = now;
         Ok(())
     }
@@ -744,12 +920,30 @@ impl Core {
                 reason: text.to_string(),
             });
         }
-        // Close the queue so the writer flushes what it has and exits.
+        // Close the queue so the writer drains what is already in it -- the
+        // Disconnect notice above is the last entry -- and exits by itself.
         drop(c.writer_tx);
-        if let Some(w) = c.writer.take() {
-            let _ = w.join();
+        // Then give it a bounded moment, and take the socket down whether or
+        // not it finished. The writer is not necessarily parked on the channel:
+        // against a peer that has stopped reading (a laptop asleep behind
+        // sshd, a stalled forward) it is parked inside `write_all` on a full
+        // socket, where closing the queue means nothing to it. Joining first is
+        // therefore an unbounded wait *on the session core thread* -- no
+        // frames, no input, no housekeeping, no idle timeout, and
+        // `accept_client` never runs again, so the user cannot even reconnect
+        // to the session they are still paying for. Only the shutdown unblocks
+        // that write, so it has to come before the join, not after it.
+        let writer = c.writer.take();
+        if let Some(w) = &writer {
+            let deadline = Instant::now() + WRITER_FLUSH_GRACE;
+            while !w.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
         c.socket.shutdown();
+        if let Some(w) = writer {
+            let _ = w.join();
+        }
         if let Some(r) = c.reader.take() {
             let _ = r.join();
         }
@@ -761,6 +955,13 @@ impl Core {
             c.bytes_sent
         );
         self.input.release_all()?;
+        // Release first, then hand the keyboard back the way we found it: a
+        // key still logically held when repeat comes back on would start
+        // repeating with nobody left to release it.
+        self.input.restore_auto_repeat();
+        // Files opened for a download this client never collected. Dropping
+        // the readers closes them.
+        self.pending_downloads.clear();
         self.last_client_seen = Instant::now();
         Ok(())
     }
@@ -816,7 +1017,7 @@ impl Core {
                 }
             }
             Message::PointerMotion { x, y } => {
-                let (w, h) = self.display.size();
+                let (w, h) = self.served;
                 let x = (u32::from(x).min(w.saturating_sub(1))) as i16;
                 let y = (u32::from(y).min(h.saturating_sub(1))) as i16;
                 if let Some(c) = self.client.as_mut() {
@@ -828,11 +1029,35 @@ impl Core {
             Message::PointerButton { button, down } => self.input.button(button, down)?,
             Message::Scroll { dx, dy } => self.input.scroll(dx, dy)?,
             Message::FrameAck { frame_id } => {
+                let now = Instant::now();
+                let (floor, auto, interval) = (
+                    self.opts.max_in_flight,
+                    self.opts.max_in_flight_auto,
+                    self.min_frame_interval,
+                );
                 if let Some(c) = self.client.as_mut() {
-                    if c.in_flight > 0 {
-                        c.in_flight -= 1;
+                    // Acknowledgements arrive in order, so anything still
+                    // queued ahead of this frame is never going to be
+                    // acknowledged and is dropped with it. That also keeps the
+                    // in-flight count honest without a second counter.
+                    let found = c
+                        .frames_in_flight
+                        .iter()
+                        .position(|(id, _)| *id == frame_id);
+                    if let Some(idx) = found {
+                        let (_, sent_at) = c.frames_in_flight[idx];
+                        c.frames_in_flight.drain(..=idx);
+                        let sample = now.saturating_duration_since(sent_at);
+                        let base = c.rtt.record(now, sample);
+                        if auto {
+                            c.window = adapt_in_flight(c.window, floor, base, sample, interval);
+                        }
                     }
-                    log::trace!("ack frame {frame_id}, in flight {}", c.in_flight);
+                    log::trace!(
+                        "ack frame {frame_id}, in flight {} of {}",
+                        c.frames_in_flight.len(),
+                        c.window
+                    );
                 }
             }
             Message::ResizeRequest { width, height } => {
@@ -850,13 +1075,28 @@ impl Core {
                 self.last_clipboard_received = Some(text.clone());
                 if let Some(cb) = self.clipboard.as_mut() {
                     log::debug!("clipboard <- client ({} bytes)", text.len());
-                    cb.set_text(text)?;
+                    // Non-fatal for the same reason as in `handle_x_event`:
+                    // this arrives from the client, and nothing a client sends
+                    // should be able to end the user's desktop session.
+                    if let Err(e) = cb.set_text(text) {
+                        log::warn!("clipboard: setting text failed: {e:#}");
+                    }
                 }
             }
             Message::Pong { nonce } => {
                 if let Some(c) = self.client.as_mut() {
                     if nonce == c.ping_nonce {
-                        c.last_pong_at = Instant::now();
+                        let now = Instant::now();
+                        // The ping round trip is the cleanest sample there is:
+                        // a few bytes each way, queued behind nothing. Feeding
+                        // it to the same minimum keeps the base estimate
+                        // honest on a link whose frames are big enough to hide
+                        // the path length, and keeps it fresh while the screen
+                        // is idle and no frames are being acknowledged at all.
+                        // Only frame acknowledgements move the window itself.
+                        c.rtt
+                            .record(now, now.saturating_duration_since(c.last_ping_at));
+                        c.last_pong_at = now;
                     }
                 }
             }
@@ -877,16 +1117,14 @@ impl Core {
             }
             Message::ClipboardRequest { format } => {
                 if let Some(cb) = self.clipboard.as_mut() {
-                    cb.request_format(format)?;
+                    if let Err(e) = cb.request_format(format) {
+                        log::warn!("clipboard: requesting format {format:#x} failed: {e:#}");
+                    }
                 }
             }
             Message::FileRequest { id, path } => self.on_file_request(id, &path),
             Message::FileList { files, .. } => self.stage_client_files(files),
-            Message::RefreshRequest => {
-                if let Some(c) = self.client.as_mut() {
-                    c.full_refresh = true;
-                }
-            }
+            Message::RefreshRequest => self.force_full_refresh(),
             Message::Disconnect { reason } => {
                 log::info!("client requested disconnect: {reason}");
                 self.drop_client(None)?;
@@ -915,16 +1153,27 @@ impl Core {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        if version != PROTOCOL_VERSION {
+        // A floor rather than equality. Refusing anything but our own version
+        // makes every release a flag day, which is the wrong trade when server
+        // packages are installed by administrators on RHEL 9 while clients
+        // update on three platforms. A client *newer* than us is accepted too:
+        // it is the newer side's job to decline if it cannot manage, and it
+        // knows what changed between the two versions where we cannot.
+        if !peer_meets_floor(version) {
             return self.reject(
                 reject::VERSION,
                 &format!(
-                    "protocol version {version} not supported (server speaks {PROTOCOL_VERSION})"
+                    "protocol version {version} is below the minimum this server \
+                     supports ({MIN_COMPATIBLE_VERSION})"
                 ),
             );
         }
+        let agreed = agreed_version(version);
         let features = want & SUPPORTED_FEATURES;
         // Apply the requested size (or the default) before the first frame.
+        // Compared against the real root, not the size we serve: when the two
+        // differ the root is oversized and a client asking for something we
+        // can serve should get an actual resize out of it.
         let (cur_w, cur_h) = self.display.size();
         let (req_w, req_h) = if width > 0 && height > 0 {
             (width, height)
@@ -938,19 +1187,21 @@ impl Core {
                 log::warn!("initial resize to {req_w}x{req_h} failed: {e:#}");
             }
         }
-        let (w, h) = self.display.size();
+        let (w, h) = self.served;
         let Some(c) = self.client.as_mut() else {
             return Ok(());
         };
         c.ready = true;
         c.features = features;
-        c.full_refresh = true;
         log::info!(
             "client {} ({client_name}) accepted: features 0x{features:x}, screen {w}x{h}",
             c.description
         );
         c.send(&Message::ServerHello {
-            version: PROTOCOL_VERSION,
+            // The agreed version, not ours: an older client checks this for
+            // equality with its own, so announcing a newer number would have it
+            // hang up on a session it could have had.
+            version: agreed,
             server_name: SERVER_NAME.to_string(),
             features,
             session_id: self.opts.session_id,
@@ -961,7 +1212,7 @@ impl Core {
         if features & features::LOCAL_CURSOR != 0 {
             self.refresh_cursor(true)?;
         }
-        self.encoder.invalidate(&Rect::new(0, 0, w, h));
+        self.force_full_refresh();
         Ok(())
     }
 
@@ -985,18 +1236,58 @@ impl Core {
         Ok(())
     }
 
-    /// Resize the X screen and reset frame state accordingly.
+    /// Change the X screen size, then adopt whatever the server actually gave
+    /// us.
+    ///
+    /// Split from [`Core::adopt_size`] because a resize is not the only way the
+    /// root changes size, and everything after the RANDR call is common to both
+    /// causes. `resize_screen` also produces a `ScreenChangeNotify` of its own,
+    /// so the adoption below and the one the echo triggers must agree -- which
+    /// they do, because adoption is idempotent on an unchanged size.
     fn apply_resize(&mut self, width: u32, height: u32) -> Result<()> {
         let width = width.clamp(64, self.opts.max_width);
         let height = height.clamp(64, self.opts.max_height);
-        resize_screen(&self.display, width, height)?;
+        resize_screen(&self.display, width, height, self.opts.dpi)?;
+        // `resize_screen` refreshes the cached size before it returns, and it
+        // is the size the server settled on that matters, not the one we asked
+        // for.
         let (w, h) = self.display.size();
+        self.adopt_size(w, h);
+        Ok(())
+    }
+
+    /// Take on a root size, whoever changed it.
+    ///
+    /// Clamped to what the capture was built for rather than growing the
+    /// capture: `ScreenCapture` sizes its shared memory segment once, from the
+    /// constructor's maximum, and cannot grow it from here. Height alone would
+    /// in fact survive -- `capture_many` bands a tall capture to fit the
+    /// segment -- but a root grown wider than one row of that segment fails the
+    /// frame outright, and `Framebuffer::new` on a root somebody else controls
+    /// is an allocation with no bound of ours. A root larger than the maximum
+    /// is only reachable when we attached to somebody else's X server with
+    /// `--display`, and cropping there is exactly what this code did before it
+    /// noticed resizes at all. The case that actually kills sessions is a root
+    /// that *shrank*, and a clamp is never in its way.
+    fn adopt_size(&mut self, width: u32, height: u32) {
+        let w = width.clamp(1, self.capture_max.0);
+        let h = height.clamp(1, self.capture_max.1);
+        if (w, h) == self.served {
+            return;
+        }
+        if (w, h) != (width, height) {
+            log::warn!(
+                "the root window is {width}x{height}, larger than this session can capture \
+                 ({}x{}); serving the top left {w}x{h} of it",
+                self.capture_max.0,
+                self.capture_max.1
+            );
+        }
+        self.served = (w, h);
         self.screen = Framebuffer::new(w, h);
         self.encoder.resize(w, h);
-        self.encoder.invalidate(&Rect::new(0, 0, w, h));
-        self.damage.mark_dirty();
+        self.force_full_refresh();
         if let Some(c) = self.client.as_mut() {
-            c.full_refresh = true;
             if c.ready {
                 c.send(&Message::ScreenResized {
                     width: w as u16,
@@ -1004,16 +1295,33 @@ impl Core {
                 });
             }
         }
-        log::info!("screen resized to {w}x{h}");
-        Ok(())
+        log::info!("screen is now {w}x{h}");
     }
 
     /// Send a frame if one is due, and sync the pointer position.
+    /// Arrange for the next frame to be a complete one.
+    ///
+    /// Both halves are required and neither is sufficient. `full_refresh` makes
+    /// `send_frame` capture the whole screen rather than the damage list;
+    /// invalidating the encoder's reference is what makes that capture actually
+    /// produce tiles, because the tile diff is against that reference and an
+    /// untouched reference matches the screen exactly. Setting only the flag
+    /// captures the screen, finds nothing changed and sends nothing -- which is
+    /// how `RefreshRequest` used to answer the one client with a reason to ask.
+    fn force_full_refresh(&mut self) {
+        let (w, h) = self.served;
+        self.encoder.invalidate(&Rect::new(0, 0, w, h));
+        self.damage.mark_dirty();
+        if let Some(c) = self.client.as_mut() {
+            c.full_refresh = true;
+        }
+    }
+
     fn pump(&mut self) -> Result<()> {
         let Some(c) = self.client.as_ref() else {
             return Ok(());
         };
-        if !c.ready || c.in_flight >= self.opts.max_in_flight {
+        if !c.ready || c.frames_in_flight.len() as u32 >= c.window {
             return Ok(());
         }
         if !(self.damage.is_dirty() || c.full_refresh) {
@@ -1028,7 +1336,7 @@ impl Core {
     }
 
     fn send_frame(&mut self) -> Result<()> {
-        let (w, h) = self.display.size();
+        let (w, h) = self.served;
         let bounds = Rect::new(0, 0, w, h);
         let full = self
             .client
@@ -1045,7 +1353,9 @@ impl Core {
             let mut merged = coalesce(&raw, TILE_SIZE, &bounds);
             // Many scattered rectangles cost more round trips than one
             // capture of the whole screen.
-            if merged.len() > 24 || crate::x11::capture::total_area(&merged) * 2 > bounds.area() {
+            if merged.len() > crate::x11::capture::MAX_CAPTURE_RECTS
+                || crate::x11::capture::total_area(&merged) * 2 > bounds.area()
+            {
                 merged = vec![bounds];
             }
             merged
@@ -1053,9 +1363,12 @@ impl Core {
         if self.screen.width() != w || self.screen.height() != h {
             self.screen = Framebuffer::new(w, h);
         }
-        for r in &rects {
-            self.capture.capture_into(&mut self.screen, r)?;
-        }
+        // One call, not a loop: `capture_many` issues every request in a batch
+        // before reading any reply, so a frame made of a dozen damage
+        // rectangles costs about one round trip instead of a dozen in series.
+        // Calling `capture_into` per rectangle is the case its documentation
+        // exists to warn against.
+        self.capture.capture_many(&mut self.screen, &rects)?;
         // A full refresh resets the reference frame, so there is no previous
         // frame a copy could reference; skip scroll detection in that case.
         let frame = self.encoder.encode_frame(&self.screen, &rects, !full);
@@ -1086,9 +1399,12 @@ impl Core {
             self.drop_client(None)?;
             return Ok(());
         }
-        c.in_flight += 1;
+        let sent_at = Instant::now();
+        // The send time is what the frame's acknowledgement is measured
+        // against, and the queue's length is the in-flight count.
+        c.frames_in_flight.push_back((frame_id, sent_at));
         c.frames_sent += 1;
-        c.last_frame_at = Some(Instant::now());
+        c.last_frame_at = Some(sent_at);
         self.sync_pointer()
     }
 
@@ -1149,5 +1465,193 @@ impl Core {
     /// Whether a client is currently connected.
     pub fn has_client(&self) -> bool {
         self.client.is_some()
+    }
+}
+
+/// A windowed minimum of round-trip samples.
+///
+/// A minimum and not an average, deliberately. An exponential average of a slow
+/// client's round trips rises with the queue the window itself created, so the
+/// rule below would read its own backlog as a longer path and deepen the queue
+/// again; on a bandwidth-limited link, where every extra byte in flight adds to
+/// the round trip, that has no fixed point short of the cap. The minimum over a
+/// recent window tracks the path rather than the queue: it falls only when the
+/// path is genuinely shorter, and rises only once every recent sample is worse.
+#[derive(Debug, Default)]
+struct RttWindow {
+    samples: VecDeque<(Instant, Duration)>,
+}
+
+impl RttWindow {
+    /// Record a sample and return the base estimate that follows from it.
+    fn record(&mut self, now: Instant, rtt: Duration) -> Duration {
+        self.samples.push_back((now, rtt));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > RTT_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        while self.samples.len() > RTT_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.iter().map(|(_, d)| *d).min().unwrap_or(rtt)
+    }
+}
+
+/// One step of the in-flight window rule, applied to each frame acknowledged.
+///
+/// A fixed `max_in_flight = 2` caps a session at two frames per round trip: 40
+/// fps at 50 ms, 20 at 100 ms, 10 at 200 ms -- on a transport that is by design
+/// a WAN SSH tunnel. A bigger constant is not the answer, because the right
+/// number is the bandwidth-delay product measured in frames and only the link
+/// knows what that is.
+///
+/// * The target is how many frames fit in one round trip at the pace we are
+///   allowed to send them: `ceil(base_rtt / min_frame_interval)`. Beyond that
+///   the extra frames are queue rather than pipeline -- stale before they are
+///   drawn, and paid for twice when the next one supersedes them.
+/// * A sample longer than `base + 2 * interval` says the frames already out
+///   there are queueing somewhere: a narrow link, or a client that cannot
+///   decode as fast as we encode. Give a slot back. Two intervals of slack
+///   rather than one, because a frame that merely missed its tick is late by a
+///   whole interval through no fault of the window.
+/// * Movement is one slot per sample in either direction. This is a guess about
+///   a path that changes, and a guess that can leap is a guess that oscillates.
+/// * `floor` is the operator's configured `max_in_flight` and always wins, even
+///   over the computed target. The documented latency knob has to keep meaning
+///   what it says, so this only ever adds frames to what was asked for.
+fn adapt_in_flight(
+    current: u32,
+    floor: u32,
+    base_rtt: Duration,
+    sample: Duration,
+    min_frame_interval: Duration,
+) -> u32 {
+    let floor = floor.clamp(1, MAX_IN_FLIGHT_CAP);
+    // A zero interval would make the target infinite. `max_fps` is validated to
+    // be at least 1 and `Core::new` clamps it again, but arithmetic this small
+    // should not have to depend on that holding somewhere else.
+    let interval = min_frame_interval.max(Duration::from_micros(1));
+    let target = frames_per_rtt(base_rtt, interval).clamp(floor, MAX_IN_FLIGHT_CAP);
+    let late = base_rtt.saturating_add(interval.saturating_mul(2));
+    let next = if sample > late || current > target {
+        current.saturating_sub(1)
+    } else if current < target {
+        current.saturating_add(1)
+    } else {
+        current
+    };
+    next.clamp(floor, MAX_IN_FLIGHT_CAP)
+}
+
+/// How many frames of `interval` fit in one `rtt`, rounded up, at least one and
+/// never more than the cap.
+fn frames_per_rtt(rtt: Duration, interval: Duration) -> u32 {
+    let n = rtt.as_nanos().div_ceil(interval.as_nanos().max(1));
+    n.clamp(1, u128::from(MAX_IN_FLIGHT_CAP)) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 100 fps, so a round trip in whole milliseconds is a whole number of
+    /// frames and the arithmetic in these tests is readable.
+    const INTERVAL: Duration = Duration::from_millis(10);
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn the_window_ramps_one_slot_per_clean_ack() {
+        // 50 ms of path at 10 ms a frame is five frames in flight.
+        let base = ms(50);
+        let mut window = 2;
+        for expected in [3, 4, 5, 5, 5] {
+            window = adapt_in_flight(window, 2, base, base, INTERVAL);
+            assert_eq!(window, expected);
+        }
+    }
+
+    #[test]
+    fn a_late_sample_gives_a_slot_back() {
+        let base = ms(50);
+        // Two intervals of slack is still on time; a hair over it is not.
+        assert_eq!(adapt_in_flight(5, 2, base, ms(70), INTERVAL), 5);
+        assert_eq!(adapt_in_flight(5, 2, base, ms(71), INTERVAL), 4);
+    }
+
+    #[test]
+    fn the_configured_floor_is_never_undercut() {
+        let base = ms(50);
+        let awful = Duration::from_secs(2);
+        assert_eq!(adapt_in_flight(2, 2, base, awful, INTERVAL), 2);
+        assert_eq!(adapt_in_flight(1, 1, base, awful, INTERVAL), 1);
+        // Even from above the floor, a run of bad samples stops there.
+        let mut window = 6;
+        for _ in 0..20 {
+            window = adapt_in_flight(window, 2, base, awful, INTERVAL);
+        }
+        assert_eq!(window, 2);
+    }
+
+    #[test]
+    fn the_window_is_capped_however_long_the_path_is() {
+        // Half a second of path would be fifty frames; eight is the cap.
+        let base = ms(500);
+        let mut window = 2;
+        for _ in 0..30 {
+            window = adapt_in_flight(window, 2, base, base, INTERVAL);
+        }
+        assert_eq!(window, MAX_IN_FLIGHT_CAP);
+    }
+
+    #[test]
+    fn a_configured_floor_above_the_computed_target_still_wins() {
+        // 5 ms of path computes a target of one frame; the operator asked for
+        // four, and the knob has to keep meaning what it says.
+        let base = ms(5);
+        assert_eq!(adapt_in_flight(4, 4, base, base, INTERVAL), 4);
+        assert_eq!(adapt_in_flight(2, 4, base, base, INTERVAL), 4);
+        assert_eq!(adapt_in_flight(4, 4, base, ms(300), INTERVAL), 4);
+    }
+
+    #[test]
+    fn the_window_walks_back_down_when_the_path_gets_shorter() {
+        // 20 ms of path is two frames, and the walk down is one slot a time.
+        let short = ms(20);
+        let mut window = MAX_IN_FLIGHT_CAP;
+        for expected in [7, 6, 5, 4, 3, 2, 2] {
+            window = adapt_in_flight(window, 2, short, short, INTERVAL);
+            assert_eq!(window, expected);
+        }
+    }
+
+    #[test]
+    fn the_base_rtt_is_the_minimum_over_the_window_not_the_last_sample() {
+        let mut rtt = RttWindow::default();
+        let t0 = Instant::now();
+        assert_eq!(rtt.record(t0, ms(50)), ms(50));
+        // A spike must not move the base...
+        assert_eq!(rtt.record(t0 + ms(1), ms(400)), ms(50));
+        // ...but a genuinely shorter path must.
+        assert_eq!(rtt.record(t0 + ms(2), ms(20)), ms(20));
+        // And once the window has rolled past those, the estimate follows the
+        // path up rather than clinging to a minimum that no longer happens.
+        let later = t0 + RTT_WINDOW + Duration::from_secs(1);
+        assert_eq!(rtt.record(later, ms(300)), ms(300));
+    }
+
+    #[test]
+    fn the_sample_window_is_bounded_by_count_as_well_as_age() {
+        let mut rtt = RttWindow::default();
+        let t0 = Instant::now();
+        for i in 0..(RTT_SAMPLES as u64 * 3) {
+            rtt.record(t0 + Duration::from_micros(i), ms(50));
+        }
+        assert!(rtt.samples.len() <= RTT_SAMPLES);
     }
 }

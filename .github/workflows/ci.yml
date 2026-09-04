@@ -35,18 +35,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install X test dependencies
+        # openssh-server is for tunnel_e2e, which starts a throwaway sshd and
+        # is the only test that exercises the transport the product ships over.
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q xvfb xterm xdotool xclip x11-utils x11-xserver-utils libxkbcommon-x11-0 libxkbcommon0
+          sudo apt-get install -y -q xvfb xterm xdotool xclip x11-utils x11-xserver-utils libxkbcommon-x11-0 libxkbcommon0 openssh-server openssh-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets
       - name: Unit tests
         run: cargo test --workspace --lib --bins
+      # LYNXRDP_REQUIRE_E2E turns every "dependency missing, skipping" guard
+      # into a failure. Without it a skipped test is reported as a pass, so
+      # losing xvfb from the apt line above would leave these steps green while
+      # covering nothing at all. It is set here and nowhere else: a developer
+      # without Xvfb still gets skips rather than failures.
       - name: End-to-end tests (session)
+        env:
+          LYNXRDP_REQUIRE_E2E: "1"
         run: cargo test -p lynxrdp-server --test e2e -- --test-threads=2
       - name: End-to-end tests (daemon)
+        env:
+          LYNXRDP_REQUIRE_E2E: "1"
         run: cargo test -p lynxrdp-server --test daemon -- --test-threads=1
+      - name: End-to-end tests (SSH tunnel)
+        env:
+          LYNXRDP_REQUIRE_E2E: "1"
+        run: cargo test -p lynxrdp-server --test tunnel_e2e -- --test-threads=1
       - name: Doc tests
         run: cargo test --workspace --doc
 
@@ -218,6 +233,51 @@ jobs:
           fi
           # The daemon must be listening on loopback only.
           sudo ss -ltnp | grep -E '127\.0\.0\.1:3390' || (echo "::error::not listening on 127.0.0.1:3390"; exit 1)
+          # /etc/logrotate.d/lynxrdp is the only thing between one chatty
+          # desktop application and a full /var, and a full /var means the
+          # daemon cannot open a session log, which means nobody can log in.
+          # A broken snippet fails silently in production -- logrotate skips
+          # the file and moves on -- so it has to fail here instead.
+          test -f /etc/logrotate.d/lynxrdp
+          dpkg-query --showformat='${Recommends}\n' -W lynxrdp-server | grep -q logrotate
+          # A Recommends, so an install run with --no-install-recommends would
+          # not have it; pull it in explicitly rather than let apt's policy
+          # decide whether this check runs at all.
+          sudo apt-get install -y -q logrotate
+          # logrotate's exit status is not a parse verdict: a mistyped
+          # directive prints "unknown option ... -- ignoring line" and still
+          # exits 0, which is precisely how a broken snippet reaches a
+          # production /var unnoticed. Assert on the diagnostics instead.
+          if ! sudo logrotate --debug /etc/logrotate.d/lynxrdp >/tmp/lr.log 2>&1 \
+              || grep -q 'error:' /tmp/lr.log; then
+            cat /tmp/lr.log
+            echo "::error::logrotate rejected /etc/logrotate.d/lynxrdp"
+            exit 1
+          fi
+          # Nothing in production names this file: it arrives through
+          # "include /etc/logrotate.d", which drops a snippet that is group- or
+          # world-writable with an error nobody reads. Only the include path
+          # can say the installed mode is one logrotate will still honour.
+          sudo logrotate --debug /etc/logrotate.conf 2>&1 \
+            | grep -q '/var/log/lynxrdp/\*\.log'
+          # Parsing is the easy half. copytruncate is the load-bearing part:
+          # the session dup()s its log onto fd 1 and 2 and holds it for its
+          # whole life, so a rotation that renamed the file would leave every
+          # running desktop appending to an unlinked inode. Hold an fd across
+          # a real rotation and prove it still reaches the live path -- that
+          # is the invariant, and unlike grepping --debug for the word
+          # copytruncate it does not depend on how a given logrotate version
+          # words its messages.
+          sudo install -d -m 0700 /var/log/lynxrdp
+          sudo bash -euo pipefail -c '
+            exec 9>>/var/log/lynxrdp/citest.log
+            head -c 65536 /dev/zero | tr "\0" x >&9
+            logrotate --force /etc/logrotate.d/lynxrdp
+            echo still-the-live-file >&9
+            grep -q still-the-live-file /var/log/lynxrdp/citest.log
+            test -f /var/log/lynxrdp/citest.log.1.gz
+            rm -f /var/log/lynxrdp/citest.log /var/log/lynxrdp/citest.log.1.gz
+          '
           sudo apt-get remove -y -q lynxrdp-server
       - name: Inspect the .rpm
         run: |
@@ -225,6 +285,11 @@ jobs:
           rpm -qpi dist/lynxrdp-server-*.rpm
           rpm -qpl dist/lynxrdp-server-*.rpm
           rpm -qp --scripts dist/lynxrdp-server-*.rpm | head -40
+          # nfpm writes deb and rpm from one config but not by one code path;
+          # the deb smoke test above cannot speak for the rpm, so check that
+          # the snippet and its weak dependency actually made it in.
+          rpm -qpl dist/lynxrdp-server-*.rpm | grep -qx /etc/logrotate.d/lynxrdp
+          rpm -qp --recommends dist/lynxrdp-server-*.rpm | grep -q logrotate
       - uses: actions/upload-artifact@v4
         with:
           name: lynxrdp-server-${{ matrix.name }}

@@ -31,13 +31,13 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 png = "0.17"
 serde = { workspace = true }
 toml = { workspace = true }
+# Not just a test dependency: a session's standard error goes to an unlinked
+# temporary file so a chatty child cannot block on an undrained pipe.
+tempfile = "3"
 # Launcher window (the connection manager). eframe drives winit, which is
 # why the launcher spawns sessions as child processes rather than opening
 # one in-process: a second winit event loop is not allowed on macOS.
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11rb = "0.13"

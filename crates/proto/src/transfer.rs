@@ -24,10 +24,16 @@
 //! # Why it does not stall the screen
 //!
 //! Everything shares one TCP connection, so a large transfer could easily
-//! starve interactive frames. Two things prevent that: chunks are capped at
-//! [`CHUNK_SIZE`] so a frame only ever waits for one chunk to drain, and the
-//! sender keeps at most [`WINDOW_CHUNKS`] chunks unacknowledged, which bounds
-//! how much transfer data can be queued ahead of a frame.
+//! starve interactive frames. Three things prevent that: chunks are capped at
+//! [`CHUNK_SIZE`] so a frame only ever waits for one chunk to drain; the sender
+//! keeps at most [`WINDOW_CHUNKS`] chunks of any one transfer unacknowledged;
+//! and [`GLOBAL_WINDOW_CHUNKS`] bounds the total across all of them.
+//!
+//! That third one is not redundant. The claim is about the *queue*, and a
+//! per-transfer window says nothing about how many transfers there are:
+//! staging a clipboard file copy fans out one per file, so eight concurrent
+//! transfers used to put eight windows -- four megabytes -- in front of the
+//! next screen update.
 
 use std::io::{self, Read, Write};
 
@@ -41,8 +47,37 @@ pub const CHUNK_SIZE: usize = 64 * 1024;
 /// Bounds transfer data queued ahead of an interactive frame.
 pub const WINDOW_CHUNKS: u32 = 8;
 
+/// How many chunks may be in flight across *all* outgoing transfers at once.
+///
+/// [`WINDOW_CHUNKS`] bounds one transfer, and the promise at the top of this
+/// module -- that a frame waits for at most one chunk -- is about the queue, not
+/// about a transfer. With N running concurrently the real figure was
+/// N x WINDOW_CHUNKS x CHUNK_SIZE ahead of the next frame, and N is routinely
+/// large: staging a clipboard file copy fans out one transfer per file, bounded
+/// only by `MAX_FILE_LIST`. Two windows' worth keeps a single transfer at full
+/// speed while capping the queue at about 1 MiB however many are running.
+pub const GLOBAL_WINDOW_CHUNKS: u32 = WINDOW_CHUNKS * 2;
+
 /// Largest transfer accepted by default (2 GiB).
 pub const MAX_TRANSFER_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Largest transfer either side will hold entirely in memory (64 MiB).
+///
+/// [`MAX_TRANSFER_SIZE`] is the right bound for something being streamed to a
+/// file, and completely the wrong one for a [`Sink::Memory`]: both endpoints'
+/// policies took a clipboard image straight into memory while explicitly
+/// ignoring the offered size, so a handful of 2 GiB offers were enough to push
+/// either peer out of memory. This is the number SECURITY.md already claims for
+/// clipboard images, now actually enforced.
+pub const MAX_MEMORY_TRANSFER_SIZE: u64 = 64 * 1024 * 1024;
+
+/// How many in-memory transfers may be in flight at once.
+///
+/// A size cap alone bounds one transfer, not the set of them. This is
+/// deliberately *not* a cap on incoming transfers in general: staging a
+/// clipboard file copy legitimately fans out one transfer per file, up to
+/// `MAX_FILE_LIST`, and those stream to disk.
+pub const MAX_CONCURRENT_MEMORY_TRANSFERS: usize = 2;
 
 /// What a transfer is for. Determines how the receiver handles it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,6 +240,11 @@ impl<R: Read> TransferSender<R> {
             self.eof = true;
         }
         Ok(Some((seq, buf)))
+    }
+
+    /// Chunks sent but not yet acknowledged.
+    pub fn in_flight(&self) -> u32 {
+        self.next_seq - self.acked
     }
 
     /// Record an acknowledgement, freeing window space.
@@ -709,6 +749,12 @@ struct Incoming {
     receiver: TransferReceiver<Sink>,
     purpose: TransferPurpose,
     name: String,
+    /// Whether this one accumulates in memory. Tracked at insertion rather
+    /// than derived later, so every path that drops an `Incoming` releases the
+    /// budget by simply removing the record -- a separate counter would have to
+    /// be decremented on each of them, and missing one silently wedges
+    /// clipboard images after a few failed transfers.
+    in_memory: bool,
 }
 
 /// Tracks every transfer in flight on one connection, in both directions.
@@ -724,6 +770,10 @@ pub struct TransferManager {
     /// nothing to resolve against and the requester would wait forever.
     pending: HashSet<u64>,
     max_size: u64,
+    /// Where the next round-robin pump starts, so a transfer that keeps
+    /// arriving at an exhausted budget is not starved by whichever id happens
+    /// to sort first.
+    pump_cursor: u64,
 }
 
 impl std::fmt::Debug for TransferManager {
@@ -746,6 +796,7 @@ impl TransferManager {
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
             pending: HashSet::new(),
+            pump_cursor: 0,
             max_size: MAX_TRANSFER_SIZE,
         }
     }
@@ -849,12 +900,42 @@ impl TransferManager {
                 self.pending.remove(id);
                 match policy.accept(*id, *purpose, name, *size) {
                     Ok(sink) => {
+                        // Memory limits are enforced here rather than in each
+                        // policy. There are two policies, both of which took a
+                        // clipboard image straight into memory while ignoring
+                        // the size they were handed, and a rule that has to be
+                        // repeated on both sides of a protocol is a rule that
+                        // will eventually only be applied on one.
+                        let in_memory = matches!(sink, Sink::Memory(_));
+                        if in_memory {
+                            if *size > MAX_MEMORY_TRANSFER_SIZE {
+                                out.replies.push(Message::TransferAccept {
+                                    id: *id,
+                                    accepted: false,
+                                    reason: format!(
+                                        "{size} bytes is more than this side will hold in memory"
+                                    ),
+                                });
+                                return Some(out);
+                            }
+                            let live = self.incoming.values().filter(|i| i.in_memory).count();
+                            if live >= MAX_CONCURRENT_MEMORY_TRANSFERS {
+                                out.replies.push(Message::TransferAccept {
+                                    id: *id,
+                                    accepted: false,
+                                    reason: "too many in-memory transfers already in flight"
+                                        .to_string(),
+                                });
+                                return Some(out);
+                            }
+                        }
                         self.incoming.insert(
                             *id,
                             Incoming {
                                 receiver: TransferReceiver::new(*id, *size, sink),
                                 purpose: *purpose,
                                 name: name.clone(),
+                                in_memory,
                             },
                         );
                         out.replies.push(Message::TransferAccept {
@@ -889,7 +970,7 @@ impl TransferManager {
                     return Some(out);
                 }
                 o.accepted = true;
-                self.pump_one(*id, &mut out);
+                self.pump(&mut out);
             }
             Message::TransferData { id, seq, data } => {
                 let Some(i) = self.incoming.get_mut(id) else {
@@ -917,18 +998,48 @@ impl TransferManager {
                 if let Some(o) = self.outgoing.get_mut(id) {
                     o.sender.on_ack(*seq);
                 }
-                self.pump_one(*id, &mut out);
+                self.pump(&mut out);
             }
             Message::TransferEnd { id, ok, message } => {
-                let was_incoming = self.incoming.remove(id).is_some();
+                let incoming = self.incoming.remove(id);
                 let was_pending = self.pending.remove(id);
                 let outgoing = self.outgoing.remove(id);
                 if *ok {
-                    // The peer confirmed it received everything we sent.
-                    if let Some(o) = outgoing {
-                        out.sent.push((*id, o.purpose, o.name));
+                    // "ok" is the peer's claim, not a fact, and both directions
+                    // have to check it against what actually moved.
+                    //
+                    // Still holding an incoming record here means the sender
+                    // declared the transfer finished before its chunks arrived.
+                    // Dropping the receiver at this point skipped `finish()`
+                    // altogether, so the truncation check never ran: a short
+                    // file was left at exactly the path the user asked for, no
+                    // event was emitted, and the id stayed registered, so the
+                    // requester waited on a transfer that had already ended.
+                    if let Some(i) = incoming {
+                        let (purpose, name) = (i.purpose, i.name);
+                        match i.receiver.finish() {
+                            Ok(_) => out.completed.push(Completed {
+                                id: *id,
+                                purpose,
+                                name,
+                                data: None,
+                            }),
+                            Err(e) => out.failed.push((*id, e.to_string())),
+                        }
                     }
-                } else if was_incoming || was_pending || outgoing.is_some() {
+                    if let Some(o) = outgoing {
+                        // Symmetrically: a peer that acknowledges more than we
+                        // managed to send has not received what it thinks.
+                        if o.sender.is_complete() {
+                            out.sent.push((*id, o.purpose, o.name));
+                        } else {
+                            out.failed.push((
+                                *id,
+                                "peer reported success before the transfer finished".to_string(),
+                            ));
+                        }
+                    }
+                } else if incoming.is_some() || was_pending || outgoing.is_some() {
                     out.failed.push((*id, message.clone()));
                 }
             }
@@ -972,32 +1083,65 @@ impl TransferManager {
     }
 
     /// Emit as many chunks for one transfer as its window allows.
-    fn pump_one(&mut self, id: u64, out: &mut Outcome) {
-        let Some(o) = self.outgoing.get_mut(&id) else {
-            return;
-        };
-        if !o.accepted {
+    /// Emit chunks for every outgoing transfer, within the global budget.
+    ///
+    /// This replaced a per-transfer `pump_one(id)`, and the replacement has to
+    /// be total: a transfer that stops early because the budget was exhausted
+    /// is only ever resumed by a later pump, so any call site still pumping a
+    /// single id would leave the others hanging forever.
+    fn pump(&mut self, out: &mut Outcome) {
+        if self.outgoing.is_empty() {
             return;
         }
-        loop {
-            match o.sender.next_chunk() {
-                Ok(Some((seq, data))) => out.replies.push(Message::TransferData { id, seq, data }),
-                Ok(None) => break,
-                Err(e) => {
-                    self.outgoing.remove(&id);
-                    out.replies.push(Message::TransferEnd {
-                        id,
-                        ok: false,
-                        message: e.to_string(),
-                    });
-                    out.failed.push((id, e.to_string()));
-                    return;
+        let mut ids: Vec<u64> = self.outgoing.keys().copied().collect();
+        ids.sort_unstable();
+        let start = (self.pump_cursor % ids.len() as u64) as usize;
+        ids.rotate_left(start);
+        self.pump_cursor = self.pump_cursor.wrapping_add(1);
+
+        let in_flight: u32 = self.outgoing.values().map(|o| o.sender.in_flight()).sum();
+        let mut budget = GLOBAL_WINDOW_CHUNKS.saturating_sub(in_flight);
+        // Collected rather than removed inline: the loop below holds a mutable
+        // borrow of `self.outgoing` for the transfer it is working on.
+        let mut failed: Vec<(u64, String)> = Vec::new();
+
+        for id in ids {
+            if budget == 0 {
+                break;
+            }
+            let Some(o) = self.outgoing.get_mut(&id) else {
+                continue;
+            };
+            if !o.accepted {
+                continue;
+            }
+            while budget > 0 {
+                match o.sender.next_chunk() {
+                    Ok(Some((seq, data))) => {
+                        out.replies.push(Message::TransferData { id, seq, data });
+                        budget -= 1;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        failed.push((id, e.to_string()));
+                        break;
+                    }
                 }
             }
         }
-        // The record stays until the peer confirms with TransferEnd: that is
-        // what tells us the bytes actually landed, and lets a late failure be
-        // reported against the right transfer.
+
+        for (id, message) in failed {
+            self.outgoing.remove(&id);
+            out.replies.push(Message::TransferEnd {
+                id,
+                ok: false,
+                message: message.clone(),
+            });
+            out.failed.push((id, message));
+        }
+        // A successful record stays until the peer confirms with TransferEnd:
+        // that is what tells us the bytes actually landed, and it lets a late
+        // failure be reported against the right transfer.
     }
 
     /// Describe a transfer in flight: its purpose, name and progress.
@@ -1152,6 +1296,175 @@ mod manager_tests {
         assert_eq!(back.failed.len(), 1);
         assert!(back.failed[0].1.contains("declined"), "{:?}", back.failed);
         assert_eq!(client.in_flight(), (0, 0));
+    }
+
+    /// Many concurrent transfers must not queue N windows ahead of a frame.
+    ///
+    /// `WINDOW_CHUNKS` bounds one transfer, and the module's stated promise --
+    /// that a frame waits for at most one chunk -- is about the queue. With the
+    /// per-transfer window only, eight concurrent transfers put eight windows,
+    /// four megabytes, in front of the next screen update; staging a clipboard
+    /// file copy fans out one transfer per file, so that is the ordinary case
+    /// rather than a contrived one.
+    ///
+    /// The measurement is taken at acceptance, because that is when a fan-out
+    /// queues its opening burst and where the difference actually shows.
+    #[test]
+    fn concurrent_transfers_share_one_queue_budget() {
+        const N: usize = 8;
+        let mut m = TransferManager::new(true);
+        let mut policy = MemoryPolicy;
+        let payload = vec![7u8; CHUNK_SIZE * (WINDOW_CHUNKS as usize + 4)];
+
+        let mut queued = 0usize;
+        for _ in 0..N {
+            let offer = m.offer_bytes(TransferPurpose::FileUpload, "f".into(), payload.clone());
+            let Message::TransferOffer { id, .. } = offer else {
+                panic!("offer_bytes did not produce an offer");
+            };
+            let out = m
+                .handle(
+                    &Message::TransferAccept {
+                        id,
+                        accepted: true,
+                        reason: String::new(),
+                    },
+                    &mut policy,
+                )
+                .expect("accept handled");
+            queued += out
+                .replies
+                .iter()
+                .filter(|r| matches!(r, Message::TransferData { .. }))
+                .count();
+        }
+
+        assert!(
+            queued <= GLOBAL_WINDOW_CHUNKS as usize,
+            "{queued} chunks queued across {N} transfers; the budget is {GLOBAL_WINDOW_CHUNKS}"
+        );
+        // Without a global budget every transfer queues its own full window, so
+        // this is the number the fix has to beat.
+        assert!(
+            queued < N * WINDOW_CHUNKS as usize,
+            "the per-transfer window was the only thing bounding the queue"
+        );
+    }
+
+    /// Neither side will hold an unbounded amount of a transfer in memory.
+    ///
+    /// Both endpoints' policies accepted a `ClipboardImage` straight into
+    /// `Sink::Memory` while explicitly ignoring the offered size, and nothing
+    /// capped how many were in flight, so a handful of 2 GiB offers pushed the
+    /// peer out of memory. The limits live in the manager because a rule
+    /// repeated in two policies on two sides of a protocol is one that
+    /// eventually gets applied on only one of them.
+    #[test]
+    fn in_memory_transfers_are_bounded_in_size_and_number() {
+        let mut m = TransferManager::new(true);
+        let mut policy = MemoryPolicy;
+
+        let offer = |id: u64, size: u64| Message::TransferOffer {
+            id,
+            purpose: TransferPurpose::ClipboardImage,
+            name: "clip.png".into(),
+            size,
+        };
+        let accepted = |out: &Outcome| {
+            matches!(
+                out.replies.as_slice(),
+                [Message::TransferAccept { accepted: true, .. }]
+            )
+        };
+
+        // Too large for memory, but well under MAX_TRANSFER_SIZE, so the old
+        // size check let it straight through.
+        let out = m
+            .handle(&offer(1, MAX_MEMORY_TRANSFER_SIZE + 1), &mut policy)
+            .unwrap();
+        assert!(!accepted(&out), "an oversized in-memory offer was accepted");
+
+        // The permitted number may be in flight at once...
+        for id in 0..MAX_CONCURRENT_MEMORY_TRANSFERS as u64 {
+            let out = m.handle(&offer(100 + id, 1024), &mut policy).unwrap();
+            assert!(accepted(&out), "offer {id} within the budget was refused");
+        }
+        // ...and one more is not.
+        let out = m.handle(&offer(200, 1024), &mut policy).unwrap();
+        assert!(!accepted(&out), "the concurrency budget was not enforced");
+
+        // Finishing one releases the budget again, on the ordinary path.
+        m.handle(
+            &Message::TransferData {
+                id: 100,
+                seq: 0,
+                data: vec![0u8; 1024],
+            },
+            &mut policy,
+        )
+        .unwrap();
+        let out = m.handle(&offer(201, 1024), &mut policy).unwrap();
+        assert!(
+            accepted(&out),
+            "the budget was not released when a transfer completed"
+        );
+    }
+
+    /// A peer claiming success mid-transfer must not produce a silent
+    /// truncated file.
+    ///
+    /// `TransferEnd { ok: true }` used to drop the receiver without calling
+    /// `finish()`, so the truncation check never ran. The short file was left
+    /// at exactly the path the user asked for, nothing was reported, and the
+    /// requester went on waiting for a transfer that had already ended.
+    #[test]
+    fn a_premature_success_is_reported_as_a_failure() {
+        // `true` = the initiating side; irrelevant here, we only receive.
+        let mut m = TransferManager::new(true);
+        let mut policy = MemoryPolicy;
+        let id = 1;
+        let out = m
+            .handle(
+                &Message::TransferOffer {
+                    id,
+                    purpose: TransferPurpose::FileDownload,
+                    name: "f.bin".into(),
+                    size: 4096,
+                },
+                &mut policy,
+            )
+            .expect("offer handled");
+        assert!(matches!(
+            out.replies.as_slice(),
+            [Message::TransferAccept { accepted: true, .. }]
+        ));
+
+        // One short chunk, then the sender claims it is done.
+        m.handle(
+            &Message::TransferData {
+                id,
+                seq: 0,
+                data: vec![0u8; 16],
+            },
+            &mut policy,
+        )
+        .expect("chunk handled");
+        let out = m
+            .handle(
+                &Message::TransferEnd {
+                    id,
+                    ok: true,
+                    message: String::new(),
+                },
+                &mut policy,
+            )
+            .expect("end handled");
+
+        assert!(
+            out.completed.is_empty(),
+            "a 16-byte prefix of a 4096-byte file was reported as complete"
+        );
+        assert_eq!(out.failed.len(), 1, "truncation was not reported: {out:?}");
     }
 
     #[test]

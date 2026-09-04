@@ -17,14 +17,43 @@
 //! able to answer a conversion request promptly; deferring a reply until a
 //! blob arrived over the network would block the pasting application.
 //!
-//! `INCR` transfers are handled in both directions, so content larger than
-//! the X server's maximum request size works rather than silently truncating.
+//! Incoming `INCR` transfers are handled, so a session application offering
+//! content larger than the X server's maximum request size is read in full
+//! rather than truncated.
+//!
+//! Outgoing `INCR` is *not* implemented: when the client puts something on the
+//! clipboard that will not fit in one `ChangeProperty`, that format is declined
+//! (`property: NONE`) and left out of `TARGETS`, so the pasting application
+//! falls back to a format that fits instead of receiving nothing. Until this
+//! gap is closed, a very large image copied on the client cannot be pasted into
+//! a session application -- which is a limitation, where propagating the
+//! resulting protocol error used to end the whole session.
+//!
+//! # One conversion at a time, but never a dropped one
+//!
+//! Only one conversion may be outstanding: an X selection transfer is a
+//! conversation with another client conducted through one property on one
+//! window, and running two of them at once would interleave their `INCR`
+//! chunks. Requests that arrive meanwhile are therefore queued rather than
+//! dropped. Dropping them was not an edge case -- a client that has just been
+//! offered PNG and FILES asks for both in the same burst, and the second
+//! request used to be answered with nothing at all, so that format never
+//! arrived and the paste stayed pending forever.
+//!
+//! Every conversion also carries a deadline. `ConvertSelection` has no timeout
+//! of its own, and a selection owner that never replies would otherwise block
+//! every later clipboard read until some other application happened to take
+//! the selection.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use lynxrdp_proto::message::clipboard_format;
-use x11rb::connection::Connection;
+// RequestConnection carries `maximum_request_bytes`. It is a supertrait of
+// Connection, but Rust still wants the defining trait in scope to call it.
+use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::xproto::{
     self, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Property,
     SelectionNotifyEvent, SelectionRequestEvent, WindowClass, SELECTION_NOTIFY_EVENT,
@@ -40,6 +69,16 @@ pub const MAX_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
 /// Largest clipboard image accepted in either direction (64 MiB). Images are
 /// held in memory on both sides, so this bounds that cost.
 pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long a conversion may go unanswered before it is abandoned.
+///
+/// This bounds *silence*, not the length of a transfer: an `INCR` transfer
+/// refreshes the deadline on every chunk, so a 64 MiB image arriving in
+/// property-sized pieces is legitimately slow and stays welcome, while an
+/// owner that has stopped answering is cut loose. Ten seconds is far longer
+/// than any healthy toolkit takes to serialise a selection and short enough
+/// that a user who pressed Ctrl+V is still connecting cause and effect.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Atoms {
     clipboard: xproto::Atom,
@@ -66,6 +105,8 @@ struct Fetch {
     buf: Vec<u8>,
     /// Whether a plain `STRING` fallback has already been tried.
     tried_string: bool,
+    /// When to give up. Refreshed by every sign of life from the owner.
+    deadline: Instant,
 }
 
 /// What the session's clipboard did.
@@ -96,6 +137,12 @@ pub struct Clipboard {
     /// Staged files we are currently offering to the session, if any.
     owned_files: Option<Vec<std::path::PathBuf>>,
     fetch: Option<Fetch>,
+    /// Formats asked for while another conversion was outstanding.
+    ///
+    /// Bounded by construction: only the three known [`clipboard_format`]
+    /// values can be enqueued and each appears at most once, so this holds
+    /// three entries at the very most however hard a client pushes.
+    queue: VecDeque<u32>,
     /// Formats the current session-side owner advertised.
     available: u32,
     /// Last text reported upwards, to suppress echoes.
@@ -157,6 +204,7 @@ impl Clipboard {
             owned_png: None,
             owned_files: None,
             fetch: None,
+            queue: VecDeque::new(),
             available: 0,
             last_text: None,
             owner_time: x11rb::CURRENT_TIME,
@@ -236,26 +284,146 @@ impl Clipboard {
     /// Ask the session's clipboard owner for one format. The result arrives
     /// from [`Clipboard::handle_event`] as [`ClipboardEvent::Image`] (or
     /// [`ClipboardEvent::Unavailable`]).
+    ///
+    /// A request made while another conversion is outstanding is queued, not
+    /// refused. This is the ordinary case rather than a corner one: an offer of
+    /// PNG and FILES draws two requests from the client back to back, both
+    /// arrive in the same drain of its message channel, and the second used to
+    /// be discarded with a debug line and no reply at all.
     pub fn request_format(&mut self, format: u32) -> Result<()> {
         if self.available & format == 0 {
             return Ok(());
         }
-        if self.fetch.is_some() {
-            // One conversion at a time; the caller can ask again later.
-            log::debug!("clipboard fetch already in flight, ignoring request");
+        let Some(target) = self.target_for(format) else {
+            return Ok(());
+        };
+        // Already coming, or already waiting: asking twice would convert the
+        // same selection twice for one paste. This is tested before the
+        // in-flight check rather than inside it, because the queue can briefly
+        // outlive the fetch it was waiting behind -- `start_next` runs only
+        // from the event tail, so an X error on the way out of `dispatch`
+        // leaves entries in place with nothing in flight. Starting one of them
+        // here as if it were new would convert it twice and offer the client
+        // two copies of the same paste.
+        if self.fetch.as_ref().is_some_and(|f| f.format == format) || self.queue.contains(&format) {
             return Ok(());
         }
-        let target = match format {
-            f if f == clipboard_format::PNG => self.atoms.png,
-            f if f == clipboard_format::FILES => self.atoms.uri_list,
-            f if f == clipboard_format::TEXT => self.atoms.utf8_string,
-            _ => return Ok(()),
-        };
+        if self.fetch.is_some() || !self.queue.is_empty() {
+            log::debug!("clipboard: queueing a request for format {format:#x}");
+            self.queue.push_back(format);
+            return Ok(());
+        }
         self.request(target, format, self.owner_time)
     }
 
+    /// The X target atom that produces `format`, if we can ask for it at all.
+    fn target_for(&self, format: u32) -> Option<xproto::Atom> {
+        match format {
+            f if f == clipboard_format::PNG => Some(self.atoms.png),
+            f if f == clipboard_format::FILES => Some(self.atoms.uri_list),
+            f if f == clipboard_format::TEXT => Some(self.atoms.utf8_string),
+            _ => None,
+        }
+    }
+
     /// Feed an X event, producing any clipboard activity it implies.
+    ///
+    /// The tail of this function is the *only* place a queued conversion is
+    /// started. Draining at each site that clears `fetch` would be wrong twice
+    /// over: `on_selection_notify` deliberately re-arms it with a plain
+    /// `STRING` fallback when a UTF-8 conversion is refused, and `on_targets`
+    /// deliberately re-arms it to pull text eagerly. Both survive because
+    /// `start_next` refuses to act while any fetch exists, so the queue can
+    /// only ever fill a genuine gap.
     pub fn handle_event(&mut self, ev: &Event) -> Result<Vec<ClipboardEvent>> {
+        let mut events = self.dispatch(ev)?;
+        // Expire after dispatching, not before: a reply that arrives in the
+        // same wake-up as the deadline came from a live owner, not a wedged
+        // one, and abandoning it would throw away a paste that did work.
+        events.extend(self.expire_fetch());
+        events.extend(self.start_next()?);
+        Ok(events)
+    }
+
+    /// Advance the clipboard without an X event.
+    ///
+    /// [`Clipboard::handle_event`] can only notice a wedged selection owner
+    /// when some other X event happens to arrive, and a desktop with nothing
+    /// moving on it produces none -- which is exactly the state a session is in
+    /// while its user waits on a paste. Calling this from the session's
+    /// housekeeping tick is what bounds the wait in that case; it is otherwise
+    /// cheap and does nothing.
+    pub fn tick(&mut self) -> Result<Vec<ClipboardEvent>> {
+        let mut events = self.expire_fetch();
+        events.extend(self.start_next()?);
+        Ok(events)
+    }
+
+    /// Abandon a conversion whose deadline has passed.
+    ///
+    /// The queue is left alone: whatever is waiting behind the dead request is
+    /// addressed to the same owner, but it is a different target and may well
+    /// be one the owner can answer, so `start_next` gets to try it.
+    fn expire_fetch(&mut self) -> Vec<ClipboardEvent> {
+        let Some(fetch) = self.fetch.as_ref() else {
+            return Vec::new();
+        };
+        if Instant::now() < fetch.deadline {
+            return Vec::new();
+        }
+        let (format, target) = (fetch.format, fetch.target);
+        log::warn!(
+            "clipboard: the selection owner did not answer a conversion to atom {target} \
+             within {}s; abandoning it",
+            FETCH_TIMEOUT.as_secs()
+        );
+        self.fetch = None;
+        if target == self.atoms.targets {
+            // Nobody was promised anything: TARGETS is asked for on our own
+            // initiative, before the far end has been told a thing.
+            Vec::new()
+        } else {
+            vec![ClipboardEvent::Unavailable(format)]
+        }
+    }
+
+    /// Start the next queued conversion, if nothing is in flight.
+    fn start_next(&mut self) -> Result<Vec<ClipboardEvent>> {
+        let mut events = Vec::new();
+        while self.fetch.is_none() {
+            let Some(format) = self.queue.pop_front() else {
+                break;
+            };
+            // Belt and braces: the queue is emptied on an owner change, so a
+            // format the current owner does not offer should be impossible.
+            match self.target_for(format) {
+                Some(target) if self.available & format != 0 => {
+                    self.request(target, format, self.owner_time)?;
+                }
+                _ => events.push(ClipboardEvent::Unavailable(format)),
+            }
+        }
+        Ok(events)
+    }
+
+    /// Drop the outstanding conversion and everything queued behind it,
+    /// telling the far end that none of it is coming.
+    ///
+    /// Silence is the one answer we must not give: the client shows a paste as
+    /// pending until it hears something, so an abandoned conversion has to come
+    /// back as `Unavailable` even though nothing went wrong on the wire.
+    fn cancel_all(&mut self) -> Vec<ClipboardEvent> {
+        let mut events = Vec::new();
+        if let Some(fetch) = self.fetch.take() {
+            if fetch.target != self.atoms.targets {
+                events.push(ClipboardEvent::Unavailable(fetch.format));
+            }
+        }
+        events.extend(self.queue.drain(..).map(ClipboardEvent::Unavailable));
+        events
+    }
+
+    fn dispatch(&mut self, ev: &Event) -> Result<Vec<ClipboardEvent>> {
         match ev {
             Event::XfixesSelectionNotify(e) if e.selection == self.atoms.clipboard => {
                 if e.owner == self.window {
@@ -264,14 +432,18 @@ impl Clipboard {
                 self.owned_text = None;
                 self.owned_png = None;
                 self.available = 0;
+                // Anything in flight or queued was addressed to the previous
+                // owner and its format list. That owner has gone and will never
+                // answer, and the formats were indexes into a list that no
+                // longer applies, so none of it may be carried across.
+                let events = self.cancel_all();
                 if e.owner == x11rb::NONE {
-                    return Ok(Vec::new());
+                    return Ok(events);
                 }
                 self.owner_time = e.timestamp;
                 // Learn what the new owner can produce before fetching.
-                self.fetch = None;
                 self.request(self.atoms.targets, 0, e.timestamp)?;
-                Ok(Vec::new())
+                Ok(events)
             }
             Event::SelectionNotify(e) if e.requestor == self.window => self.on_selection_notify(e),
             Event::PropertyNotify(e)
@@ -319,6 +491,7 @@ impl Clipboard {
             incr: false,
             buf: Vec::new(),
             tried_string: target == AtomEnum::STRING.into(),
+            deadline: Instant::now() + FETCH_TIMEOUT,
         });
         Ok(())
     }
@@ -327,6 +500,24 @@ impl Clipboard {
         let Some(fetch) = self.fetch.as_mut() else {
             return Ok(Vec::new());
         };
+        if e.target != fetch.target {
+            // An answer to a conversion we already gave up on. Since the
+            // deadline exists, a slow owner can reply after we have moved on
+            // to the next queued format, and every conversion lands in the
+            // same property -- so the echoed target (ICCCM 2.2 requires both
+            // the owner and the server to copy it from the request) is the
+            // only thing that tells them apart. Accepting one would hand the
+            // live fetch someone else's bytes and report, say, a text
+            // selection to the client as a PNG. Leaving the property untouched
+            // is safe: the owner we are actually waiting on writes it before
+            // sending its own notify.
+            log::debug!(
+                "clipboard: ignoring a late SelectionNotify for atom {} while converting atom {}",
+                e.target,
+                fetch.target
+            );
+            return Ok(Vec::new());
+        }
         if e.property == x11rb::NONE {
             // The owner refused this conversion.
             let (format, tried_string, target) = (fetch.format, fetch.tried_string, fetch.target);
@@ -357,6 +548,9 @@ impl Clipboard {
             // Deleting the property (done above) starts the INCR transfer.
             fetch.incr = true;
             fetch.buf.clear();
+            // A transfer that is only now beginning gets the full deadline for
+            // its first chunk rather than whatever the handshake left of it.
+            fetch.deadline = Instant::now() + FETCH_TIMEOUT;
             return Ok(Vec::new());
         }
         if fetch.target == self.atoms.targets {
@@ -443,6 +637,9 @@ impl Clipboard {
             self.fetch = None;
             return Ok(vec![ClipboardEvent::Unavailable(format)]);
         }
+        // Every chunk is a sign of life, so the deadline bounds the gap
+        // between chunks rather than the length of the whole transfer.
+        fetch.deadline = Instant::now() + FETCH_TIMEOUT;
         fetch.buf.extend_from_slice(&reply.value);
         Ok(Vec::new())
     }
@@ -495,25 +692,65 @@ impl Clipboard {
         Ok(())
     }
 
+    /// The largest payload one `ChangeProperty` can carry on this connection.
+    ///
+    /// The X maximum request length is a property of the connection (and of
+    /// whether BIG-REQUESTS was negotiated), not a constant: it is around
+    /// 256 KiB without the extension and 16 MiB with it. A `change_property8`
+    /// over that limit is a protocol error, and a protocol error here used to
+    /// end the session.
+    ///
+    /// The real fix for an oversized selection is outgoing INCR, which this
+    /// module does not implement in that direction. Until it does, an
+    /// unservable format is better declined than promised: `serve` returns
+    /// `Ok(false)`, which `on_selection_request` turns into the
+    /// protocol-correct `property: NONE`, and it is left out of `TARGETS` so
+    /// the pasting application falls back to a format that does fit instead of
+    /// choosing one that cannot work.
+    fn max_property_bytes(&self) -> usize {
+        // The ChangeProperty header is 24 bytes; leave a little more than that
+        // so a rounding difference cannot turn into a protocol error.
+        self.display
+            .conn()
+            .maximum_request_bytes()
+            .saturating_sub(64)
+    }
+
+    /// The `text/uri-list` payload for the files currently owned, if any.
+    fn uri_list_payload(&self, gnome: bool) -> Option<String> {
+        let files = self.owned_files.as_ref()?;
+        let list = lynxrdp_proto::urilist::build(files);
+        // GNOME's variant is the same list prefixed with the operation.
+        Some(if gnome {
+            format!("copy\n{}", list.replace("\r\n", "\n"))
+        } else {
+            list
+        })
+    }
+
     /// Answer one conversion request; returns whether it was satisfied.
     fn serve(&mut self, e: &SelectionRequestEvent, property: xproto::Atom) -> Result<bool> {
         if e.selection != self.atoms.clipboard {
             return Ok(false);
         }
+        let limit = self.max_property_bytes();
         let conn = self.display.conn();
         if e.target == self.atoms.targets {
             let mut list = vec![self.atoms.targets, self.atoms.timestamp];
-            if self.owned_text.is_some() {
+            if self.owned_text.as_ref().is_some_and(|t| t.len() <= limit) {
                 list.extend([
                     self.atoms.utf8_string,
                     self.atoms.text,
                     AtomEnum::STRING.into(),
                 ]);
             }
-            if self.owned_png.is_some() {
+            if self.owned_png.as_ref().is_some_and(|p| p.len() <= limit) {
                 list.push(self.atoms.png);
             }
-            if self.owned_files.is_some() {
+            if self
+                .uri_list_payload(false)
+                .is_some_and(|l| l.len() <= limit)
+            {
                 list.push(self.atoms.uri_list);
                 list.push(self.atoms.gnome_copied);
             }
@@ -537,16 +774,17 @@ impl Clipboard {
             return Ok(true);
         }
         if e.target == self.atoms.uri_list || e.target == self.atoms.gnome_copied {
-            let Some(files) = self.owned_files.as_ref() else {
+            let Some(payload) = self.uri_list_payload(e.target == self.atoms.gnome_copied) else {
                 return Ok(false);
             };
-            let list = lynxrdp_proto::urilist::build(files);
-            // GNOME's variant is the same list prefixed with the operation.
-            let payload = if e.target == self.atoms.gnome_copied {
-                format!("copy\n{}", list.replace("\r\n", "\n"))
-            } else {
-                list
-            };
+            if payload.len() > limit {
+                log::warn!(
+                    "clipboard: file list of {} bytes exceeds the {limit}-byte \
+                     property limit; declining the conversion",
+                    payload.len()
+                );
+                return Ok(false);
+            }
             conn.change_property8(
                 PropMode::REPLACE,
                 e.requestor,
@@ -560,6 +798,16 @@ impl Clipboard {
             let Some(png) = self.owned_png.as_ref() else {
                 return Ok(false);
             };
+            if png.len() > limit {
+                // The common way to reach this: copy a large screenshot on the
+                // client, then press Ctrl+V in the session.
+                log::warn!(
+                    "clipboard: PNG of {} bytes exceeds the {limit}-byte property \
+                     limit; declining the conversion",
+                    png.len()
+                );
+                return Ok(false);
+            }
             conn.change_property8(
                 PropMode::REPLACE,
                 e.requestor,
@@ -572,6 +820,14 @@ impl Clipboard {
         let Some(text) = self.owned_text.as_ref() else {
             return Ok(false);
         };
+        if text.len() > limit {
+            log::warn!(
+                "clipboard: text of {} bytes exceeds the {limit}-byte property \
+                 limit; declining the conversion",
+                text.len()
+            );
+            return Ok(false);
+        }
         if e.target == self.atoms.utf8_string || e.target == self.atoms.text {
             conn.change_property8(
                 PropMode::REPLACE,

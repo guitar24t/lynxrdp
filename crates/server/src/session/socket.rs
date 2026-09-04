@@ -191,4 +191,54 @@ mod tests {
         sock.shutdown();
         assert_eq!(t.join().unwrap(), 0);
     }
+
+    /// A writer wedged against a peer that stopped reading is freed by
+    /// `shutdown`, and by nothing else.
+    ///
+    /// This is the property `Core::drop_client` depends on. It used to close
+    /// the writer's queue and *then* join the writer before shutting the socket
+    /// down, which is only correct when the writer is waiting on the queue. A
+    /// writer blocked inside `write_all` on a socket whose peer has stopped
+    /// reading -- a client that went to sleep behind sshd -- never looks at the
+    /// queue again, so the join was unbounded and it ran on the session core
+    /// thread, taking the whole desktop with it.
+    #[test]
+    fn shutdown_frees_a_writer_blocked_on_a_full_socket() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (s, _) = l.accept().unwrap();
+        let sock = ClientSocket::from_tcp(s);
+
+        // Deliberately never read from `client`. Enough data to overflow both
+        // the sender's send buffer and the receiver's receive window, so the
+        // write cannot complete no matter how the kernel sizes them.
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut w = sock.clone();
+        let writer = std::thread::spawn(move || {
+            let big = vec![0u8; 8 * 1024 * 1024];
+            let r = w.write_all(&big);
+            let _ = done_tx.send(());
+            r
+        });
+
+        // It must still be stuck: nothing has drained the peer.
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "writer completed against a peer that never read; the test is not \
+             exercising a blocked write"
+        );
+
+        let started = Instant::now();
+        sock.shutdown();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown did not free the blocked writer");
+        assert!(writer.join().unwrap().is_err(), "write should have failed");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        drop(client);
+    }
 }

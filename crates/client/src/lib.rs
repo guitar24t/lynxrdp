@@ -12,6 +12,7 @@
 pub const APP_ID: &str = "lynxrdp";
 
 pub mod app;
+pub mod clipchange;
 pub mod connection;
 pub mod console;
 pub mod fileclip;
@@ -20,7 +21,10 @@ pub mod imageclip;
 pub mod keymap;
 pub mod launch;
 pub mod launcher;
+pub mod overlay;
 pub mod profiles;
+pub mod settings;
+pub mod theme;
 pub mod tunnel;
 
 /// Name reported to the server.

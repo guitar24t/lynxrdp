@@ -4,7 +4,6 @@
 //! `lynxrdpd --supervise ...` so that it is a fresh single-threaded process.
 
 use std::collections::BTreeMap;
-use std::ffi::CString;
 use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -14,6 +13,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use anyhow::{bail, Context, Result};
 
 use super::pam::Pam;
+use super::users::group_ids;
 
 /// Everything the supervisor needs to know.
 #[derive(Clone, Debug)]
@@ -104,6 +104,24 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
         bail!("cannot switch to uid {} without root privileges", args.uid);
     }
 
+    // Resolve the user's groups here: in the parent, before PAM, and long
+    // before the fork. `pre_exec` called `initgroups(3)`, which does this
+    // lookup in the forked child, where only async-signal-safe calls are
+    // allowed and NSS is emphatically not one -- and by then libpam has
+    // dlopen'ed the name service stack into this process, so the very locks
+    // that lookup needs may have been held by another thread at fork time.
+    //
+    // Doing it before `pam_open_session` as well as before the fork means a
+    // failure here costs nothing: there is no session to close and nothing to
+    // unwind, and the spawn simply does not happen. It must not proceed:
+    // see `group_ids` for why an empty list is not an acceptable fallback.
+    let groups: Vec<libc::gid_t> = if need_switch {
+        group_ids(&args.user, args.gid)
+            .with_context(|| format!("resolving the groups of {}", args.user))?
+    } else {
+        Vec::new()
+    };
+
     // PAM session (only meaningful when we are root).
     let pam = match (&args.pam_service, own_uid) {
         (Some(service), 0) if std::path::Path::new(&format!("/etc/pam.d/{service}")).exists() => {
@@ -159,7 +177,8 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
     }
     let (control_fd, log_fd) = (args.control_fd, args.log_fd);
     let (uid, gid) = (args.uid, args.gid);
-    let c_user = CString::new(args.user.as_str())?;
+    // Captured before the fork so the child can tell whether we are still here.
+    let parent_pid = std::process::id() as libc::pid_t;
     // SAFETY: only async-signal-safe calls in the child before exec.
     unsafe {
         cmd.pre_exec(move || {
@@ -189,7 +208,9 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
             // from us. Serving our own uid needs no change and must not try to
             // drop privileges.
             if need_switch && libc::getuid() == 0 {
-                if libc::initgroups(c_user.as_ptr(), gid) != 0 {
+                // setgroups, not initgroups: the list was resolved above, in
+                // the parent, and all that is left here is the bare syscall.
+                if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::setgid(gid) != 0 {
@@ -203,6 +224,27 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
                 if uid != 0 && libc::setuid(0) == 0 {
                     return Err(std::io::Error::other("privilege drop failed"));
                 }
+            }
+            // Die with the supervisor.
+            //
+            // This must come *after* the credential switch above: the kernel
+            // clears the parent-death signal on any uid change (commit_creds),
+            // so setting it earlier would leave it silently unset -- which is
+            // precisely the state that let a SIGKILLed supervisor orphan
+            // lynxrdp-session, and with it Xvfb, the desktop, and the user's
+            // logind session, on an unlinked socket, indefinitely.
+            //
+            // Xvfb and the desktop already have this link to the session; the
+            // session did not have one to the supervisor, so the chain broke at
+            // exactly the point the daemon reaches for when a handoff fails.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Close the race the flag cannot: if the supervisor died between
+            // the fork and the prctl above, the signal has already been sent
+            // and missed, and this child would run on forever unattached.
+            if libc::getppid() != parent_pid {
+                libc::_exit(1);
             }
             Ok(())
         });
@@ -253,6 +295,17 @@ mod tests {
             session_binary: PathBuf::from("/usr/bin/lynxrdp-session"),
             session_args: vec![],
         }
+    }
+
+    #[test]
+    fn the_group_list_handed_to_setgroups_is_never_empty() {
+        // The child calls setgroups with exactly what this produced, so an
+        // empty list would mean stripping the user of every supplementary
+        // group -- video, audio, input -- rather than leaving them alone.
+        let root = crate::daemon::users::user_by_uid(0).unwrap();
+        let groups = group_ids(&root.name, root.gid).unwrap();
+        assert!(!groups.is_empty());
+        assert!(groups.contains(&root.gid), "{groups:?}");
     }
 
     #[test]

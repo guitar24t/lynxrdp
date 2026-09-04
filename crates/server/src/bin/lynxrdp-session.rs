@@ -65,7 +65,7 @@ struct Args {
     /// Maximum screen height.
     #[arg(long, default_value_t = 2160)]
     max_height: u32,
-    /// DPI reported by the X server.
+    /// DPI reported by the X server (48 to 480; clamped).
     #[arg(long, default_value_t = 96)]
     dpi: u32,
     /// Command that starts the desktop ("none" to start nothing).
@@ -74,9 +74,14 @@ struct Args {
     /// Frame rate cap.
     #[arg(long, default_value_t = 60)]
     max_fps: u32,
-    /// Frames in flight before waiting for acknowledgements.
+    /// Frames in flight before waiting for acknowledgements (a floor unless
+    /// --no-auto-in-flight is given).
     #[arg(long, default_value_t = 2)]
     max_in_flight: u32,
+    /// Hold the in-flight window at --max-in-flight instead of letting the
+    /// session raise it to suit the round trip it measures.
+    #[arg(long)]
+    no_auto_in_flight: bool,
     /// Exit when the client disconnects.
     #[arg(long)]
     exit_on_disconnect: bool,
@@ -148,6 +153,15 @@ fn run() -> Result<i32> {
     }
     let username = args.username.clone().unwrap_or_else(current_username);
     let runtime_dir = args.runtime_dir.clone().unwrap_or_else(default_runtime_dir);
+    // Clamped here and not only in `Config::validate`, because user mode never
+    // goes near a config file: `lynxrdp-session --dpi 0` reaches RANDR
+    // directly, and a physical size computed from zero DPI is `u32::MAX`
+    // millimetres, which every toolkit in the session then reads back as a DPI
+    // of zero. The same bounds the config file enforces.
+    let dpi = args.dpi.clamp(48, 480);
+    if dpi != args.dpi {
+        log::warn!("--dpi {} is out of range; using {dpi}", args.dpi);
+    }
 
     // 1. X server.
     let (xserver, display_name) = match &args.display {
@@ -158,7 +172,7 @@ fn run() -> Result<i32> {
                 extra_args: args.xserver_args.clone(),
                 max_width: args.max_width.max(args.width),
                 max_height: args.max_height.max(args.height),
-                dpi: args.dpi,
+                dpi,
                 runtime_dir: runtime_dir.clone(),
             };
             let xs = XServer::spawn(&cfg)?;
@@ -176,7 +190,7 @@ fn run() -> Result<i32> {
     // Size the screen before starting the desktop so it lays out correctly.
     if xserver.is_some() {
         if let Err(e) =
-            lynxrdp_server::x11::resize::resize_screen(&display, args.width, args.height)
+            lynxrdp_server::x11::resize::resize_screen(&display, args.width, args.height, dpi)
         {
             log::warn!("initial resize failed: {e:#}");
         }
@@ -245,8 +259,10 @@ fn run() -> Result<i32> {
     let opts = SessionOptions {
         max_fps: args.max_fps.clamp(1, 240),
         max_in_flight: args.max_in_flight.clamp(1, 8),
+        max_in_flight_auto: !args.no_auto_in_flight,
         max_width: args.max_width.max(args.width),
         max_height: args.max_height.max(args.height),
+        dpi,
         default_width: args.width,
         default_height: args.height,
         username,

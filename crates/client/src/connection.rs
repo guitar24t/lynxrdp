@@ -14,7 +14,9 @@ use lynxrdp_proto::codec::Decoder;
 use lynxrdp_proto::frame::{frame_message, read_message, FrameError};
 use lynxrdp_proto::message::{clipboard_format, features, CursorImage};
 use lynxrdp_proto::transfer::{Completed, Sink, TransferManager, TransferPolicy, TransferPurpose};
-use lynxrdp_proto::{Framebuffer, Message, Rect, PROTOCOL_VERSION};
+use lynxrdp_proto::{
+    can_speak, Framebuffer, Message, Rect, MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION,
+};
 
 /// Options for connecting.
 #[derive(Clone, Debug)]
@@ -88,6 +90,13 @@ pub enum ClientEvent {
     ClipboardFiles(Vec<lynxrdp_proto::FileEntry>),
     /// A file finished downloading to this path.
     FileDownloaded {
+        /// Transfer identifier, as returned by [`Client::request_file`].
+        ///
+        /// The id, not the name, is what a caller tracking a batch has to key
+        /// on: a session can copy two files called `notes.txt` from different
+        /// directories in one go, and names stop being unique the moment a
+        /// caller queues transfers across more than one request.
+        id: u64,
         /// Where it was written locally.
         path: PathBuf,
         /// Name the server reported.
@@ -95,6 +104,8 @@ pub enum ClientEvent {
     },
     /// A file finished uploading into the session.
     FileUploaded {
+        /// Transfer identifier, as returned by [`Client::send_file`].
+        id: u64,
         /// Name as offered to the server.
         name: String,
     },
@@ -111,6 +122,52 @@ pub enum ClientEvent {
     Rtt(Duration),
     /// The connection ended.
     Disconnected(String),
+}
+
+/// What every rejection string says, and the only place it is written down.
+const REJECTION_MARK: &str = "rejected (code ";
+
+/// How a rejection from the server is phrased for the user.
+///
+/// A function rather than a `format!` where it happens, because the code has
+/// to be readable back out of the string afterwards: the session window
+/// decides whether a dropped link is worth retrying, and a rejection --
+/// a version floor, a policy refusal -- is precisely the case where retrying
+/// achieves nothing but noise. [`rejection_code`] and [`mentions_rejection`]
+/// are the other half, and all three are tested against each other rather
+/// than against a literal, so the wording can change without quietly turning
+/// every rejection retryable.
+pub fn rejection_reason(code: u16, reason: &str) -> String {
+    format!("{REJECTION_MARK}{code}): {reason}")
+}
+
+/// The code out of a string [`rejection_reason`] produced, if it is one.
+pub fn rejection_code(text: &str) -> Option<u16> {
+    text.strip_prefix(REJECTION_MARK)?
+        .split_once(')')?
+        .0
+        .parse()
+        .ok()
+}
+
+/// Whether a failure reports a rejection, wherever in it that is said.
+///
+/// The question [`rejection_code`] answers is "is this string a rejection",
+/// and that is the wrong one to ask of a reconnection failure: by the time
+/// one reaches the session window it has been through a `Result` chain, and
+/// a single `.context()` anywhere along it turns `rejected (code 3): ...`
+/// into `reconnecting: rejected (code 3): ...`. A rejection that stops being
+/// recognisable is not a cosmetic loss -- it is the whole retry budget spent
+/// re-asking a question whose answer cannot change, and eight refusals in
+/// the server's log for an administrator to explain instead of one.
+///
+/// Nesting does not make it less of a rejection, so searching rather than
+/// matching at the front has no false positive to trade against: the parse
+/// is still `rejection_code`'s, so the two cannot come to disagree about
+/// what the string looks like.
+pub fn mentions_rejection(text: &str) -> bool {
+    text.match_indices(REJECTION_MARK)
+        .any(|(at, _)| rejection_code(&text[at..]).is_some())
 }
 
 /// Accepts what the session sends us.
@@ -132,28 +189,45 @@ impl TransferPolicy for ClientTransferPolicy {
     ) -> Result<Sink, String> {
         match purpose {
             TransferPurpose::ClipboardImage => Ok(Sink::Memory(Vec::new())),
-            TransferPurpose::FileDownload => {
-                let dest = self
-                    .downloads
-                    .get(&id)
-                    .ok_or_else(|| "unsolicited download".to_string())?;
-                if let Some(parent) = dest.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-                    }
-                }
-                let f = std::fs::File::create(dest)
-                    .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
-                Ok(Sink::Stream(Box::new(f)))
-            }
+            TransferPurpose::FileDownload => self.open_download(id),
             // The session never uploads to us.
-            TransferPurpose::FileUpload => Err("unexpected upload offer".into()),
+            TransferPurpose::FileUpload => Err("unexpected upload offer".to_string()),
         }
     }
 }
 
+impl ClientTransferPolicy {
+    fn open_download(&mut self, id: u64) -> Result<Sink, String> {
+        let dest = self
+            .downloads
+            .get(&id)
+            .ok_or_else(|| "unsolicited download".to_string())?;
+        if let Some(parent) = dest.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            }
+        }
+        let f = std::fs::File::create(dest)
+            .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+        Ok(Sink::Stream(Box::new(f)))
+    }
+}
+
 /// Client-side connection state.
+/// Declare the server gone after this long with no message of any kind.
+///
+/// Matches the server's own `PONG_TIMEOUT`, so both ends give up at the same
+/// point rather than one of them holding a connection the other has abandoned.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest single blocking wait inside `poll_event`.
+///
+/// A caller asking to wait a minute must still have the liveness deadline
+/// checked on the way, so the wait is chopped into pieces rather than trusting
+/// the caller to pass something short.
+const POLL_SLICE: Duration = Duration::from_millis(250);
+
 pub struct Client {
     writer: Arc<Mutex<TcpStream>>,
     events: Receiver<Message>,
@@ -165,6 +239,26 @@ pub struct Client {
     frames_received: u64,
     bytes_received: Arc<Mutex<u64>>,
     last_ping: Option<(u64, Instant)>,
+    /// When the last message of any kind arrived from the server.
+    ///
+    /// The server pings every two seconds from the session core thread, so
+    /// "nothing at all for thirty seconds" is an exact test for that thread
+    /// being wedged -- and it is the only test the client has. Without it a
+    /// stuck session shows a frozen screen, accepts input that goes nowhere and
+    /// displays a stale round-trip time indefinitely, because ssh's own
+    /// ServerAliveInterval only fires when the *transport* dies, not when the
+    /// thing behind it stops.
+    last_message_at: Instant,
+    /// Events one server message produced but a single `poll_event` call
+    /// cannot return.
+    ///
+    /// One message routinely resolves more than one transfer -- a
+    /// `TransferAck` pumps every outgoing transfer and can fail several of
+    /// them, and a refusal is reported alongside whatever else the same
+    /// message finished. The old code returned the first and dropped the rest,
+    /// which is invisible until a caller is tracking a set of transfers and
+    /// one of them never resolves.
+    queued: std::collections::VecDeque<ClientEvent>,
     transfers: TransferManager,
     /// Destinations for downloads this client asked for.
     downloads: HashMap<u64, PathBuf>,
@@ -210,6 +304,11 @@ impl Client {
     ) -> Result<Self> {
         stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(opts.timeout))?;
+        // Without this a send into a stalled tunnel blocks forever, and
+        // `Client::send` is called from the winit thread -- including on the
+        // way out, where `exiting()` sends a Disconnect before the shutdown
+        // that would have unblocked it, so the window could not even close.
+        stream.set_write_timeout(Some(opts.timeout))?;
         let (w, h) = opts.size.unwrap_or((0, 0));
         let hello = Message::ClientHello {
             version: PROTOCOL_VERSION,
@@ -223,37 +322,45 @@ impl Client {
         (&stream).write_all(&buf).context("sending hello")?;
 
         let mut reader = BufReader::with_capacity(256 * 1024, stream.try_clone()?);
-        let (info, width, height) = match read_message(&mut reader)
-            .map_err(|e| anyhow!("handshake failed: {e}"))?
-        {
-            Message::ServerHello {
-                version,
-                server_name,
-                features,
-                session_id,
-                username,
-                width,
-                height,
-            } => {
-                if version != PROTOCOL_VERSION {
-                    bail!("server speaks protocol version {version}, this client speaks {PROTOCOL_VERSION}");
+        let (info, width, height) =
+            match read_message(&mut reader).map_err(|e| anyhow!("handshake failed: {e}"))? {
+                Message::ServerHello {
+                    version,
+                    server_name,
+                    features,
+                    session_id,
+                    username,
+                    width,
+                    height,
+                } => {
+                    // The server answers with the version the two of us agreed on,
+                    // which is the older of the pair -- so this is a range check,
+                    // not an equality one. `can_speak` refuses a server below our
+                    // floor (too old to hold a session with) and one above our own
+                    // version (which would mean it ignored the hello we sent).
+                    if !can_speak(version) {
+                        bail!(
+                            "server speaks protocol version {version}; this client supports \
+                         {MIN_COMPATIBLE_VERSION} to {PROTOCOL_VERSION}"
+                        );
+                    }
+                    (
+                        ServerInfo {
+                            server_name,
+                            features,
+                            session_id,
+                            username,
+                        },
+                        u32::from(width),
+                        u32::from(height),
+                    )
                 }
-                (
-                    ServerInfo {
-                        server_name,
-                        features,
-                        session_id,
-                        username,
-                    },
-                    u32::from(width),
-                    u32::from(height),
-                )
-            }
-            Message::Rejected { code, reason } => {
-                bail!("server rejected the connection (code {code}): {reason}")
-            }
-            other => bail!("unexpected message {:?} during handshake", other.kind()),
-        };
+                // Phrased by `rejection_reason` like every other rejection,
+                // because the window reads the code back out of it to decide
+                // whether a reconnection attempt is worth repeating.
+                Message::Rejected { code, reason } => bail!("{}", rejection_reason(code, &reason)),
+                other => bail!("unexpected message {:?} during handshake", other.kind()),
+            };
         stream.set_read_timeout(None)?;
 
         let (tx, rx) = crossbeam_channel::unbounded::<Message>();
@@ -307,6 +414,8 @@ impl Client {
             frames_received: 0,
             bytes_received,
             last_ping: None,
+            last_message_at: Instant::now(),
+            queued: std::collections::VecDeque::new(),
             transfers: TransferManager::new(true),
             downloads: HashMap::new(),
             pending_image: None,
@@ -350,6 +459,19 @@ impl Client {
     /// Reason the connection closed, if it has.
     pub fn closed(&self) -> Option<&str> {
         self.closed.as_deref()
+    }
+
+    /// How long it has been since the server said anything at all.
+    ///
+    /// A better liveness signal than a caller's own ping/pong bookkeeping,
+    /// and the reason it is exposed: *any* message refreshes it, so a session
+    /// that is answering pings but sending nothing else still reads as alive,
+    /// and one whose core thread has wedged reads as quiet within a couple of
+    /// server ping intervals. It starts at the handshake, which is itself
+    /// proof the link was up, so it never lies about a connection too young
+    /// to have been probed.
+    pub fn quiet_for(&self) -> Duration {
+        self.last_message_at.elapsed()
     }
 
     /// Send a message to the server.
@@ -499,6 +621,20 @@ impl Client {
         Ok(id)
     }
 
+    /// Abandon transfer `id` in either direction.
+    ///
+    /// Used when what the transfer was *for* has gone: a clipboard copy
+    /// superseded by the next one is still downloading files nobody will ever
+    /// paste, and each of them holds an open descriptor and a share of the
+    /// global window until it finishes. No event follows -- the caller asked
+    /// for this and already knows.
+    pub fn cancel_transfer(&mut self, id: u64) {
+        self.downloads.remove(&id);
+        if let Some(end) = self.transfers.cancel(id, "no longer wanted") {
+            let _ = self.send(&end);
+        }
+    }
+
     /// Drive the connection until transfer `id` finishes.
     ///
     /// Returns the local path for a completed download. Used by the
@@ -510,9 +646,15 @@ impl Client {
             if remaining.is_zero() {
                 bail!("transfer timed out");
             }
+            // Matched by id rather than by "the next completion of that
+            // shape": nothing stops a caller from having other transfers in
+            // flight, and returning someone else's completion here would
+            // report success for a transfer that is still running.
             match self.poll_event(remaining)? {
-                Some(ClientEvent::FileUploaded { .. }) => return Ok(None),
-                Some(ClientEvent::FileDownloaded { path, .. }) => return Ok(Some(path)),
+                Some(ClientEvent::FileUploaded { id: done, .. }) if done == id => return Ok(None),
+                Some(ClientEvent::FileDownloaded { id: done, path, .. }) if done == id => {
+                    return Ok(Some(path))
+                }
                 Some(ClientEvent::TransferFailed { id: failed, reason }) if failed == id => {
                     bail!("{reason}")
                 }
@@ -536,18 +678,41 @@ impl Client {
     /// Process the next server message, applying frames to the framebuffer
     /// and answering pings. Returns `None` on timeout.
     pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<ClientEvent>> {
+        // Before the closed check, not after: a connection that ends in the
+        // same batch of messages that finished a transfer still owes the
+        // caller the completion, and a batch reported as neither done nor
+        // failed is exactly what leaves a caller waiting forever.
+        if let Some(ev) = self.queued.pop_front() {
+            return Ok(Some(ev));
+        }
         if let Some(reason) = &self.closed {
             return Ok(Some(ClientEvent::Disconnected(reason.clone())));
         }
+        let deadline = Instant::now() + timeout;
         loop {
-            let msg = match self.events.recv_timeout(timeout) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let msg = match self.events.recv_timeout(remaining.min(POLL_SLICE)) {
                 Ok(m) => m,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if self.last_message_at.elapsed() > LIVENESS_TIMEOUT {
+                        let reason = format!(
+                            "no response from the session for {}s",
+                            LIVENESS_TIMEOUT.as_secs()
+                        );
+                        self.closed = Some(reason.clone());
+                        return Ok(Some(ClientEvent::Disconnected(reason)));
+                    }
+                    if remaining <= POLL_SLICE {
+                        return Ok(None);
+                    }
+                    continue;
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     self.closed = Some("reader stopped".into());
                     return Ok(Some(ClientEvent::Disconnected("reader stopped".into())));
                 }
             };
+            self.last_message_at = Instant::now();
             if let Some(ev) = self.handle(msg)? {
                 return Ok(Some(ev));
             }
@@ -560,34 +725,73 @@ impl Client {
     }
 
     /// Feed a message to the transfer manager, sending any replies.
-    /// Returns the event it produced, if any.
+    ///
+    /// Every outcome the message produced is queued, and the first is
+    /// returned; the rest come out of later `poll_event` calls. Nothing is
+    /// dropped, because a caller waiting on a set of transfers cannot tell an
+    /// event that never happened from one that was thrown away.
     fn handle_transfer(&mut self, msg: &Message) -> Option<Result<Option<ClientEvent>>> {
         let mut policy = ClientTransferPolicy {
-            downloads: self.downloads.clone(),
+            // Moved out and back rather than cloned: this runs for every
+            // message on the connection, screen updates included, and staging
+            // a clipboard copy can leave hundreds of entries in the map.
+            downloads: std::mem::take(&mut self.downloads),
         };
-        let outcome = self.transfers.handle(msg, &mut policy)?;
+        let outcome = self.transfers.handle(msg, &mut policy);
+        self.downloads = std::mem::take(&mut policy.downloads);
+        let outcome = outcome?;
         for reply in &outcome.replies {
+            // A refusal is read off the reply rather than reported by the
+            // policy, because the policy is not the only thing that turns an
+            // offer away: `TransferManager` refuses one that is over the size
+            // limit, or that would be the third transfer landing in memory,
+            // without consulting the policy at all. Every one of those paths
+            // -- and the policy's own refusals, of which a local
+            // `File::create` failure is the common one, since `a:b.txt`,
+            // `what?.png`, `CON` and a trailing dot are ordinary names in an
+            // X11 session and none of them can be created on NTFS -- answers
+            // on the wire and puts nothing in `Outcome::failed`, because from
+            // the manager's point of view no transfer ever existed. The
+            // requester is still waiting, and a clipboard batch holding a slot
+            // for a file that can never arrive strands the whole paste.
+            // `TransferAccept { accepted: false }` is the one thing all of
+            // them have in common, so that is what becomes the event.
+            if let Message::TransferAccept {
+                id,
+                accepted: false,
+                reason,
+            } = reply
+            {
+                self.fail_transfer(*id, reason.clone());
+            }
             if let Err(e) = self.send(reply) {
                 return Some(Err(e));
             }
         }
-        if let Some((id, reason)) = outcome.failed.into_iter().next() {
-            self.downloads.remove(&id);
-            return Some(Ok(Some(ClientEvent::TransferFailed { id, reason })));
+        for (id, reason) in outcome.failed {
+            self.fail_transfer(id, reason);
         }
-        if let Some((_, purpose, name)) = outcome.sent.into_iter().next() {
+        for (id, purpose, name) in outcome.sent {
             if purpose == TransferPurpose::FileUpload {
-                return Some(Ok(Some(ClientEvent::FileUploaded { name })));
+                self.queued
+                    .push_back(ClientEvent::FileUploaded { id, name });
             }
         }
         for done in outcome.completed {
             match self.on_completed(done) {
-                Ok(Some(ev)) => return Some(Ok(Some(ev))),
+                Ok(Some(ev)) => self.queued.push_back(ev),
                 Ok(None) => {}
                 Err(e) => return Some(Err(e)),
             }
         }
-        Some(Ok(None))
+        Some(Ok(self.queued.pop_front()))
+    }
+
+    /// Record a transfer as failed and release whatever it was holding.
+    fn fail_transfer(&mut self, id: u64, reason: String) {
+        self.downloads.remove(&id);
+        self.queued
+            .push_back(ClientEvent::TransferFailed { id, reason });
     }
 
     fn on_completed(&mut self, done: Completed) -> Result<Option<ClientEvent>> {
@@ -597,6 +801,7 @@ impl Client {
                 self.downloads
                     .remove(&done.id)
                     .map(|path| ClientEvent::FileDownloaded {
+                        id: done.id,
                         path,
                         name: done.name,
                     })
@@ -730,7 +935,7 @@ impl Client {
                 Some(ClientEvent::Disconnected(reason))
             }
             Message::Rejected { code, reason } => {
-                let r = format!("rejected (code {code}): {reason}");
+                let r = rejection_reason(code, &reason);
                 self.closed = Some(r.clone());
                 Some(ClientEvent::Disconnected(r))
             }
@@ -768,14 +973,37 @@ impl Client {
         let _ = self.send(&Message::Disconnect {
             reason: reason.to_string(),
         });
+        self.close_socket("closed by client");
+    }
+
+    /// Let go of a connection that has already failed, without saying goodbye.
+    ///
+    /// [`Client::disconnect`] writes a `Disconnect` first, which is right for
+    /// a link that is still there and wrong for one that is not: against a
+    /// half-open socket -- a sleeping laptop, a forward whose far end has gone
+    /// -- that write ends only when the kernel's send buffer fills and the
+    /// write timeout expires, fifteen seconds of it, on whatever thread called
+    /// in. The session window calls in on the winit thread, and a reconnection
+    /// that freezes the window for fifteen seconds before it starts is not a
+    /// reconnection anyone would keep.
+    ///
+    /// The shutdown alone is what actually has to happen: it wakes the reader
+    /// thread out of its blocking read so the thread and the descriptor are
+    /// released rather than leaked, once per attempt, for as long as the user
+    /// keeps trying.
+    pub fn abandon(&mut self, reason: &str) {
+        self.close_socket(reason);
+    }
+
+    /// Take the socket down and collect the reader thread.
+    fn close_socket(&mut self, reason: &str) {
         if let Ok(w) = self.writer.lock() {
             let _ = w.shutdown(std::net::Shutdown::Both);
         }
         if let Some(t) = self.reader.take() {
             let _ = t.join();
         }
-        self.closed
-            .get_or_insert_with(|| "closed by client".to_string());
+        self.closed.get_or_insert_with(|| reason.to_string());
     }
 }
 
@@ -792,6 +1020,7 @@ mod tests {
     use super::*;
     use lynxrdp_proto::codec::{TileEncoding, TileUpdate};
     use lynxrdp_proto::frame::write_message;
+    use lynxrdp_proto::transfer::MAX_CONCURRENT_MEMORY_TRANSFERS;
     use std::net::TcpListener;
 
     /// A minimal fake server for exercising the client state machine.
@@ -910,6 +1139,230 @@ mod tests {
         let _server = fake_server(listener, vec![h]);
         let err = Client::connect(addr, &ConnectOptions::default(), None).unwrap_err();
         assert!(err.to_string().contains("version"), "{err}");
+    }
+
+    /// A server too old to hold a session with is refused; one merely older
+    /// than us is not.
+    ///
+    /// The check used to be plain equality, which made every protocol bump a
+    /// flag day -- server packages are installed by administrators on RHEL 9
+    /// while clients update on three platforms, so some skew is guaranteed.
+    /// The server answers with the version the two sides agreed on, so this is
+    /// a range check against the floor rather than an equality test.
+    #[test]
+    fn a_server_below_the_floor_is_refused_but_an_older_one_is_not() {
+        let refuse = |v: u16| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut h = hello(1, 1);
+            if let Message::ServerHello { version, .. } = &mut h {
+                *version = v;
+            }
+            let _server = fake_server(listener, vec![h]);
+            Client::connect(addr, &ConnectOptions::default(), None)
+        };
+
+        if MIN_COMPATIBLE_VERSION > 0 {
+            let err = refuse(MIN_COMPATIBLE_VERSION - 1)
+                .expect_err("a server below the floor must be refused");
+            assert!(err.to_string().contains("version"), "{err}");
+        }
+        // Every version from the floor up to ours inclusive must be accepted;
+        // today that is a single value, and it will not stay that way.
+        for v in MIN_COMPATIBLE_VERSION..=PROTOCOL_VERSION {
+            assert!(refuse(v).is_ok(), "version {v} should have been accepted");
+        }
+    }
+
+    #[test]
+    fn a_refused_offer_is_reported_and_not_merely_declined() {
+        // The policy refusing an offer used to be silent: `TransferManager`
+        // answers on the wire and forgets, nothing reaches `Outcome::failed`,
+        // and the requester waits for a completion that cannot come. A caller
+        // counting a batch of downloads then never publishes it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = fake_server(
+            listener,
+            vec![
+                hello(4, 4),
+                // An id this client never asked for: refused by the policy,
+                // which is the same code path a local `File::create` failure
+                // takes on a name NTFS will not accept.
+                Message::TransferOffer {
+                    id: 4242,
+                    purpose: TransferPurpose::FileDownload,
+                    name: "what?.png".into(),
+                    size: 9,
+                },
+            ],
+        );
+        let mut c = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        match c.poll_event(Duration::from_secs(5)).unwrap().unwrap() {
+            ClientEvent::TransferFailed { id, reason } => {
+                assert_eq!(id, 4242);
+                assert!(reason.contains("unsolicited"), "{reason}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        c.disconnect("bye");
+        let received = server.join().unwrap();
+        assert!(
+            received.iter().any(|m| matches!(
+                m,
+                Message::TransferAccept {
+                    id: 4242,
+                    accepted: false,
+                    ..
+                }
+            )),
+            "the peer must still be told it was refused"
+        );
+    }
+
+    #[test]
+    fn a_refusal_the_policy_never_saw_is_reported_too() {
+        // The policy is not the only thing that turns an offer away.
+        // `TransferManager` refuses an offer that would be the third landing
+        // in memory before it consults the policy at all, so a scheme that
+        // reports refusals from inside the policy misses this one entirely --
+        // and the requester waits for a completion that cannot come. Reading
+        // the refusal off the reply is what covers every path at once.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let image = |id: u64| Message::TransferOffer {
+            id,
+            purpose: TransferPurpose::ClipboardImage,
+            name: "shot.png".into(),
+            // Non-zero, so each stays in flight rather than completing on the
+            // offer and freeing its slot again.
+            size: 16,
+        };
+        let mut script = vec![hello(4, 4)];
+        script.extend((0..=MAX_CONCURRENT_MEMORY_TRANSFERS as u64).map(image));
+        let server = fake_server(listener, script);
+        let mut c = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        let refused = MAX_CONCURRENT_MEMORY_TRANSFERS as u64;
+        match c.poll_event(Duration::from_secs(5)).unwrap().unwrap() {
+            ClientEvent::TransferFailed { id, reason } => {
+                assert_eq!(id, refused, "{reason}");
+                assert!(reason.contains("in-memory"), "{reason}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        c.disconnect("bye");
+        let received = server.join().unwrap();
+        assert!(
+            received.iter().any(|m| matches!(
+                m,
+                Message::TransferAccept {
+                    id,
+                    accepted: false,
+                    ..
+                } if *id == refused
+            )),
+            "the peer must still be told it was refused"
+        );
+    }
+
+    #[test]
+    fn every_outcome_of_one_message_reaches_the_caller() {
+        // A `TransferAck` pumps every outgoing transfer at once and a
+        // `TransferEnd` resolves whatever the same message finished, so one
+        // message can produce several events. Returning the first and dropping
+        // the rest leaves a caller tracking a set of transfers waiting on ids
+        // that were resolved and thrown away.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = fake_server(listener, vec![hello(4, 4)]);
+        let mut c = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        c.queued.push_back(ClientEvent::TransferFailed {
+            id: 1,
+            reason: "a".into(),
+        });
+        c.queued.push_back(ClientEvent::TransferFailed {
+            id: 2,
+            reason: "b".into(),
+        });
+        assert!(matches!(
+            c.try_event().unwrap(),
+            Some(ClientEvent::TransferFailed { id: 1, .. })
+        ));
+        assert!(matches!(
+            c.try_event().unwrap(),
+            Some(ClientEvent::TransferFailed { id: 2, .. })
+        ));
+        // Even after the connection is gone: a queued completion is owed to
+        // the caller regardless of what happened to the socket afterwards.
+        c.closed = Some("gone".into());
+        c.queued.push_back(ClientEvent::FileUploaded {
+            id: 3,
+            name: "c".into(),
+        });
+        assert!(matches!(
+            c.try_event().unwrap(),
+            Some(ClientEvent::FileUploaded { id: 3, .. })
+        ));
+        assert!(matches!(
+            c.try_event().unwrap(),
+            Some(ClientEvent::Disconnected(_))
+        ));
+    }
+
+    #[test]
+    fn a_rejection_can_be_read_back_out_of_what_the_user_is_shown() {
+        // The pair, not a literal: the session window has to tell a rejection
+        // from an ordinary drop to decide whether retrying is worth anything,
+        // and it has only this string to go on.
+        for code in [0u16, 1, 2, 3, 4, u16::MAX] {
+            let text = rejection_reason(code, "no: (parens) and 12345");
+            assert_eq!(rejection_code(&text), Some(code), "{text}");
+            assert!(mentions_rejection(&text), "{text}");
+            // Wrapped in context on the way up, which is what actually
+            // reaches the retry classifier.
+            let wrapped = format!("reconnecting: {text}");
+            assert_eq!(rejection_code(&wrapped), None, "{wrapped}");
+            assert!(mentions_rejection(&wrapped), "{wrapped}");
+        }
+        // Anything else is not a rejection, and must not be mistaken for one.
+        for other in [
+            "connection closed",
+            "no response from the session for 30s",
+            "Another client connected to this session.",
+            "rejected (code x): not a number",
+            "rejected (code ",
+            "",
+        ] {
+            assert_eq!(rejection_code(other), None, "{other}");
+            assert!(!mentions_rejection(other), "{other}");
+        }
+        // A rejection nested inside another failure is still a rejection: the
+        // strict parse says no, the question the classifier asks says yes.
+        assert_eq!(rejection_code("protocol error: rejected (code 2): x"), None);
+        assert!(mentions_rejection("protocol error: rejected (code 2): x"));
+    }
+
+    #[test]
+    fn abandoning_a_dead_link_does_not_write_to_it() {
+        // The point of `abandon`: no `Disconnect` goes out, so a half-open
+        // socket cannot hold the caller for the write timeout. The reader
+        // thread is still collected, which is the part that must happen.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = fake_server(listener, vec![hello(4, 4)]);
+        let mut c = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        c.abandon("link lost");
+        assert_eq!(c.closed(), Some("link lost"));
+        // Dropping it must not send either: `Drop` only speaks for a
+        // connection nobody has closed.
+        drop(c);
+        let received = server.join().unwrap();
+        assert!(
+            !received
+                .iter()
+                .any(|m| matches!(m, Message::Disconnect { .. })),
+            "a goodbye was written down a link that had already failed: {received:?}"
+        );
     }
 
     #[test]

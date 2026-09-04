@@ -39,6 +39,13 @@ startwm = "/etc/lynxrdp/startwm.sh"
 # (1 = lowest latency, 2 = smoother on jittery links).
 max_fps = 60
 max_in_flight = 2
+# Let a session raise that number by itself, up to 8, when the round trip it
+# measures justifies more. A fixed 2 frames per round trip is 40 fps at 50 ms
+# and 20 fps at 100 ms, and the transport here is an SSH tunnel that is often
+# crossing a WAN. The value above stays the floor either way: the session will
+# never allow itself fewer frames than you asked for, so set this to false if
+# you are tuning for latency and want max_in_flight taken literally.
+max_in_flight_auto = true
 # Seconds a session may stay without a client before it is ended (0 = never).
 idle_timeout_secs = 0
 # PAM service used to open the login session (/etc/pam.d/lynxrdp).
@@ -47,6 +54,10 @@ runtime_dir = "/run/lynxrdp"
 session_binary = "/usr/bin/lynxrdp-session"
 # Per-user session logs go to <log_dir>/<user>.log.
 #log_dir = "/var/log/lynxrdp"
+# Physical size the X screen reports, in dots per inch (48 to 480). This is
+# what xdpyinfo prints and what Qt scales itself by. GTK does not read it --
+# GTK follows the Xft.dpi X resource, which your desktop's own settings set --
+# so a GTK application will not follow this on its own.
 dpi = 96
 
 [reporting]

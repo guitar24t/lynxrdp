@@ -2,7 +2,8 @@
 //! the headless protocol client.
 //!
 //! These need `Xvfb` and `xterm` installed and are skipped (with a message)
-//! when they are not.
+//! when they are not -- unless `LYNXRDP_REQUIRE_E2E` is set, which turns a
+//! missing dependency into a failure. CI sets it; see `tests/common/mod.rs`.
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
@@ -12,20 +13,12 @@ use std::time::{Duration, Instant};
 use lynxrdp_client::connection::{Client, ClientEvent, ConnectOptions};
 use lynxrdp_proto::{keysym, Rect};
 
-fn have(prog: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {prog}"))
-        .stdout(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+mod common;
+use common::{have, skip_unless};
 
 macro_rules! require_xvfb {
     () => {
-        if !have("Xvfb") {
-            eprintln!("SKIP: Xvfb not installed");
+        if skip_unless(have("Xvfb"), "Xvfb not installed") {
             return;
         }
     };
@@ -224,6 +217,55 @@ fn handshake_and_first_frame() {
         matches!(ev, ClientEvent::Frame { .. }) && c.framebuffer().get(320, 240) == 0xff0000
     }));
     assert!(c.frames_received() >= 1);
+    c.disconnect("test done");
+}
+
+/// A refresh request must actually produce a frame.
+///
+/// `RefreshRequest` used to set the "send a whole frame" flag without
+/// invalidating the encoder's reference. `send_frame` then captured the entire
+/// screen, diffed it against a reference that still matched it exactly, found
+/// nothing changed and returned having sent nothing -- while clearing the flag,
+/// so the request was consumed. The one client with a reason to ask (its
+/// framebuffer is wrong) was the one client guaranteed to get no answer.
+///
+/// The test leans on that: with the screen quiescent, ordinary damage produces
+/// no frames at all, so any frame arriving after the request came from the
+/// request.
+#[test]
+fn refresh_request_resends_the_screen() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+    s.x("xsetroot", &["-solid", "#00ff00"]);
+    assert!(wait_for(&mut c, Duration::from_secs(5), |_, c| c
+        .framebuffer()
+        .get(1, 1)
+        == 0x00ff00));
+
+    // Let the screen go quiet, and confirm it really is quiet.
+    let settle = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < settle {
+        let _ = c.poll_event(Duration::from_millis(50));
+    }
+    let before = c.frames_received();
+    let quiet = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < quiet {
+        let _ = c.poll_event(Duration::from_millis(50));
+    }
+    assert_eq!(
+        c.frames_received(),
+        before,
+        "screen is not quiescent; the test cannot attribute a frame to the request"
+    );
+
+    c.request_refresh().unwrap();
+    assert!(
+        wait_for(&mut c, Duration::from_secs(5), |_, c| c.frames_received()
+            > before),
+        "refresh request produced no frame"
+    );
+    assert_eq!(c.framebuffer().get(1, 1), 0x00ff00);
     c.disconnect("test done");
 }
 
@@ -493,13 +535,11 @@ fn pointer_events_are_injected() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let _ = c.poll_event(Duration::from_millis(50));
-        let out = if have("xdotool") {
-            let o = s.x("xdotool", &["getmouselocation"]);
-            String::from_utf8_lossy(&o.stdout).to_string()
-        } else {
-            eprintln!("SKIP pointer check: xdotool not installed");
+        if skip_unless(have("xdotool"), "xdotool not installed (pointer check)") {
             return;
-        };
+        }
+        let o = s.x("xdotool", &["getmouselocation"]);
+        let out = String::from_utf8_lossy(&o.stdout).to_string();
         if out.contains("x:123 y:45") {
             break;
         }
@@ -572,8 +612,10 @@ fn second_client_replaces_first() {
 #[test]
 fn clipboard_roundtrip() {
     require_xvfb!();
-    if !have("xclip") && !have("xsel") {
-        eprintln!("SKIP: neither xclip nor xsel installed");
+    if skip_unless(
+        have("xclip") || have("xsel"),
+        "neither xclip nor xsel installed",
+    ) {
         return;
     }
     let s = Session::start(320, 240, "none", &[]);
@@ -635,8 +677,7 @@ fn sample_png(w: usize, h: usize) -> Vec<u8> {
 #[test]
 fn clipboard_image_from_client_reaches_the_session() {
     require_xvfb!();
-    if !have("xclip") {
-        eprintln!("SKIP: xclip not installed");
+    if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
     let s = Session::start(320, 240, "none", &[]);
@@ -668,8 +709,7 @@ fn clipboard_image_from_client_reaches_the_session() {
 #[test]
 fn clipboard_image_from_the_session_reaches_the_client() {
     require_xvfb!();
-    if !have("xclip") {
-        eprintln!("SKIP: xclip not installed");
+    if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -786,6 +826,136 @@ fn a_file_downloads_out_of_the_session() {
     assert_eq!(std::fs::read(&dest).unwrap(), content);
 }
 
+/// A large transfer must not stop the screen.
+///
+/// This is the stated reason `CHUNK_SIZE` and `WINDOW_CHUNKS` exist: a chunk is
+/// capped so a frame waits for at most one of them to drain, and the sender's
+/// window bounds how much of a file can be in flight ahead of the acks. Neither
+/// bound had a test that would notice it being removed. The other transfer
+/// tests cannot: they use `run_transfer`, which drives the connection but
+/// discards every `Frame` event, so a session that went blind for the length of
+/// a download would pass all of them. Hence the hand-written loop below.
+#[test]
+fn a_large_download_does_not_stall_the_screen() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+
+    // 16 MiB is 256 chunks, so the sender refills its 8-chunk window thirty-odd
+    // times. Sized against the *frame* cadence rather than the file: the screen
+    // below changes about thirty times a second, so the transfer has to last
+    // long enough for several of those to fall inside it. A megabyte would
+    // finish between two frames on a quick host and prove nothing.
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = remote_dir.path().join("big.bin");
+    let content: Vec<u8> = (0..16 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&remote, &content).unwrap();
+
+    // Keep the screen changing for the whole transfer. Without this the test
+    // proves nothing at all: a quiescent screen produces no frames either way,
+    // and the assertion below would be measuring the absence of damage rather
+    // than the presence of a stall.
+    let mut painter = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "while :; do xsetroot -solid '#ff0000'; sleep 0.02; \
+             xsetroot -solid '#0000ff'; sleep 0.02; done",
+        )
+        .env("DISPLAY", &s.display)
+        .env("XAUTHORITY", s.xauth())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let dest = out_dir.path().join("big.bin");
+    // The id is not needed: completion arrives as an event, and progress is
+    // no longer sampled now that the measurement is the gap between frames.
+    c.request_file(remote.to_str().unwrap(), dest.clone())
+        .unwrap();
+
+    // What is actually under test is that the core thread never *stops*
+    // serving the screen while a transfer runs. Counting frames that land
+    // inside the transfer window cannot measure that here: over loopback 16 MiB
+    // moves in about sixteen milliseconds, which is one frame interval, so a
+    // correct implementation and a badly stalled one both produce one frame and
+    // the count says nothing. Growing the file until it outruns loopback would
+    // mean hundreds of megabytes in a suite that has to stay quick.
+    //
+    // The largest gap between consecutive frames is the honest measurement, and
+    // it does not care how fast the transfer was: a session that went blind
+    // behind a download shows a gap the length of the download, whereas one
+    // that stayed responsive keeps painting throughout. The painter drives the
+    // screen at roughly 25 Hz, so anything approaching a second is a stall and
+    // nothing else.
+    let mut worst_gap = Duration::ZERO;
+    let mut last_frame = Instant::now();
+    let mut frames = 0u32;
+    let mut done = false;
+    let started = Instant::now();
+    let mut took = Duration::ZERO;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline {
+        let ev = c.poll_event(Duration::from_millis(200)).unwrap();
+        match ev {
+            Some(ClientEvent::FileDownloaded { .. }) => {
+                took = started.elapsed();
+                done = true;
+                // Keep watching briefly: a stall that begins with the last
+                // chunk and ends when the writer drains would otherwise fall
+                // outside the window entirely.
+                let settle = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < settle {
+                    if let Some(ClientEvent::Frame { .. }) =
+                        c.poll_event(Duration::from_millis(100)).unwrap()
+                    {
+                        worst_gap = worst_gap.max(last_frame.elapsed());
+                        last_frame = Instant::now();
+                        frames += 1;
+                    }
+                }
+                break;
+            }
+            Some(ClientEvent::TransferFailed { reason, .. }) => panic!("transfer failed: {reason}"),
+            Some(ClientEvent::Disconnected(r)) => panic!("disconnected: {r}"),
+            Some(ClientEvent::Frame { .. }) => {
+                worst_gap = worst_gap.max(last_frame.elapsed());
+                last_frame = Instant::now();
+                frames += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let _ = painter.kill();
+    let _ = painter.wait();
+
+    assert!(done, "the download never finished");
+    // Not assert_eq!, which would dump 16 MiB of bytes twice before anyone
+    // could read the message. The first differing offset is the useful part.
+    let got = std::fs::read(&dest).unwrap();
+    assert_eq!(got.len(), content.len(), "the download was truncated");
+    let differs = got.iter().zip(content.iter()).position(|(a, b)| a != b);
+    assert!(
+        differs.is_none(),
+        "the downloaded file differs from the original at byte {differs:?}"
+    );
+    assert!(
+        frames > 2,
+        "only {frames} frames arrived in {} ms; the painter is not driving the \
+         screen, so this test is measuring nothing",
+        started.elapsed().as_millis()
+    );
+    assert!(
+        worst_gap < Duration::from_secs(1),
+        "the screen went {} ms without a frame while a 16 MiB download ran \
+         (transfer took {} ms, {frames} frames): the session stalled behind it",
+        worst_gap.as_millis(),
+        took.as_millis()
+    );
+}
+
 #[test]
 fn downloading_a_missing_file_fails_cleanly() {
     require_xvfb!();
@@ -802,8 +972,7 @@ fn downloading_a_missing_file_fails_cleanly() {
 #[test]
 fn clipboard_files_from_the_client_are_staged_for_the_session() {
     require_xvfb!();
-    if !have("xclip") {
-        eprintln!("SKIP: xclip not installed");
+    if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
     let s = Session::start(320, 240, "none", &[]);
@@ -856,8 +1025,7 @@ fn clipboard_files_from_the_client_are_staged_for_the_session() {
 #[test]
 fn clipboard_files_copied_in_the_session_are_offered_to_the_client() {
     require_xvfb!();
-    if !have("xclip") {
-        eprintln!("SKIP: xclip not installed");
+    if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -912,6 +1080,74 @@ fn exit_on_disconnect_ends_session() {
         .wait_exit(Duration::from_secs(10))
         .expect("session should exit");
     assert!(st.success(), "{st}");
+}
+
+/// The idle timeout is the only thing that ever ends an abandoned session.
+///
+/// `--exit-on-disconnect` exists and is covered just above, but the daemon
+/// never passes it: `daemon/manager.rs` builds the session's argument list and
+/// it is not in there, deliberately, because a user whose SSH tunnel drops is
+/// meant to reconnect to the session they left. That makes `idle_timeout` the
+/// entire lifecycle policy for a session nobody comes back to -- otherwise an
+/// Xvfb, a desktop and a PAM session sit on the host until it reboots -- and it
+/// had no test on either side.
+///
+/// The client connects and then leaves rather than never connecting, because
+/// `last_client_seen` is initialised at start-up: a timer that was only ever
+/// armed once would still pass a test that measured from there, and would still
+/// fail to collect the sessions this is for.
+#[test]
+fn an_idle_session_exits_after_the_timeout() {
+    require_xvfb!();
+    let mut s = Session::start(320, 240, "none", &["--idle-timeout", "2"]);
+    let mut c = s.connect(None);
+    s.x("xsetroot", &["-solid", "#ff00ff"]);
+    assert!(wait_for(&mut c, Duration::from_secs(5), |_, c| c
+        .framebuffer()
+        .get(1, 1)
+        == 0xff00ff));
+    c.disconnect("test done");
+    drop(c);
+    let st = s
+        .wait_exit(Duration::from_secs(20))
+        .expect("an abandoned session should have timed out");
+    assert!(st.success(), "{st}");
+}
+
+/// ...and it must not fire while somebody is still connected.
+///
+/// The obvious way to write this is `let _ = s.connect(None);`, which drops the
+/// client on the spot -- disconnecting it, arming the idle timer, and asserting
+/// the exact opposite of what the test claims while still going green for as
+/// long as the timeout outlasts the wait. Hence the binding, and hence the
+/// poll loop: a client that stops answering pings is dropped after
+/// `PONG_TIMEOUT` and would be testing something else entirely.
+#[test]
+fn a_session_with_a_client_attached_survives_the_idle_timeout() {
+    require_xvfb!();
+    let mut s = Session::start(320, 240, "none", &["--idle-timeout", "2"]);
+    let mut client = s.connect(None);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        let ev = client
+            .poll_event(Duration::from_millis(100))
+            .expect("poll failed");
+        if let Some(ClientEvent::Disconnected(r)) = ev {
+            panic!("the session dropped its client: {r}");
+        }
+    }
+    assert!(
+        s.wait_exit(Duration::from_millis(200)).is_none(),
+        "the session exited on its idle timeout with a client attached"
+    );
+    // Proof the connection is still live rather than merely still in scope.
+    client.ping().unwrap();
+    assert!(wait_for(
+        &mut client,
+        Duration::from_secs(5),
+        |ev, _| matches!(ev, ClientEvent::Rtt(_))
+    ));
+    client.disconnect("test done");
 }
 
 #[test]

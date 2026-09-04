@@ -56,10 +56,15 @@ impl ShmSegment {
         }
     }
 
-    fn bytes(&self, len: usize) -> &[u8] {
-        assert!(len <= self.size);
-        // SAFETY: the mapping is valid for `size` bytes for our lifetime.
-        unsafe { std::slice::from_raw_parts(self.addr, len) }
+    /// The `len` bytes of the mapping starting at `offset`.
+    ///
+    /// Pipelined captures give each rectangle its own region of the segment,
+    /// so this can no longer assume a capture starts at the beginning of it.
+    fn bytes_at(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(offset.saturating_add(len) <= self.size);
+        // SAFETY: the mapping is valid for `size` bytes for our lifetime, and
+        // the assertion above keeps `offset + len` inside it.
+        unsafe { std::slice::from_raw_parts(self.addr.add(offset), len) }
     }
 }
 
@@ -112,68 +117,248 @@ impl ScreenCapture {
 
     /// Capture `rect` (clipped to `fb`) from the root window into `fb`.
     pub fn capture_into(&mut self, fb: &mut Framebuffer, rect: &Rect) -> Result<()> {
-        let rect = rect.intersect(&fb.bounds());
-        if rect.is_empty() {
-            return Ok(());
-        }
-        // Split very tall captures so they fit the SHM segment / request limits.
-        let max_rows = (self.shm_pixels / rect.width as usize).clamp(1, 4096) as u32;
-        let mut y = rect.y;
-        while y < rect.bottom() {
-            let h = (rect.bottom() - y).min(max_rows);
-            let part = Rect::new(rect.x, y, rect.width, h);
-            self.capture_part(fb, &part)?;
-            y += h;
-        }
-        Ok(())
+        self.capture_many(fb, std::slice::from_ref(rect))
     }
 
-    fn capture_part(&mut self, fb: &mut Framebuffer, rect: &Rect) -> Result<()> {
-        let conn = self.display.conn();
-        let root = self.display.root();
-        let n = rect.area() as usize;
-        let msb = self.display.msb_first();
-        if let Some(shm) = &self.shm {
-            let reply = x11rb::protocol::shm::get_image(
+    /// Capture several rectangles (each clipped to `fb`) into `fb`.
+    ///
+    /// Prefer this over calling [`ScreenCapture::capture_into`] in a loop.
+    /// With MIT-SHM every request in a batch is issued before any reply is
+    /// read, and that is the whole reason this entry point exists: a
+    /// `shm::get_image` reply is 32 bytes -- the pixels land in the shared
+    /// segment, not in the reply -- so a rectangle costs one round trip and
+    /// nothing else. A frame made of two dozen damage rectangles used to pay
+    /// two dozen of those in series before the encoder saw a single pixel;
+    /// overlapping them makes it roughly one.
+    ///
+    /// Each rectangle in a batch gets its own region of the segment, which is
+    /// what makes the requests independent of one another. A batch ends when
+    /// the segment or the pipeline depth is full, and its pixels are copied
+    /// out before the next batch reuses the space.
+    pub fn capture_many(&mut self, fb: &mut Framebuffer, rects: &[Rect]) -> Result<()> {
+        let bounds = fb.bounds();
+        let capacity_px = self.shm_pixels;
+        let mut bands: Vec<Rect> = Vec::new();
+        for r in rects {
+            let clipped = r.intersect(&bounds);
+            if clipped.is_empty() {
+                continue;
+            }
+            // Very tall captures are split so each one fits the SHM segment
+            // and stays a reasonable single request.
+            bands.extend(split_bands(&clipped, band_rows(clipped.width, capacity_px)));
+        }
+        if bands.is_empty() {
+            return Ok(());
+        }
+        match self.shm.as_ref() {
+            Some(shm) => capture_shm(&self.display, shm, fb, &bands),
+            None => capture_serial(&self.display, fb, &bands),
+        }
+    }
+}
+
+/// Issue every capture in a batch before reading any of its replies.
+fn capture_shm(
+    display: &Arc<XDisplay>,
+    shm: &ShmSegment,
+    fb: &mut Framebuffer,
+    bands: &[Rect],
+) -> Result<()> {
+    let conn = display.conn();
+    let root = display.root();
+    let msb = display.msb_first();
+    for band in bands {
+        // `band_rows` sizes bands against this same segment, so this can only
+        // fire if the segment was created for a smaller screen than the
+        // framebuffer now is. A clear error beats an offset the X server would
+        // reject with BadValue and a frame that is silently missing a strip.
+        let need = band_bytes(band);
+        if need > shm.size {
+            bail!(
+                "capture rectangle {band} needs {need} bytes, the shared segment holds {}",
+                shm.size
+            );
+        }
+    }
+    for batch in plan_batches(bands, shm.size) {
+        let mut cookies = Vec::with_capacity(batch.len());
+        for slot in &batch {
+            cookies.push(x11rb::protocol::shm::get_image(
                 conn,
                 root,
-                rect.x as i16,
-                rect.y as i16,
-                rect.width as u16,
-                rect.height as u16,
+                slot.rect.x as i16,
+                slot.rect.y as i16,
+                slot.rect.width as u16,
+                slot.rect.height as u16,
                 !0,
                 ImageFormat::Z_PIXMAP.into(),
                 shm.seg,
-                0,
-            )?
-            .reply()
-            .context("shm GetImage")?;
-            if reply.size as usize != n * 4 {
-                bail!("unexpected shm image size {} for {}", reply.size, rect);
+                slot.offset as u32,
+            )?);
+        }
+        // The X server answers a `ShmGetImage` only once the pixels are in the
+        // segment, and it answers requests in the order it received them, so
+        // a band can be copied out as soon as its own reply lands rather than
+        // after the whole batch. The same ordering is what makes the error
+        // paths safe: a request abandoned here is still processed before
+        // anything the next frame sends, so its late write cannot land on top
+        // of a later capture that reuses the same offset.
+        for (slot, cookie) in batch.iter().zip(cookies) {
+            let reply = cookie.reply().context("shm GetImage")?;
+            let need = band_bytes(&slot.rect);
+            if reply.size as usize != need {
+                bail!("unexpected shm image size {} for {}", reply.size, slot.rect);
             }
-            let bytes = shm.bytes(n * 4);
-            copy_pixels(fb, rect, bytes, msb);
-            Ok(())
-        } else {
-            let reply = conn
-                .get_image(
-                    ImageFormat::Z_PIXMAP,
-                    root,
-                    rect.x as i16,
-                    rect.y as i16,
-                    rect.width as u16,
-                    rect.height as u16,
-                    !0,
-                )?
-                .reply()
-                .context("GetImage")?;
-            if reply.data.len() < n * 4 {
-                bail!("short GetImage reply for {}", rect);
-            }
-            copy_pixels(fb, rect, &reply.data[..n * 4], msb);
-            Ok(())
+            copy_pixels(fb, &slot.rect, shm.bytes_at(slot.offset, need), msb);
         }
     }
+    Ok(())
+}
+
+/// The fallback used when MIT-SHM is unavailable.
+///
+/// Deliberately one request at a time. Without shared memory the pixels travel
+/// inside the reply, so a pipeline of these would hold several whole bands in
+/// the connection's buffers at once -- megabytes of them, on a path that only
+/// exists because shared memory was not available in the first place.
+fn capture_serial(display: &Arc<XDisplay>, fb: &mut Framebuffer, bands: &[Rect]) -> Result<()> {
+    let conn = display.conn();
+    let root = display.root();
+    let msb = display.msb_first();
+    for band in bands {
+        let need = band_bytes(band);
+        let reply = conn
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                root,
+                band.x as i16,
+                band.y as i16,
+                band.width as u16,
+                band.height as u16,
+                !0,
+            )?
+            .reply()
+            .context("GetImage")?;
+        if reply.data.len() < need {
+            bail!("short GetImage reply for {band}");
+        }
+        copy_pixels(fb, band, &reply.data[..need], msb);
+    }
+    Ok(())
+}
+
+/// Tallest band a single capture request may cover.
+///
+/// Carried over from the serial code: an X server services a `GetImage`
+/// synchronously, and a band this tall is already a generous unit of work.
+const MAX_BAND_ROWS: u32 = 4096;
+
+/// Captures allowed to be outstanding at once.
+///
+/// Only the MIT-SHM path pipelines, and there each unread reply is 32 bytes,
+/// so this cap is not about memory. It is about never letting the number of
+/// unread replies approach what the socket buffers hold, whatever the
+/// capture-rectangle budget grows to: an X server blocked writing replies
+/// while we are blocked writing requests is a deadlock, not a slowdown.
+const MAX_PIPELINE: usize = 64;
+
+/// Alignment applied to every offset into the shared segment.
+///
+/// A band's byte count is always a multiple of four (32 bits per pixel), so
+/// offsets are naturally word aligned already; rounding up to eight costs at
+/// most four bytes per band and keeps the destination aligned for an X server
+/// built with 64-bit framebuffer words.
+const SHM_ALIGN: usize = 8;
+
+/// Bytes one band occupies at 32 bits per pixel.
+fn band_bytes(rect: &Rect) -> usize {
+    (rect.width as usize)
+        .saturating_mul(rect.height as usize)
+        .saturating_mul(4)
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    value.saturating_add(align - 1) & !(align - 1)
+}
+
+/// Rows of `width` pixels that fit in `capacity` pixels, capped at
+/// [`MAX_BAND_ROWS`]. Never zero, so a band always makes progress.
+fn band_rows(width: u32, capacity: usize) -> u32 {
+    if width == 0 {
+        return MAX_BAND_ROWS;
+    }
+    (capacity / width as usize).clamp(1, MAX_BAND_ROWS as usize) as u32
+}
+
+/// Split `rect` into horizontal bands of at most `max_rows` rows each.
+fn split_bands(rect: &Rect, max_rows: u32) -> Vec<Rect> {
+    let mut out = Vec::new();
+    if rect.is_empty() || max_rows == 0 {
+        return out;
+    }
+    let mut y = rect.y;
+    while y < rect.bottom() {
+        let h = (rect.bottom() - y).min(max_rows);
+        out.push(Rect::new(rect.x, y, rect.width, h));
+        y += h;
+    }
+    out
+}
+
+/// One capture request and where in the shared segment its pixels will land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Slot {
+    rect: Rect,
+    /// Byte offset into the shared segment.
+    offset: usize,
+}
+
+/// Pack `bands` into batches that each fit `capacity` bytes and hold at most
+/// [`MAX_PIPELINE`] requests, giving every band its own region of the segment.
+///
+/// Distinct, non-overlapping offsets are exactly what allows a batch's
+/// requests to be outstanding together: the X server writes each band's pixels
+/// straight into its own region, so no reply can overwrite another's pixels
+/// before they have been copied out.
+///
+/// The running offset is summed in `usize` on purpose. `config.rs` permits a
+/// session up to 16384x16384, which is a one-gigabyte segment, and a running
+/// total over a batch reaches the same order as `u32::MAX` long before the
+/// capacity check would reject it -- sooner still if that ceiling ever rises.
+/// The offset is narrowed to `u32` for the wire only once it is known to fit.
+///
+/// A band larger than `capacity` cannot be captured this way at all; it is
+/// emitted alone at offset zero rather than silently dropped, which only keeps
+/// this function total. `capture_shm` rejects that case before planning.
+fn plan_batches(bands: &[Rect], capacity: usize) -> Vec<Vec<Slot>> {
+    let mut batches: Vec<Vec<Slot>> = Vec::new();
+    let mut cur: Vec<Slot> = Vec::new();
+    let mut next = 0usize;
+    for band in bands {
+        if band.is_empty() {
+            continue;
+        }
+        let need = band_bytes(band);
+        let mut offset = align_up(next, SHM_ALIGN);
+        if cur.len() >= MAX_PIPELINE || offset.saturating_add(need) > capacity {
+            if !cur.is_empty() {
+                batches.push(std::mem::take(&mut cur));
+            }
+            // The previous batch's pixels are copied out before any request of
+            // this one is issued, so the segment is free to be reused.
+            offset = 0;
+        }
+        cur.push(Slot {
+            rect: *band,
+            offset,
+        });
+        next = offset.saturating_add(need);
+    }
+    if !cur.is_empty() {
+        batches.push(cur);
+    }
+    batches
 }
 
 /// Convert server pixel bytes (32 bpp ZPixmap) to `0x00RRGGBB` and store them.
@@ -274,23 +459,65 @@ impl Drop for DamageTracker {
     }
 }
 
+/// Above this many rectangles, one whole-screen capture beats capturing each
+/// of them: every rectangle is a separate round trip to the X server.
+pub const MAX_CAPTURE_RECTS: usize = 24;
+
+/// How much empty area a merge may add, over and above the two rectangles it
+/// joins. Four tiles: enough that the diagonally-adjacent tiles this function
+/// exists to join still merge, and far too little to swallow a screen.
+fn merge_slack(tile: u32) -> u64 {
+    4 * (tile as u64) * (tile as u64)
+}
+
 /// Merge overlapping/adjacent rectangles to reduce capture requests. The
 /// result is a list of tile-aligned rectangles that cover the input.
+///
+/// Merging is refused when the union would add more empty area than
+/// [`merge_slack`] allows. Bare adjacency is a bad reason to merge on its own:
+/// a menu-bar repaint and a sidebar repaint touch once they are tile-aligned,
+/// and unioning them turns 70,400 damaged pixels into a 1920x960 rectangle --
+/// a 26x amplification, which then trips the whole-screen fallback in
+/// `send_frame` and costs a full-screen capture, diff and encode to transmit a
+/// few hundred bytes. A clock ticking while anything else repaints is enough
+/// to produce exactly that.
+///
+/// The guard leaves more rectangles behind, so when the result is too
+/// fragmented to capture piecemeal we fall back to the old unconditional
+/// merge: fewer, larger rectangles are the better trade at that point, and it
+/// guarantees this change cannot make any frame worse than it was.
 pub fn coalesce(rects: &[Rect], tile: u32, bounds: &Rect) -> Vec<Rect> {
+    let guarded = coalesce_within(rects, tile, bounds, merge_slack(tile));
+    if guarded.len() <= MAX_CAPTURE_RECTS {
+        return guarded;
+    }
+    coalesce_within(rects, tile, bounds, u64::MAX)
+}
+
+/// `coalesce`, with an explicit cap on the empty area a merge may add.
+///
+/// Note that with a finite `slack` the output is no longer guaranteed to be
+/// pairwise disjoint: two rectangles that touch but whose union is too costly
+/// are both kept. That is safe -- capture is idempotent and `encode_regions`
+/// de-duplicates the tiles -- but it does mean `total_area` can now count a
+/// small overlap twice, which only ever biases towards the whole-screen path.
+fn coalesce_within(rects: &[Rect], tile: u32, bounds: &Rect, slack: u64) -> Vec<Rect> {
     let mut out: Vec<Rect> = Vec::new();
     for r in rects {
         let mut cur = r.align_to_tiles(tile, bounds);
         if cur.is_empty() {
             continue;
         }
-        // Absorb any existing rectangle this one touches; repeat until stable.
+        // Absorb any existing rectangle this one touches cheaply enough;
+        // repeat until stable, since a merge can bring a further one in range.
         loop {
             let mut merged = false;
             let mut i = 0;
             while i < out.len() {
                 let o = out[i];
-                if touches(&o, &cur) {
-                    cur = cur.union(&o);
+                let union = cur.union(&o);
+                if touches(&o, &cur) && union.area() <= cur.area() + o.area() + slack {
+                    cur = union;
                     out.swap_remove(i);
                     merged = true;
                 } else {
@@ -321,6 +548,159 @@ fn _assert_types(_: &xproto::Rectangle) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two ordinary desktop repaints must not become a full-screen capture.
+    ///
+    /// A menu bar and a sidebar do not overlap, but once each is aligned out to
+    /// tile boundaries they touch, and the old unconditional union turned
+    /// 70,400 damaged pixels into 1,843,200 -- which then tripped the
+    /// whole-screen fallback in `send_frame`. This is the single most common
+    /// damage shape a desktop produces.
+    #[test]
+    fn adjacent_strips_do_not_swallow_the_screen() {
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        let menu = Rect::new(0, 0, 1920, 20);
+        let side = Rect::new(0, 100, 40, 800);
+        let merged = coalesce(&[menu, side], 64, &bounds);
+        assert_eq!(merged.len(), 2, "the two strips were merged: {merged:?}");
+        assert!(
+            total_area(&merged) * 8 < bounds.area(),
+            "coalesce amplified {} px of damage to {} px",
+            menu.area() + side.area(),
+            total_area(&merged)
+        );
+    }
+
+    /// The guard must not defeat the merging the function exists to do.
+    #[test]
+    fn genuinely_neighbouring_rects_still_merge() {
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        let a = Rect::new(64, 64, 64, 64);
+        let b = Rect::new(128, 64, 64, 64);
+        assert_eq!(coalesce(&[a, b], 64, &bounds).len(), 1);
+    }
+
+    /// Past the capture-rect budget the old greedy merge takes over, so a
+    /// heavily fragmented frame is never worse off than it was before.
+    #[test]
+    fn heavy_fragmentation_falls_back_to_greedy_merging() {
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        // A diagonal of isolated tiles: none of them touch, so the guard keeps
+        // every one and the fallback has to be what bounds the count.
+        let scattered: Vec<Rect> = (0..40).map(|i| Rect::new(i * 48, i * 26, 8, 8)).collect();
+        let merged = coalesce(&scattered, 64, &bounds);
+        assert!(
+            merged.len() <= scattered.len(),
+            "fallback produced more rectangles than it was given"
+        );
+    }
+
+    #[test]
+    fn bands_cover_the_rectangle_exactly() {
+        let r = Rect::new(10, 5, 100, 1000);
+        let bands = split_bands(&r, 384);
+        assert_eq!(bands.len(), 3);
+        assert_eq!(bands[0], Rect::new(10, 5, 100, 384));
+        assert_eq!(bands[2], Rect::new(10, 773, 100, 232));
+        // No gaps and no overlaps: the areas add up and the ends line up.
+        assert_eq!(bands.iter().map(Rect::area).sum::<u64>(), r.area());
+        assert_eq!(bands[0].y, r.y);
+        assert_eq!(bands.last().unwrap().bottom(), r.bottom());
+        assert!(split_bands(&Rect::new(0, 0, 0, 10), 8).is_empty());
+    }
+
+    /// The band height comes from the segment, never from a constant alone:
+    /// a band that does not fit is a `BadValue` and a frame with a hole in it.
+    #[test]
+    fn band_rows_respect_the_segment() {
+        assert_eq!(band_rows(1920, 1920 * 1080), 1080);
+        assert_eq!(band_rows(1920, 1920 * 10), 10);
+        // Never zero, however small the segment...
+        assert_eq!(band_rows(1920, 0), 1);
+        assert_eq!(band_rows(1920, 1919), 1);
+        // ...and never unbounded, however large.
+        assert_eq!(band_rows(1, usize::MAX), MAX_BAND_ROWS);
+        assert_eq!(band_rows(0, 4), MAX_BAND_ROWS);
+    }
+
+    /// The property the whole pipeline rests on: within one batch no two
+    /// captures may share a byte of the segment, or one reply would overwrite
+    /// another band's pixels before they were copied out.
+    #[test]
+    fn planned_slots_never_overlap_within_a_batch() {
+        let bands: Vec<Rect> = (0..40).map(|i| Rect::new(0, i * 16, 640, 16)).collect();
+        let capacity = 640 * 16 * 4 * 7; // room for seven bands
+        let batches = plan_batches(&bands, capacity);
+        assert!(batches.len() > 1, "the capacity should have forced a split");
+        let mut planned = 0;
+        for batch in &batches {
+            assert!(batch.len() <= MAX_PIPELINE);
+            let mut spans: Vec<(usize, usize)> = batch
+                .iter()
+                .map(|s| (s.offset, s.offset + band_bytes(&s.rect)))
+                .collect();
+            spans.sort_unstable();
+            for w in spans.windows(2) {
+                assert!(w[0].1 <= w[1].0, "slots overlap: {spans:?}");
+            }
+            assert!(spans.last().unwrap().1 <= capacity);
+            planned += batch.len();
+        }
+        assert_eq!(planned, bands.len(), "a band was dropped");
+    }
+
+    /// Offsets are summed in `usize` and narrowed only for the wire. A segment
+    /// sized for the 16384-square ceiling `config.rs` allows is a gigabyte,
+    /// and the arithmetic has to stay exact across the whole of it.
+    #[test]
+    fn offsets_stay_inside_a_gigabyte_segment() {
+        let capacity = 16384usize * 16384 * 4;
+        let bands: Vec<Rect> = (0..4)
+            .map(|i| Rect::new(0, i * 4096, 16384, 4096))
+            .collect();
+        let batches = plan_batches(&bands, capacity);
+        // The four bands fill the segment exactly, so none should be split off.
+        assert_eq!(batches.len(), 1);
+        for slot in &batches[0] {
+            assert!(
+                u32::try_from(slot.offset).is_ok(),
+                "offset {} does not fit the wire field",
+                slot.offset
+            );
+            assert!(slot.offset + band_bytes(&slot.rect) <= capacity);
+        }
+    }
+
+    /// Byte counts are multiples of four, offsets are multiples of eight.
+    #[test]
+    fn offsets_stay_aligned() {
+        let bands = [
+            Rect::new(0, 0, 1, 1),
+            Rect::new(0, 1, 1, 1),
+            Rect::new(0, 2, 3, 1),
+        ];
+        let batches = plan_batches(&bands, 1024);
+        assert_eq!(batches.len(), 1);
+        for slot in &batches[0] {
+            assert_eq!(slot.offset % SHM_ALIGN, 0, "unaligned {slot:?}");
+        }
+        assert_eq!(batches[0][1].offset, 8);
+        assert_eq!(batches[0][2].offset, 16);
+    }
+
+    /// Pipeline depth is capped independently of the segment, so a future,
+    /// larger capture budget cannot put an unbounded number of replies in
+    /// flight.
+    #[test]
+    fn the_pipeline_depth_is_capped() {
+        let bands: Vec<Rect> = (0..MAX_PIPELINE as u32 * 2 + 1)
+            .map(|i| Rect::new(0, i, 8, 1))
+            .collect();
+        let batches = plan_batches(&bands, usize::MAX);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), MAX_PIPELINE);
+        assert_eq!(batches[2].len(), 1);
+    }
 
     #[test]
     fn copy_pixels_handles_byte_orders() {

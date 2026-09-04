@@ -73,13 +73,24 @@ impl Handoff {
 }
 
 /// Daemon side: send the client fd to the session and wait for the reply.
+///
+/// `reply_timeout` is how long the session gets to answer. It is a parameter
+/// rather than a constant because the two callers have genuinely different
+/// budgets: an established session replies immediately, while a cold start has
+/// to bring up Xvfb first. This function used to hard-code ten seconds and
+/// silently overwrite whatever the caller had set on the socket, so the
+/// forty-five seconds the manager budgets for a cold start became ten -- less
+/// than the session's own twenty-second displayfd wait plus ten-second connect
+/// allowance, which meant a perfectly healthy session on a loaded host was
+/// declared failed and killed.
 pub fn send_handoff(
     control: &UnixStream,
     handoff: &Handoff,
     client_fd: RawFd,
+    reply_timeout: Duration,
 ) -> io::Result<Reply> {
     control.set_write_timeout(Some(Duration::from_secs(5)))?;
-    control.set_read_timeout(Some(Duration::from_secs(10)))?;
+    control.set_read_timeout(Some(reply_timeout))?;
     send_with_fd(control, &handoff.encode(), client_fd)?;
     let mut b = [0u8; 1];
     (&*control).read_exact(&mut b)?;
@@ -145,8 +156,52 @@ mod tests {
             assert!(fd.as_raw_fd() >= 0);
             send_reply(&session, Reply::Accepted).unwrap();
         });
-        let reply = send_handoff(&daemon, &h, server_side.as_raw_fd()).unwrap();
+        let reply =
+            send_handoff(&daemon, &h, server_side.as_raw_fd(), Duration::from_secs(5)).unwrap();
         assert_eq!(reply, Reply::Accepted);
         t.join().unwrap();
+    }
+
+    /// The caller's reply timeout is the one that applies.
+    ///
+    /// `send_handoff` used to set its own ten seconds on the socket, silently
+    /// discarding whatever the caller had chosen. The manager budgets
+    /// forty-five seconds for a cold start -- more than the session's own
+    /// twenty-second displayfd wait plus ten-second connect allowance -- and
+    /// got ten, so a healthy session on a loaded host was declared failed,
+    /// killed, and (before the parent-death link) orphaned.
+    #[test]
+    fn the_callers_reply_timeout_is_honoured() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+        // `session` is held open and never answers, so the only thing that can
+        // end this call is the timeout.
+        let (daemon, _session) = UnixStream::pair().unwrap();
+        let h = Handoff {
+            uid: 7,
+            username: "u".into(),
+            peer: "p".into(),
+        };
+        let started = std::time::Instant::now();
+        let err = send_handoff(
+            &daemon,
+            &h,
+            server_side.as_raw_fd(),
+            Duration::from_millis(300),
+        )
+        .expect_err("a silent session should time out");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "unexpected error {err:?}"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(5),
+            "waited {waited:?}: the caller's timeout was overridden again"
+        );
     }
 }

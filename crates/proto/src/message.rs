@@ -11,6 +11,66 @@
 //!    [`Message::Rejected`] followed by closing the connection.
 //! 3. Server immediately sends a full [`Message::ScreenUpdate`].
 //!
+//! ## Versioning
+//!
+//! [`crate::PROTOCOL_VERSION`] is the version a build speaks;
+//! [`crate::MIN_COMPATIBLE_VERSION`] is the oldest peer it will still hold a
+//! session with. Between them the two hello handlers — `on_hello` in the
+//! server's session engine, the handshake in the client's `connection` — owe
+//! one rule, and it is a rule rather than a description because the helpers in
+//! `lib.rs` cannot enforce it from where they sit:
+//!
+//! 1. A `ClientHello` below the floor is refused with [`reject::VERSION`] and a
+//!    reason naming both numbers. A version mismatch is something a user can
+//!    act on, but only if the message says which side is old.
+//! 2. A `ClientHello` *above* the server's own version is **not** refused. The
+//!    server answers with [`crate::agreed_version`], the older of the two, and
+//!    speaks that. An old client sees exactly the version it sent, so its
+//!    equality check passes; a newer client sees an older number and decides
+//!    for itself, which is right because it is the only side that knows both
+//!    versions *and* its own floor.
+//! 3. The client refuses a `ServerHello` it cannot speak
+//!    ([`crate::can_speak`]) before the first frame arrives.
+//!
+//! Refusing at the handshake is the entire benefit. The alternative is not
+//! "it mostly works" — it is a session that opens, paints, and then dies on the
+//! first message the older side cannot parse, reporting a tag number instead of
+//! a version.
+//!
+//! ### The gap: a new [`crate::codec::TileEncoding`]
+//!
+//! The floor does not cover everything, and this is the one that will catch
+//! somebody. A tile's encoding is a `u8` nested *inside*
+//! [`Message::ScreenUpdate`], with its own tag space and no skip rule of any
+//! kind. Two consequences, both easy to get backwards:
+//!
+//! * The skippable extension range at [`crate::frame::EXTENSION_TAG_MIN`] is no
+//!   help here. That range is the *message* tag, one layer up, and it works by
+//!   throwing away a whole frame the length prefix has already measured. A
+//!   `ScreenUpdate` is not optional and half of one cannot be discarded.
+//! * A tile cannot be skipped even in principle. The codec is lossless and the
+//!   encoder diffs against a reference frame it believes the client holds, so a
+//!   client that dropped one tile is wrong in that rectangle *permanently* —
+//!   nothing redraws it until those pixels happen to change again. A hard
+//!   failure is the honest outcome and is what `TileEncoding::from_u8` gives:
+//!   [`crate::wire::DecodeError::InvalidTag`], and a dropped connection, in the
+//!   middle of a session that handshook cleanly.
+//!
+//! So a new encoding shipped bare is a compatibility break the version floor
+//! cannot turn into a clean rejection, and one no test in this tree can catch,
+//! because it only appears against a binary built from a different commit.
+//! Before adding one, do one of these:
+//!
+//! * **Put it behind a feature bit** ([`features`]). The client advertises the
+//!   bit in its `ClientHello`, the server emits the encoding only to clients
+//!   that set it, and older clients keep working untouched. Reach for this one:
+//!   the mechanism is already here and costs a bit in a `u32`.
+//! * **Or raise [`crate::PROTOCOL_VERSION`] and
+//!   [`crate::MIN_COMPATIBLE_VERSION`] together.** That converts the
+//!   mid-session death into a refusal at the handshake, which is correct but
+//!   locks out every older client — precisely what the floor exists to stop
+//!   doing.
+//!
 //! ## Flow control
 //!
 //! The server tags each [`Message::ScreenUpdate`] with a monotonically
@@ -53,7 +113,10 @@ pub mod clipboard_format {
 
 /// Reasons a server refuses a client.
 pub mod reject {
-    /// Protocol version mismatch.
+    /// The peer's protocol version is below [`crate::MIN_COMPATIBLE_VERSION`].
+    ///
+    /// The accompanying reason should name both versions: a user told only
+    /// "version mismatch" has no way to know which end to update.
     pub const VERSION: u16 = 1;
     /// Peer could not be identified or is not allowed.
     pub const UNAUTHORIZED: u16 = 2;
@@ -171,6 +234,13 @@ impl Kind {
             70 => Kind::FileList,
             71 => Kind::ClipboardOffer,
             72 => Kind::ClipboardRequest,
+            // Tags at or above `frame::EXTENSION_TAG_MIN` (128) never reach
+            // here: the framing layer discards those frames whole, so an
+            // optional message a newer peer invents does not drop the
+            // connection. Anything unknown *below* that is structural, and a
+            // peer that cannot decode it cannot stay in sync, so it stays
+            // fatal. New message types that both ends must understand belong
+            // below 128; new optional ones belong at or above it.
             other => return Err(DecodeError::InvalidTag(u32::from(other))),
         })
     }
@@ -196,7 +266,10 @@ pub struct CursorImage {
 pub enum Message {
     /// First message from the client.
     ClientHello {
-        /// [`crate::PROTOCOL_VERSION`] of the client.
+        /// [`crate::PROTOCOL_VERSION`] of the client. Refused with
+        /// [`reject::VERSION`] if it is below the server's
+        /// [`crate::MIN_COMPATIBLE_VERSION`]; a *higher* one is clamped rather
+        /// than refused (see the module docs).
         version: u16,
         /// Human readable client identification.
         client_name: String,
@@ -209,7 +282,12 @@ pub enum Message {
     },
     /// Server accepts the client.
     ServerHello {
-        /// Server protocol version.
+        /// Must carry [`crate::agreed_version`]: the older of the two
+        /// versions, which is not always the server's own. A client that
+        /// predates the floor rule compares this against its
+        /// `PROTOCOL_VERSION` for equality, and answering with the agreed
+        /// value rather than the server's is the whole of what makes that
+        /// client's check pass.
         version: u16,
         /// Human readable server identification.
         server_name: String,
@@ -301,6 +379,12 @@ pub enum Message {
         /// Regions copied from the previous frame. Applied before `tiles`.
         copies: Vec<CopyRect>,
         /// Changed rectangles.
+        ///
+        /// Each carries a [`crate::codec::TileEncoding`] tag, which is the one
+        /// part of the protocol the version floor cannot protect: a tag an
+        /// older peer does not know is a fatal decode here, mid-session, long
+        /// after a handshake that succeeded. Read the module docs before
+        /// adding an encoding.
         tiles: Vec<TileUpdate>,
     },
     /// The screen size changed; a full update follows.
@@ -411,6 +495,18 @@ pub const MAX_TILES_PER_UPDATE: usize = 65_536;
 pub const MAX_COPIES_PER_UPDATE: usize = 4_096;
 /// Maximum cursor dimension accepted.
 pub const MAX_CURSOR_DIM: u16 = 256;
+/// Largest screen dimension a *client* will accept from a server.
+///
+/// This is the same ceiling `session.max_width`/`max_height` are validated
+/// against, so it rejects nothing a correctly configured server can produce.
+/// Without it, the two `u16`s in a seven-byte `ScreenResized` reach
+/// `Framebuffer::new` unchecked: 65535 x 65535 x 4 bytes is a 17 GB
+/// allocation, which is an abort rather than an error on some platforms.
+///
+/// It deliberately does *not* apply to `ClientHello` or `ResizeRequest`. Those
+/// are decoded by the server, which already clamps them harmlessly, and a
+/// client asking for something silly is not the threat this guards against.
+pub const MAX_SCREEN_DIM: u16 = 16_384;
 
 impl Message {
     /// Kind tag of this message.
@@ -637,15 +733,27 @@ impl Message {
                 width: r.u16()?,
                 height: r.u16()?,
             },
-            Kind::ServerHello => Message::ServerHello {
-                version: r.u16()?,
-                server_name: r.string()?,
-                features: r.u32()?,
-                session_id: r.u64()?,
-                username: r.string()?,
-                width: r.u16()?,
-                height: r.u16()?,
-            },
+            Kind::ServerHello => {
+                let version = r.u16()?;
+                let server_name = r.string()?;
+                let features = r.u32()?;
+                let session_id = r.u64()?;
+                let username = r.string()?;
+                let width = r.u16()?;
+                let height = r.u16()?;
+                if width > MAX_SCREEN_DIM || height > MAX_SCREEN_DIM {
+                    return Err(DecodeError::InvalidValue("screen size"));
+                }
+                Message::ServerHello {
+                    version,
+                    server_name,
+                    features,
+                    session_id,
+                    username,
+                    width,
+                    height,
+                }
+            }
             Kind::Rejected => Message::Rejected {
                 code: r.u16()?,
                 reason: r.string()?,
@@ -741,10 +849,14 @@ impl Message {
                     tiles,
                 }
             }
-            Kind::ScreenResized => Message::ScreenResized {
-                width: r.u16()?,
-                height: r.u16()?,
-            },
+            Kind::ScreenResized => {
+                let width = r.u16()?;
+                let height = r.u16()?;
+                if width > MAX_SCREEN_DIM || height > MAX_SCREEN_DIM {
+                    return Err(DecodeError::InvalidValue("screen size"));
+                }
+                Message::ScreenResized { width, height }
+            }
             Kind::CursorShape => {
                 let width = r.u16()?;
                 let height = r.u16()?;
@@ -1127,6 +1239,55 @@ mod tests {
         assert_eq!(
             Message::decode(w.as_slice()),
             Err(DecodeError::InvalidValue("cursor size"))
+        );
+    }
+
+    /// A tiny message must not be able to ask the client for gigabytes.
+    ///
+    /// `ScreenResized` is seven bytes on the wire, and its two dimensions used
+    /// to reach `Framebuffer::new` unchecked: a hostile or simply broken server
+    /// could name 65535 x 65535 and demand 17 GB, which on some platforms is
+    /// `handle_alloc_error` and a process abort rather than an error a client
+    /// can report and recover from. The cap is the same ceiling the server's
+    /// own configuration is validated against, so nothing a correctly
+    /// configured server can produce is refused.
+    #[test]
+    fn oversized_screen_dimensions_are_refused() {
+        let mut w = Writer::new();
+        w.u8(Kind::ScreenResized as u8);
+        w.u16(MAX_SCREEN_DIM + 1);
+        w.u16(1080);
+        assert_eq!(
+            Message::decode(w.as_slice()),
+            Err(DecodeError::InvalidValue("screen size"))
+        );
+
+        let mut w = Writer::new();
+        w.u8(Kind::ServerHello as u8);
+        w.u16(1);
+        w.string("srv");
+        w.u32(0);
+        w.u64(1);
+        w.string("alice");
+        w.u16(u16::MAX);
+        w.u16(u16::MAX);
+        assert_eq!(
+            Message::decode(w.as_slice()),
+            Err(DecodeError::InvalidValue("screen size"))
+        );
+
+        // The ceiling itself has to stay usable, or a legitimately large screen
+        // becomes unreachable.
+        let mut w = Writer::new();
+        w.u8(Kind::ScreenResized as u8);
+        w.u16(MAX_SCREEN_DIM);
+        w.u16(MAX_SCREEN_DIM);
+        assert_eq!(
+            Message::decode(w.as_slice()),
+            Ok(Message::ScreenResized {
+                width: MAX_SCREEN_DIM,
+                height: MAX_SCREEN_DIM,
+            })
         );
     }
 
