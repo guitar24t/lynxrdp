@@ -21,8 +21,14 @@ the same steps:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings   # warnings are errors
-cargo test --workspace                                   # 234 tests
+cargo test --workspace                                   # 427 tests
 ```
+
+**Build on a current stable toolchain, not just whatever is installed.** Several
+rustc lints that `-D warnings` turns into errors exist only on newer releases --
+the float-literal fallback on `impl Into<f32>` arguments is one that reached CI
+this way. CI uses `dtolnay/rust-toolchain@stable`, so anything older than that
+locally is a blind spot rather than a safe floor.
 
 Narrower runs while iterating:
 
@@ -37,6 +43,25 @@ cargo test -p lynxrdp-proto codec::tests::noisy_tile_roundtrip -- --exact --noca
 
 The thread limits are not decoration: `e2e` starts real `Xvfb` displays and
 `daemon` binds real sockets and spawns processes. Running them wide is flaky.
+
+**`LYNXRDP_REQUIRE_E2E=1` makes a missing dependency a failure instead of a
+skip.** Every guard in the integration suites prints `SKIP:` and returns, and
+cargo reports a test that returns as a test that *passed* -- so without this,
+dropping `xvfb` from the CI apt line would leave twenty-six end-to-end tests
+green while covering nothing. CI sets it on exactly the steps that install those
+dependencies. Set it locally when you want to be sure a run is real; leave it
+unset if you genuinely do not have `Xvfb` or `xclip`.
+
+```bash
+cargo test -p lynxrdp-server --test privdrop   # needs root; skips cleanly otherwise
+cargo test -p lynxrdp-server --test tunnel_e2e # needs sshd; CI runs it now
+```
+
+**`cargo build -p lynxrdp-server` on its own can fail to link with
+`unable to find library -lxcb`,** on a host with `libxcb` but no `libxcb-devel`.
+Building the server *with* the client (`--workspace`, or the release line the
+packaging uses) resolves x11rb's features differently and links fine, which is
+why CI never sees it. Build the workspace rather than chasing it.
 
 The Python monitor viewer is a separate suite (75 tests):
 
