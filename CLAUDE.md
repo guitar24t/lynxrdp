@@ -21,7 +21,7 @@ the same steps:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings   # warnings are errors
-cargo test --workspace                                   # 553 tests
+cargo test --workspace                                   # 556 tests
 ```
 
 **Build on a current stable toolchain, not just whatever is installed.** Several
