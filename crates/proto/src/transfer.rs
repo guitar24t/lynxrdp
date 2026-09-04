@@ -44,6 +44,24 @@ pub const WINDOW_CHUNKS: u32 = 8;
 /// Largest transfer accepted by default (2 GiB).
 pub const MAX_TRANSFER_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Largest transfer either side will hold entirely in memory (64 MiB).
+///
+/// [`MAX_TRANSFER_SIZE`] is the right bound for something being streamed to a
+/// file, and completely the wrong one for a [`Sink::Memory`]: both endpoints'
+/// policies took a clipboard image straight into memory while explicitly
+/// ignoring the offered size, so a handful of 2 GiB offers were enough to push
+/// either peer out of memory. This is the number SECURITY.md already claims for
+/// clipboard images, now actually enforced.
+pub const MAX_MEMORY_TRANSFER_SIZE: u64 = 64 * 1024 * 1024;
+
+/// How many in-memory transfers may be in flight at once.
+///
+/// A size cap alone bounds one transfer, not the set of them. This is
+/// deliberately *not* a cap on incoming transfers in general: staging a
+/// clipboard file copy legitimately fans out one transfer per file, up to
+/// `MAX_FILE_LIST`, and those stream to disk.
+pub const MAX_CONCURRENT_MEMORY_TRANSFERS: usize = 2;
+
 /// What a transfer is for. Determines how the receiver handles it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -709,6 +727,12 @@ struct Incoming {
     receiver: TransferReceiver<Sink>,
     purpose: TransferPurpose,
     name: String,
+    /// Whether this one accumulates in memory. Tracked at insertion rather
+    /// than derived later, so every path that drops an `Incoming` releases the
+    /// budget by simply removing the record -- a separate counter would have to
+    /// be decremented on each of them, and missing one silently wedges
+    /// clipboard images after a few failed transfers.
+    in_memory: bool,
 }
 
 /// Tracks every transfer in flight on one connection, in both directions.
@@ -849,12 +873,42 @@ impl TransferManager {
                 self.pending.remove(id);
                 match policy.accept(*id, *purpose, name, *size) {
                     Ok(sink) => {
+                        // Memory limits are enforced here rather than in each
+                        // policy. There are two policies, both of which took a
+                        // clipboard image straight into memory while ignoring
+                        // the size they were handed, and a rule that has to be
+                        // repeated on both sides of a protocol is a rule that
+                        // will eventually only be applied on one.
+                        let in_memory = matches!(sink, Sink::Memory(_));
+                        if in_memory {
+                            if *size > MAX_MEMORY_TRANSFER_SIZE {
+                                out.replies.push(Message::TransferAccept {
+                                    id: *id,
+                                    accepted: false,
+                                    reason: format!(
+                                        "{size} bytes is more than this side will hold in memory"
+                                    ),
+                                });
+                                return Some(out);
+                            }
+                            let live = self.incoming.values().filter(|i| i.in_memory).count();
+                            if live >= MAX_CONCURRENT_MEMORY_TRANSFERS {
+                                out.replies.push(Message::TransferAccept {
+                                    id: *id,
+                                    accepted: false,
+                                    reason: "too many in-memory transfers already in flight"
+                                        .to_string(),
+                                });
+                                return Some(out);
+                            }
+                        }
                         self.incoming.insert(
                             *id,
                             Incoming {
                                 receiver: TransferReceiver::new(*id, *size, sink),
                                 purpose: *purpose,
                                 name: name.clone(),
+                                in_memory,
                             },
                         );
                         out.replies.push(Message::TransferAccept {
@@ -1182,6 +1236,65 @@ mod manager_tests {
         assert_eq!(back.failed.len(), 1);
         assert!(back.failed[0].1.contains("declined"), "{:?}", back.failed);
         assert_eq!(client.in_flight(), (0, 0));
+    }
+
+    /// Neither side will hold an unbounded amount of a transfer in memory.
+    ///
+    /// Both endpoints' policies accepted a `ClipboardImage` straight into
+    /// `Sink::Memory` while explicitly ignoring the offered size, and nothing
+    /// capped how many were in flight, so a handful of 2 GiB offers pushed the
+    /// peer out of memory. The limits live in the manager because a rule
+    /// repeated in two policies on two sides of a protocol is one that
+    /// eventually gets applied on only one of them.
+    #[test]
+    fn in_memory_transfers_are_bounded_in_size_and_number() {
+        let mut m = TransferManager::new(true);
+        let mut policy = MemoryPolicy;
+
+        let offer = |id: u64, size: u64| Message::TransferOffer {
+            id,
+            purpose: TransferPurpose::ClipboardImage,
+            name: "clip.png".into(),
+            size,
+        };
+        let accepted = |out: &Outcome| {
+            matches!(
+                out.replies.as_slice(),
+                [Message::TransferAccept { accepted: true, .. }]
+            )
+        };
+
+        // Too large for memory, but well under MAX_TRANSFER_SIZE, so the old
+        // size check let it straight through.
+        let out = m
+            .handle(&offer(1, MAX_MEMORY_TRANSFER_SIZE + 1), &mut policy)
+            .unwrap();
+        assert!(!accepted(&out), "an oversized in-memory offer was accepted");
+
+        // The permitted number may be in flight at once...
+        for id in 0..MAX_CONCURRENT_MEMORY_TRANSFERS as u64 {
+            let out = m.handle(&offer(100 + id, 1024), &mut policy).unwrap();
+            assert!(accepted(&out), "offer {id} within the budget was refused");
+        }
+        // ...and one more is not.
+        let out = m.handle(&offer(200, 1024), &mut policy).unwrap();
+        assert!(!accepted(&out), "the concurrency budget was not enforced");
+
+        // Finishing one releases the budget again, on the ordinary path.
+        m.handle(
+            &Message::TransferData {
+                id: 100,
+                seq: 0,
+                data: vec![0u8; 1024],
+            },
+            &mut policy,
+        )
+        .unwrap();
+        let out = m.handle(&offer(201, 1024), &mut policy).unwrap();
+        assert!(
+            accepted(&out),
+            "the budget was not released when a transfer completed"
+        );
     }
 
     /// A peer claiming success mid-transfer must not produce a silent
