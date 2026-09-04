@@ -1,0 +1,40 @@
+# One sealed monitoring report, hex encoded. Lines beginning with '#', and all
+# whitespace, are ignored by the two readers.
+#
+# THERE IS EXACTLY ONE COPY OF THIS FILE, ON PURPOSE. It is read from two
+# places that each look like they ought to own it:
+#
+#   crates/server/tests/report_fixture.rs               (Rust, byte-asserts it)
+#   tools/lynxrdp-monitor/tests/test_report_fixture.py  (Python, field-asserts)
+#
+# Copying it into the Python tree so that suite "owns its own data" would
+# destroy the only thing it is for. The two implementations are already pinned
+# to each other on the sealing *key* -- a known answer asserted in
+# reporting/seal.rs and again in test_crypto.py -- but nothing pinned the
+# *payload*. Rename a JSON field in crates/server/src/reporting/mod.rs and both
+# suites stay green while every deployed viewer shows an empty table, because
+# model.py's parse_report() returns None the moment "node" or "ip" is missing.
+# Two copies of this file would let exactly that happen again, one copy per
+# side, silently. One copy cannot: the rename fails the Rust assertion, and
+# updating the fixture to match fails the Python one.
+#
+# The plaintext inside is what Report::to_json() produces for the values in
+# reporting/mod.rs's own `sample()`, on one line:
+#
+#   {"node":"desk01","ip":"10.0.0.5","port":3390,"version":"LynxRDP/0.1.0",
+#    "sessions":2,"uptime_secs":3600,"time":1756900000}
+#
+# This is a fixture, not a capture: it was sealed by the same code path a real
+# report goes through, but the nonce is arbitrary, so regenerating rewrites
+# every byte from the nonce onwards. test_crypto.py keeps a genuine captured datagram
+# (RUST_DATAGRAM_HEX) separately, for the framing rather than the contents.
+#
+# Regenerate only after a deliberate payload change:
+#   LYNXRDP_WRITE_REPORT_FIXTURE=1 \
+#     cargo test -p lynxrdp-server --test report_fixture -- --ignored
+# then update the field assertions on the Python side to match.
+4c58523101000102030405060708090a0b038baf3d0f0b5b43048200dcd73009
+6879b07531a610195da6520ad8f84ebc7742bea45416cbe609a9e6fbbf414074
+1adbf221ec1646a3aebfbe8dbc2667015c4f32beaa58f2f5c07e278df0997011
+a74f48ba9773b22962447e9c95de8b2ee34d38b54ddcb24e534f9687dc8ac4c0
+c7d21c6e316c2451660b9fc01a7aa84dab9f51d46de86d03300f

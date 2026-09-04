@@ -826,6 +826,136 @@ fn a_file_downloads_out_of_the_session() {
     assert_eq!(std::fs::read(&dest).unwrap(), content);
 }
 
+/// A large transfer must not stop the screen.
+///
+/// This is the stated reason `CHUNK_SIZE` and `WINDOW_CHUNKS` exist: a chunk is
+/// capped so a frame waits for at most one of them to drain, and the sender's
+/// window bounds how much of a file can be in flight ahead of the acks. Neither
+/// bound had a test that would notice it being removed. The other transfer
+/// tests cannot: they use `run_transfer`, which drives the connection but
+/// discards every `Frame` event, so a session that went blind for the length of
+/// a download would pass all of them. Hence the hand-written loop below.
+#[test]
+fn a_large_download_does_not_stall_the_screen() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+
+    // 16 MiB is 256 chunks, so the sender refills its 8-chunk window thirty-odd
+    // times. Sized against the *frame* cadence rather than the file: the screen
+    // below changes about thirty times a second, so the transfer has to last
+    // long enough for several of those to fall inside it. A megabyte would
+    // finish between two frames on a quick host and prove nothing.
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote = remote_dir.path().join("big.bin");
+    let content: Vec<u8> = (0..16 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&remote, &content).unwrap();
+
+    // Keep the screen changing for the whole transfer. Without this the test
+    // proves nothing at all: a quiescent screen produces no frames either way,
+    // and the assertion below would be measuring the absence of damage rather
+    // than the presence of a stall.
+    let mut painter = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "while :; do xsetroot -solid '#ff0000'; sleep 0.02; \
+             xsetroot -solid '#0000ff'; sleep 0.02; done",
+        )
+        .env("DISPLAY", &s.display)
+        .env("XAUTHORITY", s.xauth())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let dest = out_dir.path().join("big.bin");
+    // The id is not needed: completion arrives as an event, and progress is
+    // no longer sampled now that the measurement is the gap between frames.
+    c.request_file(remote.to_str().unwrap(), dest.clone())
+        .unwrap();
+
+    // What is actually under test is that the core thread never *stops*
+    // serving the screen while a transfer runs. Counting frames that land
+    // inside the transfer window cannot measure that here: over loopback 16 MiB
+    // moves in about sixteen milliseconds, which is one frame interval, so a
+    // correct implementation and a badly stalled one both produce one frame and
+    // the count says nothing. Growing the file until it outruns loopback would
+    // mean hundreds of megabytes in a suite that has to stay quick.
+    //
+    // The largest gap between consecutive frames is the honest measurement, and
+    // it does not care how fast the transfer was: a session that went blind
+    // behind a download shows a gap the length of the download, whereas one
+    // that stayed responsive keeps painting throughout. The painter drives the
+    // screen at roughly 25 Hz, so anything approaching a second is a stall and
+    // nothing else.
+    let mut worst_gap = Duration::ZERO;
+    let mut last_frame = Instant::now();
+    let mut frames = 0u32;
+    let mut done = false;
+    let started = Instant::now();
+    let mut took = Duration::ZERO;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline {
+        let ev = c.poll_event(Duration::from_millis(200)).unwrap();
+        match ev {
+            Some(ClientEvent::FileDownloaded { .. }) => {
+                took = started.elapsed();
+                done = true;
+                // Keep watching briefly: a stall that begins with the last
+                // chunk and ends when the writer drains would otherwise fall
+                // outside the window entirely.
+                let settle = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < settle {
+                    if let Some(ClientEvent::Frame { .. }) =
+                        c.poll_event(Duration::from_millis(100)).unwrap()
+                    {
+                        worst_gap = worst_gap.max(last_frame.elapsed());
+                        last_frame = Instant::now();
+                        frames += 1;
+                    }
+                }
+                break;
+            }
+            Some(ClientEvent::TransferFailed { reason, .. }) => panic!("transfer failed: {reason}"),
+            Some(ClientEvent::Disconnected(r)) => panic!("disconnected: {r}"),
+            Some(ClientEvent::Frame { .. }) => {
+                worst_gap = worst_gap.max(last_frame.elapsed());
+                last_frame = Instant::now();
+                frames += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let _ = painter.kill();
+    let _ = painter.wait();
+
+    assert!(done, "the download never finished");
+    // Not assert_eq!, which would dump 16 MiB of bytes twice before anyone
+    // could read the message. The first differing offset is the useful part.
+    let got = std::fs::read(&dest).unwrap();
+    assert_eq!(got.len(), content.len(), "the download was truncated");
+    let differs = got.iter().zip(content.iter()).position(|(a, b)| a != b);
+    assert!(
+        differs.is_none(),
+        "the downloaded file differs from the original at byte {differs:?}"
+    );
+    assert!(
+        frames > 2,
+        "only {frames} frames arrived in {} ms; the painter is not driving the \
+         screen, so this test is measuring nothing",
+        started.elapsed().as_millis()
+    );
+    assert!(
+        worst_gap < Duration::from_secs(1),
+        "the screen went {} ms without a frame while a 16 MiB download ran \
+         (transfer took {} ms, {frames} frames): the session stalled behind it",
+        worst_gap.as_millis(),
+        took.as_millis()
+    );
+}
+
 #[test]
 fn downloading_a_missing_file_fails_cleanly() {
     require_xvfb!();
@@ -950,6 +1080,74 @@ fn exit_on_disconnect_ends_session() {
         .wait_exit(Duration::from_secs(10))
         .expect("session should exit");
     assert!(st.success(), "{st}");
+}
+
+/// The idle timeout is the only thing that ever ends an abandoned session.
+///
+/// `--exit-on-disconnect` exists and is covered just above, but the daemon
+/// never passes it: `daemon/manager.rs` builds the session's argument list and
+/// it is not in there, deliberately, because a user whose SSH tunnel drops is
+/// meant to reconnect to the session they left. That makes `idle_timeout` the
+/// entire lifecycle policy for a session nobody comes back to -- otherwise an
+/// Xvfb, a desktop and a PAM session sit on the host until it reboots -- and it
+/// had no test on either side.
+///
+/// The client connects and then leaves rather than never connecting, because
+/// `last_client_seen` is initialised at start-up: a timer that was only ever
+/// armed once would still pass a test that measured from there, and would still
+/// fail to collect the sessions this is for.
+#[test]
+fn an_idle_session_exits_after_the_timeout() {
+    require_xvfb!();
+    let mut s = Session::start(320, 240, "none", &["--idle-timeout", "2"]);
+    let mut c = s.connect(None);
+    s.x("xsetroot", &["-solid", "#ff00ff"]);
+    assert!(wait_for(&mut c, Duration::from_secs(5), |_, c| c
+        .framebuffer()
+        .get(1, 1)
+        == 0xff00ff));
+    c.disconnect("test done");
+    drop(c);
+    let st = s
+        .wait_exit(Duration::from_secs(20))
+        .expect("an abandoned session should have timed out");
+    assert!(st.success(), "{st}");
+}
+
+/// ...and it must not fire while somebody is still connected.
+///
+/// The obvious way to write this is `let _ = s.connect(None);`, which drops the
+/// client on the spot -- disconnecting it, arming the idle timer, and asserting
+/// the exact opposite of what the test claims while still going green for as
+/// long as the timeout outlasts the wait. Hence the binding, and hence the
+/// poll loop: a client that stops answering pings is dropped after
+/// `PONG_TIMEOUT` and would be testing something else entirely.
+#[test]
+fn a_session_with_a_client_attached_survives_the_idle_timeout() {
+    require_xvfb!();
+    let mut s = Session::start(320, 240, "none", &["--idle-timeout", "2"]);
+    let mut client = s.connect(None);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        let ev = client
+            .poll_event(Duration::from_millis(100))
+            .expect("poll failed");
+        if let Some(ClientEvent::Disconnected(r)) = ev {
+            panic!("the session dropped its client: {r}");
+        }
+    }
+    assert!(
+        s.wait_exit(Duration::from_millis(200)).is_none(),
+        "the session exited on its idle timeout with a client attached"
+    );
+    // Proof the connection is still live rather than merely still in scope.
+    client.ping().unwrap();
+    assert!(wait_for(
+        &mut client,
+        Duration::from_secs(5),
+        |ev, _| matches!(ev, ClientEvent::Rtt(_))
+    ));
+    client.disconnect("test done");
 }
 
 #[test]
