@@ -90,6 +90,19 @@ pub mod colour {
     pub const PRESSED_ALPHA: u32 = 87;
 }
 
+/// How long the pointer must stay in the hot zone before the bar comes up.
+///
+/// The top edge of the remote screen is somewhere users go on purpose --
+/// a panel, a menu bar, a window title bar dragged up to maximise -- and a bar
+/// that appeared the moment the pointer crossed the strip covered the thing
+/// they were reaching for. The dwell is what separates "I am using the top of
+/// my desktop" from "I want the connection bar": the first is a pass through
+/// the strip, the second is a pause in it.
+///
+/// Presence, not stillness: the timer runs while the pointer is anywhere in
+/// the strip and is reset only by leaving it. Requiring the pointer to hold
+/// still would make the bar hard to summon with a real mouse, which jitters.
+pub const REVEAL_DELAY: Duration = Duration::from_millis(600);
 /// How long the bar stays up after the pointer leaves it.
 pub const HIDE_DELAY: Duration = Duration::from_millis(700);
 /// How long the bar shows itself on connect and on every state change, so it
@@ -626,8 +639,13 @@ pub struct Overlay {
     visible: bool,
     pinned: bool,
     focused: bool,
-    /// The pointer is in the hot zone or on the bar.
-    near: bool,
+    /// The pointer is on the bar itself, which holds it up with no delay --
+    /// a bar that hid out from under the pointer aiming at its buttons would
+    /// be unusable.
+    on_bar: bool,
+    /// When the pointer entered the hot zone, or `None` when it is outside.
+    /// The bar comes up once this is [`REVEAL_DELAY`] old.
+    in_zone_since: Option<Instant>,
     /// Whether the pointer was holding the bar up at the last tick, so that
     /// the grace period below is armed by the pointer *leaving* and by
     /// nothing else.
@@ -677,31 +695,69 @@ impl Overlay {
     /// Window focus changed. An unfocused window does not raise the bar on
     /// hover: the pointer is probably only crossing it on its way somewhere.
     pub fn set_focused(&mut self, focused: bool) {
-        self.focused = focused;
-        if !focused {
-            self.near = false;
-            self.hover = None;
-            self.armed = None;
+        if focused == self.focused {
+            return;
         }
+        self.focused = focused;
+        // Either direction throws the pointer state away, the dwell included.
+        // What the pointer was doing over an unfocused window -- crossing it
+        // on the way somewhere, resting on it -- was not a request for this
+        // bar, so the clock starts when the window is the user's again and
+        // they move in the strip, not before.
+        self.on_bar = false;
+        self.in_zone_since = None;
+        self.hover = None;
+        self.armed = None;
     }
 
     /// The pointer left the window.
     pub fn pointer_left(&mut self) {
-        self.near = false;
+        self.on_bar = false;
+        self.in_zone_since = None;
         self.hover = None;
+    }
+
+    /// The session has taken the pointer -- a button is down on the remote
+    /// screen.
+    ///
+    /// This cancels a dwell in progress, and it is why a press in the hot zone
+    /// is a press and not a slow reveal: clicking a panel at the top of the
+    /// remote desktop, or dragging a window up there, must not raise the bar
+    /// over the thing being clicked. The dwell restarts from the next move
+    /// after the button comes up.
+    pub fn pointer_taken(&mut self) {
+        self.on_bar = false;
+        self.in_zone_since = None;
     }
 
     /// Note the pointer position. Returns true when it is over the bar, in
     /// which case the caller must not forward the event to the session.
-    pub fn track(&mut self, x: u32, y: u32, s: u32) -> bool {
-        let on_bar = self.visible && y < bar_height(s);
-        self.near = on_bar || y < hot_zone_height(s);
-        self.hover = if on_bar {
+    ///
+    /// `now` is what the dwell is measured from, so it is taken here rather
+    /// than at the next tick: the strip is a few pixels tall and a pointer
+    /// crossing it may be seen exactly once, and starting the clock a tick
+    /// late would make [`REVEAL_DELAY`] mean anything up to a tick more.
+    pub fn track(&mut self, x: u32, y: u32, s: u32, now: Instant) -> bool {
+        self.on_bar = self.visible && y < bar_height(s);
+        if self.on_bar || y < hot_zone_height(s) {
+            // Re-entering restarts the dwell; staying does not, so the timer
+            // survives movement along the strip.
+            self.in_zone_since.get_or_insert(now);
+        } else {
+            self.in_zone_since = None;
+        }
+        self.hover = if self.on_bar {
             self.layout.as_ref().and_then(|l| l.button_at(x, y))
         } else {
             None
         };
-        on_bar
+        self.on_bar
+    }
+
+    /// Whether a dwell is running that has not yet raised the bar, so the
+    /// caller knows to keep waking up finely enough to honour it.
+    pub fn revealing(&self) -> bool {
+        !self.visible && self.focused && self.in_zone_since.is_some()
     }
 
     /// A press landed on the bar.
@@ -730,11 +786,18 @@ impl Overlay {
     /// else: it exists so that crossing the bar's own bottom edge does not
     /// make it flicker. An expiring flash or an unpin hides the bar at once,
     /// because in both cases the user has already had their 1500 ms.
+    ///
+    /// The pointer holds the bar up once it has been in the hot zone for
+    /// [`REVEAL_DELAY`], or at once when it is on the bar already -- the delay
+    /// is the price of raising a bar, not of keeping one that is up.
     pub fn tick(&mut self, now: Instant) -> bool {
         if self.flash_until.is_some_and(|t| now >= t) {
             self.flash_until = None;
         }
-        let pointed = self.focused && self.near;
+        let dwelt = self
+            .in_zone_since
+            .is_some_and(|t| now.saturating_duration_since(t) >= REVEAL_DELAY);
+        let pointed = self.focused && (self.on_bar || dwelt);
         if pointed {
             self.hide_at = None;
         } else if self.was_pointed {
@@ -1167,23 +1230,78 @@ mod tests {
         o.tick(now);
         assert!(!o.visible(), "the opening flash should have expired");
 
-        o.track(100, 2, 2);
+        o.track(100, 2, 2, now);
+        now += REVEAL_DELAY;
         o.tick(now);
         assert!(!o.visible(), "an unfocused window should not raise the bar");
 
+        // Focus restarts the dwell, so the time already spent in the strip
+        // over an unfocused window buys nothing.
         o.set_focused(true);
-        o.track(100, 2, 2);
+        assert!(!o.tick(now));
+        o.track(100, 2, 2, now);
+        now += REVEAL_DELAY;
         assert!(o.tick(now));
         assert!(o.visible());
 
         // Leaving starts the delay rather than hiding at once, so crossing the
         // bar's own edge does not make it flicker.
-        o.track(100, 200, 2);
+        o.track(100, 200, 2, now);
         now += Duration::from_millis(1);
         assert!(!o.tick(now));
         assert!(o.visible());
         now += HIDE_DELAY;
         assert!(o.tick(now));
+        assert!(!o.visible());
+    }
+
+    #[test]
+    fn reaching_for_the_top_of_the_remote_screen_does_not_raise_the_bar() {
+        // The whole point of the dwell: a pointer on its way to a panel or a
+        // title bar passes through the strip, and passing through must not
+        // put our bar over the thing it was going to.
+        let mut now = Instant::now();
+        let mut o = Overlay::new(now);
+        o.set_focused(true);
+        now += FLASH;
+        o.tick(now);
+        assert!(!o.visible(), "the opening flash should have expired");
+
+        o.track(100, 2, 2, now);
+        now += REVEAL_DELAY / 2;
+        assert!(!o.tick(now), "half a dwell is not a dwell");
+        o.track(100, 300, 2, now);
+        now += REVEAL_DELAY * 2;
+        assert!(!o.tick(now));
+        assert!(!o.visible(), "leaving the strip abandons the dwell");
+
+        // Staying does raise it, and moving along the strip is staying: the
+        // clock is reset by leaving and by nothing else.
+        let entered = now;
+        o.track(100, 2, 2, now);
+        now += REVEAL_DELAY / 2;
+        o.track(600, 5, 2, now);
+        assert!(!o.tick(now));
+        now = entered + REVEAL_DELAY;
+        assert!(o.tick(now));
+        assert!(o.visible());
+    }
+
+    #[test]
+    fn a_press_in_the_hot_zone_belongs_to_the_session() {
+        // Clicking something at the top of the remote desktop and holding --
+        // a menu, a drag -- would otherwise finish the dwell under the button
+        // and cover what was clicked.
+        let mut now = Instant::now();
+        let mut o = Overlay::new(now);
+        o.set_focused(true);
+        now += FLASH;
+        o.tick(now);
+
+        o.track(100, 2, 2, now);
+        o.pointer_taken();
+        now += REVEAL_DELAY * 3;
+        assert!(!o.tick(now));
         assert!(!o.visible());
     }
 
@@ -1218,16 +1336,16 @@ mod tests {
         let (bx, by) = (disconnect.rect.x + 4, disconnect.rect.y + 4);
 
         // A press that drifts off the button before release does nothing.
-        o.track(bx, by, 2);
+        o.track(bx, by, 2, now);
         o.press();
-        o.track(10, by, 2);
+        o.track(10, by, 2, now);
         assert_eq!(o.release(), None);
 
         // A release with no press does nothing either.
-        o.track(bx, by, 2);
+        o.track(bx, by, 2, now);
         assert_eq!(o.release(), None);
 
-        o.track(bx, by, 2);
+        o.track(bx, by, 2, now);
         o.press();
         assert_eq!(o.release(), Some(Action::Disconnect));
     }
@@ -1238,13 +1356,16 @@ mod tests {
         let mut o = Overlay::new(now);
         o.set_focused(true);
         assert!(
-            !o.track(100, 10, 2),
+            !o.track(100, 10, 2, now),
             "hidden bar must not swallow the pointer"
         );
         o.tick(now);
         assert!(o.visible());
-        assert!(o.track(100, 10, 2));
-        assert!(!o.track(100, 40, 2), "below the bar is the remote screen");
+        assert!(o.track(100, 10, 2, now));
+        assert!(
+            !o.track(100, 40, 2, now),
+            "below the bar is the remote screen"
+        );
     }
 
     /// The scrim composited over an arbitrary remote screen.
