@@ -135,6 +135,44 @@ certificate behind this project, so both systems will object the first time:
 Every release also publishes `SHA256SUMS`, which is the check that actually
 tells you the download is intact.
 
+### Keeping the client up to date
+
+The connection manager can update itself. Once a day it asks
+`api.github.com` for this project's release list, and if there is a newer one
+it says so above the list of connections. Nothing is downloaded until you
+choose **Install**.
+
+What that costs in privacy is one HTTPS request carrying your address and a
+user agent naming the release you are on — `lynxrdp/v0.1.0-rc.5 (+…)`. No
+identifier, nothing about your saved connections, and no request at all if
+you turn it off: **Help → Check Automatically**. The manual **Help → Check
+for Updates…** still works with it off.
+
+`SHA256SUMS` from the same release is checked before anything is unpacked,
+and a download that does not match is thrown away. That catches a truncated
+or corrupted file. It is not a signature: it arrives from the same place over
+the same connection, so what you are trusting is GitHub and your TLS
+connection to it, exactly as if you had downloaded the file yourself.
+
+What happens then depends on how the client was installed:
+
+| Installed as | Update |
+| --- | --- |
+| Archive, or Windows installer in a folder you can write | Replaced in place. Restart to use it. |
+| Windows installer in `Program Files` | Downloads `setup.exe` and runs it — Windows asks for administrator, and the installer's last page offers to reopen LynxRDP. |
+| macOS `LynxRDP.app` | The whole bundle is replaced. Because your machine did the download rather than a browser, Gatekeeper does not re-quarantine it and you are not asked to allow it a second time. |
+| `.deb` / `.rpm` | **Not** replaced. The package manager owns those files, so the window says so and points you at `apt` or `dnf`. |
+
+Release candidates are offered to anyone already running one, and only to
+them; **Help → Include Prereleases** overrides that either way. A client
+built from source rather than downloaded never replaces itself, and does not
+check on its own.
+
+One thing worth knowing before updating a client on its own: a client can
+speak to an older server, but only back to its own protocol floor. If the
+server is older than that, the session is refused with a message naming both
+versions, and the server needs updating too.
+
 ### You also need an OpenSSH client
 
 * **Windows 10/11**: ships with OpenSSH (`ssh.exe`). Enable it under

@@ -38,6 +38,28 @@ tempfile = "3"
 # why the launcher spawns sessions as child processes rather than opening
 # one in-process: a second winit event loop is not allowed on macOS.
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+# The updater. ureq's defaults are rustls with the bundled Mozilla roots, so
+# there is no system TLS library to find at build time or at run time and the
+# same binary works on a host with no CA bundle laid out where OpenSSL wants
+# it. serde_json only ever sees GitHub's release listing; semver only ever
+# compares release tags, where getting `rc.10 > rc.9` and `0.1.0 > 0.1.0-rc.5`
+# right by hand is more subtlety than a hand-rolled comparison deserves.
+# Pinned to the 3.2 line on purpose: 3.4 raises its own minimum toolchain to
+# 1.85, and this workspace still promises rust-version 1.80. Lift both
+# together or neither -- with resolver 2 the version choice is not
+# MSRV-aware, so a bare "3" would quietly break the promise.
+ureq = "~3.2"
+serde_json = "1"
+semver = "1"
+sha2 = { workspace = true }
+
+# Unpacking a downloaded release. Each platform pulls only its own format:
+# the Unix builds ship a .tar.gz and the Windows build a .zip, and neither
+# has any use for the other's reader. Pure Rust backends throughout --
+# flate2 on miniz_oxide, and zip with everything but deflate turned off.
+[target.'cfg(unix)'.dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4", default-features = false }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11rb = "0.13"
@@ -46,6 +68,7 @@ x11rb = "0.13"
 # its own minimal binding: CF_HDROP on Windows, NSPasteboard on macOS.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 # Host-conditional: the resource compiler only exists on Windows, and that
 # is also the only place we build Windows executables.

@@ -21,7 +21,7 @@ the same steps:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings   # warnings are errors
-cargo test --workspace                                   # 507 tests
+cargo test --workspace                                   # 553 tests
 ```
 
 **Build on a current stable toolchain, not just whatever is installed.** Several
@@ -55,6 +55,16 @@ unset if you genuinely do not have `Xvfb` or `xclip`.
 ```bash
 cargo test -p lynxrdp-server --test privdrop   # needs root; skips cleanly otherwise
 cargo test -p lynxrdp-server --test tunnel_e2e # needs sshd; CI runs it now
+```
+
+**Two tests reach github.com and are `#[ignore]`d for it.** A suite that fails
+on an aeroplane is a suite people learn to ignore, so neither CI nor a plain
+`cargo test` runs them. They are the only check that the release listing still
+has the shape the updater reads and that a published archive still installs,
+which makes them worth running by hand when either end changes:
+
+```bash
+cargo test -p lynxrdp-client --lib -- --ignored --nocapture
 ```
 
 **`cargo build -p lynxrdp-server` on its own can fail to link with
@@ -170,7 +180,26 @@ not a style question.
   `packaging/check-glibc-floor.sh` enforces it in CI.
 - **Pure Rust, no C library dependencies.** x11rb, not xlib; PAM is `dlopen`ed
   at runtime (`daemon/pam.rs`) so one binary works with or without PAM present.
-  Keep new dependencies in that spirit.
+  Keep new dependencies in that spirit. The updater's TLS is rustls with
+  bundled roots for the same reason — there is no system library to find.
+- **The updater matches release assets by suffix.** `update::asset_suffix`
+  looks for `-linux-x86_64.tar.gz`, `-windows-x86_64.zip`,
+  `-windows-x86_64-setup.exe` and so on, where the platform names come from
+  the matrix in `release.yml`. Renaming an asset in `package-client.sh`, or
+  dropping `SHA256SUMS` from the release job, does not fail any build: it
+  makes every deployed client report "no published download for this
+  platform" instead. Change one, change `update/mod.rs`.
+- **`LYNXRDP_RELEASE_TAG` is how a build knows which release it is.**
+  `release.yml` sets it, `build.rs` bakes it in, and a build without it
+  refuses to replace itself. Do not try to derive this from
+  `CARGO_PKG_VERSION`: the workspace version stays `0.1.0` across every
+  candidate, so `v0.1.0-rc.6` would compare as *older* than a build that
+  reported `0.1.0`. To exercise the updater locally, build with a fake older
+  tag: `LYNXRDP_RELEASE_TAG=v0.1.0-rc.1 cargo run -p lynxrdp-client --bin lynxrdp`.
+- **`ureq` is pinned to `~3.2` to hold the 1.80 `rust-version`.** 3.4 raises
+  its own floor to 1.85. Lift both together or neither; with `resolver = "2"`
+  the version choice is not MSRV-aware, so a bare `"3"` silently breaks the
+  promise the manifest makes.
 
 ## Platform traps
 

@@ -26,6 +26,7 @@ pub mod profiles;
 pub mod settings;
 pub mod theme;
 pub mod tunnel;
+pub mod update;
 
 /// Name reported to the server.
 pub const CLIENT_NAME: &str = concat!("LynxRDP client/", env!("CARGO_PKG_VERSION"));

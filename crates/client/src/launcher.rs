@@ -28,6 +28,7 @@ use crate::launch::Sessions;
 use crate::profiles::{self, Profile, Profiles};
 use crate::settings::{Settings, ThemeChoice};
 use crate::theme;
+use crate::update::{self, State, Updater};
 
 /// Where "Documentation" goes.
 const REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
@@ -40,6 +41,15 @@ const EXCHANGE_FILE: &str = "connections-export.toml";
 
 /// Open the launcher, returning when the window is closed.
 pub fn run(path: PathBuf) -> Result<()> {
+    // Before the window: an update installed last time may have left the
+    // executable it replaced behind, because Windows will not delete the
+    // image of a running process. This is the next start, so it will go now.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = update::install::install_dir(&exe) {
+            update::install::sweep(&dir);
+        }
+    }
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("LynxRDP")
         // Matches StartupWMClass in the .desktop entry, which is how a Linux
@@ -117,6 +127,28 @@ mod keys {
     pub const FILTER: KeyboardShortcut = KeyboardShortcut::new(PLAIN, Key::Slash);
 }
 
+/// What the update window says about where a download comes from.
+///
+/// Written once and shown next to the Install button rather than left to the
+/// README, because this is the moment a user is deciding whether to let the
+/// application replace itself, and "we checked the checksum" and "nobody
+/// signed this" are both true and both theirs to weigh.
+const UPDATE_TRUST: &str = "The download is checked against the SHA256SUMS published with the \
+     release. Nothing here is code signed, so your system may still warn about an unknown \
+     publisher.";
+
+/// What Help > Check for Updates does, said before it is chosen.
+const UPDATE_CHECK_HINT: &str =
+    "Asks github.com for the release list. Nothing is downloaded until you say so.";
+
+/// Why the prerelease checkbox may already be ticked.
+const UPDATE_PRERELEASE_HINT: &str = "Release candidates as well as finished releases. Follows \
+     the build you are running until you choose.";
+
+/// What "Installed" does and does not mean.
+const UPDATE_RESTART_HINT: &str = "This window is still the old build; restarting picks up the \
+     new one. Running sessions are not affected.";
+
 /// Id of the filter field.
 ///
 /// Fixed rather than generated because the key handler runs *before* the
@@ -154,6 +186,19 @@ enum Action {
     ShowAbout,
     OpenDocumentation,
 
+    /// Ask GitHub whether there is a newer release.
+    CheckForUpdates,
+    /// Open the update window, whatever the updater is currently doing.
+    ShowUpdate,
+    /// Download the release that was found and put it in place.
+    InstallUpdate,
+    /// Start the build that was just installed and close this one.
+    RestartForUpdate,
+    /// Close the notice above the list for this run.
+    DismissUpdate,
+    ToggleAutoUpdate,
+    TogglePrereleases,
+
     /// Move the selection by n rows through what the filter is showing.
     Move(isize),
     FocusFilter,
@@ -179,6 +224,10 @@ enum Dialog {
     Export(String),
     Shortcuts,
     About,
+    /// The updater, in whatever state it is in. It holds nothing of its own:
+    /// what the window shows comes from [`Updater::state`], so opening this
+    /// while a download is running shows the download.
+    Update,
 }
 
 /// A profile being edited.
@@ -350,6 +399,21 @@ struct Launcher {
     /// save would publish that emptiness over the real thing. The user has
     /// to fix the file or move it aside before anything writes it again.
     load_failed: bool,
+    /// Checking the releases page, and replacing this build with what it
+    /// finds. Lives here rather than in the session window because a session
+    /// is a child process with no menus -- and because replacing the
+    /// executable under a desktop that is mid-keystroke would be rude.
+    updater: Updater,
+    /// Whether the once-a-day check has already been considered this run, so
+    /// that a launcher left open for a week does not ask again every frame
+    /// the moment the interval passes.
+    auto_checked: bool,
+    /// Whether the user asked for the check that is running.
+    ///
+    /// A check they asked for reports its failure in red; the automatic one
+    /// goes to the log. An aeroplane with no network should not paint an
+    /// error across a window somebody opened to read a host name.
+    update_asked: bool,
 }
 
 impl Launcher {
@@ -399,6 +463,9 @@ impl Launcher {
             error,
             confirming_delete: None,
             load_failed,
+            updater: Updater::default(),
+            auto_checked: false,
+            update_asked: false,
         }
     }
 
@@ -616,6 +683,14 @@ impl Launcher {
             Action::AskExport => writable,
             Action::Connect | Action::Edit | Action::CopyCommandLine => selection,
             Action::MoveAside => self.load_failed,
+            // Every one of these would otherwise be a button that starts a
+            // second thread, or one that offers an install nothing found.
+            Action::CheckForUpdates => !self.updater.busy(),
+            Action::InstallUpdate => self
+                .updater
+                .found()
+                .is_some_and(|f| f.installable() && !self.updater.busy()),
+            Action::RestartForUpdate => *self.updater.state() == State::Installed,
             _ => true,
         }
     }
@@ -713,10 +788,174 @@ impl Launcher {
             Action::ShowAbout => self.dialog = Some(Dialog::About),
             Action::OpenDocumentation => ctx.open_url(egui::OpenUrl::new_tab(REPO_URL)),
 
+            Action::CheckForUpdates => {
+                self.update_asked = true;
+                self.dialog = Some(Dialog::Update);
+                self.start_check();
+            }
+            Action::ShowUpdate => self.dialog = Some(Dialog::Update),
+            Action::InstallUpdate => {
+                self.dialog = Some(Dialog::Update);
+                self.updater.install();
+            }
+            Action::RestartForUpdate => {
+                match update::restart() {
+                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    // Nothing has been lost -- the new build is in place and
+                    // the next start will be it -- so this is a line, not a
+                    // state.
+                    Err(e) => {
+                        self.error = Some(format!(
+                            "Could not start the new version: {e:#}. Close and reopen LynxRDP."
+                        ))
+                    }
+                }
+            }
+            Action::DismissUpdate => self.updater.dismiss(),
+            Action::ToggleAutoUpdate => {
+                self.settings.updates.check = !self.settings.updates.check;
+                self.save_settings();
+            }
+            Action::TogglePrereleases => {
+                // Tri-state on disk, two-state in the menu: the first click
+                // writes down whatever the automatic answer currently is,
+                // inverted, and it stays written from then on.
+                let current = self.prereleases();
+                self.settings.updates.prereleases = Some(!current);
+                self.save_settings();
+            }
+
             Action::Move(delta) => self.move_selection(delta),
             Action::FocusFilter => self.focus_filter = true,
             Action::ClearFilter => self.filter.clear(),
         }
+    }
+
+    /// Whether release candidates are on offer, resolving the "match what I
+    /// am running" default.
+    fn prereleases(&self) -> bool {
+        update::wants_prereleases(
+            self.settings.updates.prereleases,
+            &update::current_version(),
+        )
+    }
+
+    /// Start a check and remember when it happened.
+    ///
+    /// The stamp is written when the check *starts*, not when it succeeds. A
+    /// machine that is offline all week would otherwise try again on every
+    /// start, which is a request a minute for a network that is not there.
+    fn start_check(&mut self) {
+        if self.updater.busy() {
+            return;
+        }
+        self.settings.updates.last_check = Some(update::now_secs());
+        self.save_settings();
+        self.updater.check(self.settings.updates.prereleases);
+    }
+
+    /// The once-a-day check, considered once per run.
+    fn maybe_auto_check(&mut self) {
+        if self.auto_checked {
+            return;
+        }
+        self.auto_checked = true;
+        if !self.settings.updates.check {
+            return;
+        }
+        // Only a build that could actually install an update asks for one by
+        // itself. A working copy or a distribution's own build cannot -- see
+        // `update::Blocker::NotARelease` -- so a background request would be
+        // traffic that could never lead anywhere, from the machines most
+        // likely to object to it. Help > Check for Updates still works.
+        if update::current_tag().is_none() {
+            return;
+        }
+        if !update::due(self.settings.updates.last_check, update::now_secs()) {
+            return;
+        }
+        self.update_asked = false;
+        self.start_check();
+    }
+
+    /// Say what the updater just did.
+    ///
+    /// Only from [`Self::draw`], and only when [`Updater::poll`] reports a
+    /// change, so a status line written here is not overwritten every frame.
+    fn on_update_change(&mut self, ctx: &egui::Context) {
+        match self.updater.state().clone() {
+            State::Found(found) => {
+                self.status = match &found.blocker {
+                    None => format!("LynxRDP {} is available.", found.tag),
+                    Some(_) => format!("LynxRDP {} has been released.", found.tag),
+                };
+                self.error = None;
+            }
+            State::UpToDate => {
+                // Only worth a line when somebody asked. A background check
+                // that finds nothing should leave the window as it was.
+                if self.update_asked {
+                    self.status = format!("{} is the newest release.", update::current_label());
+                    self.error = None;
+                }
+            }
+            State::Installed => {
+                self.status = "Update installed. Restart LynxRDP to use it.".into();
+                self.error = None;
+            }
+            State::HandedOff => {
+                // The installer cannot replace an executable that is running,
+                // and it is now waiting for the user behind our window.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            State::Failed(e) => {
+                if self.update_asked {
+                    self.error = Some(format!("Update failed: {e}"));
+                } else {
+                    log::debug!("background update check failed: {e}");
+                }
+            }
+            State::Idle | State::Checking | State::Downloading { .. } => {}
+        }
+    }
+
+    /// The strip above the list that says a new version exists.
+    ///
+    /// The same shape as the unreadable-file warning below it, deliberately:
+    /// one line, said where the thing it concerns is, with the buttons that
+    /// answer it on the same line.
+    fn update_notice_ui(&mut self, ui: &mut egui::Ui, chosen: &mut Option<Action>) {
+        let Some(found) = self.updater.found().cloned() else {
+            return;
+        };
+        let t = theme::of(ui.visuals());
+        padded(ui, |ui| {
+            ui.add_space(theme::UNIT);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("LynxRDP {} is available.", found.tag))
+                        .color(t.accent),
+                );
+                // Drawn only when it would do something: the button exists
+                // in the same breath as the click that answers it.
+                if found.installable()
+                    && ui
+                        .button("Install")
+                        .on_hover_text(format!("Downloads {}", found.asset.name))
+                        .clicked()
+                {
+                    *chosen = Some(Action::InstallUpdate);
+                }
+                if ui.button("Details…").clicked() {
+                    *chosen = Some(Action::ShowUpdate);
+                }
+                if ui.button("Later").clicked() {
+                    *chosen = Some(Action::DismissUpdate);
+                }
+            });
+            ui.add_space(theme::UNIT);
+        });
+        hairline(ui, t.border);
     }
 
     /// A path in the configuration directory, as a starting point for the
@@ -1032,6 +1271,33 @@ impl Launcher {
             self.item(ui, "Documentation", Action::OpenDocumentation, None, chosen)
                 .on_hover_text(REPO_URL);
             ui.separator();
+            self.item(
+                ui,
+                "Check for Updates…",
+                Action::CheckForUpdates,
+                None,
+                chosen,
+            )
+            .on_hover_text(UPDATE_CHECK_HINT);
+            let mut automatic = self.settings.updates.check;
+            if ui
+                .checkbox(&mut automatic, "Check Automatically")
+                .on_hover_text("Once a day at most, and only ever to offer.")
+                .clicked()
+            {
+                *chosen = Some(Action::ToggleAutoUpdate);
+                ui.close_menu();
+            }
+            let mut prereleases = self.prereleases();
+            if ui
+                .checkbox(&mut prereleases, "Include Prereleases")
+                .on_hover_text(UPDATE_PRERELEASE_HINT)
+                .clicked()
+            {
+                *chosen = Some(Action::TogglePrereleases);
+                ui.close_menu();
+            }
+            ui.separator();
             self.item(ui, "About LynxRDP…", Action::ShowAbout, None, chosen);
         });
     }
@@ -1079,6 +1345,10 @@ impl Launcher {
         let mut chosen = self.toolbar_ui(ui);
         let t = theme::of(ui.visuals());
         hairline(ui, t.border);
+
+        if self.updater.announcing() {
+            self.update_notice_ui(ui, &mut chosen);
+        }
 
         if self.load_failed {
             // An empty list here means "unreadable", not "none saved", and
@@ -1670,6 +1940,10 @@ impl Launcher {
             return;
         };
         let mut close = false;
+        // An action the modal asks for, run after the closure ends: the
+        // buttons inside it already hold `&mut self` through the borrow that
+        // draws them, and `perform` wants the same.
+        let mut pending: Option<Action> = None;
         let t = theme::of(&ctx.style().visuals);
         // What a scrolling dialog may take before its own buttons are pushed
         // out of the window: everything but the heading, the buttons and the
@@ -1800,11 +2074,14 @@ impl Launcher {
                 }
                 Dialog::About => {
                     ui.heading("LynxRDP");
+                    // The release tag, not the Cargo version: they differ on
+                    // every candidate, and the one a user needs when
+                    // reporting something is the one on the releases page.
                     ui.label(
                         egui::RichText::new(format!(
-                            "version {} · {}",
-                            env!("CARGO_PKG_VERSION"),
-                            crate::CLIENT_NAME
+                            "{} · protocol {}",
+                            update::current_label(),
+                            lynxrdp_proto::PROTOCOL_VERSION
                         ))
                         .small()
                         .color(t.text_dim),
@@ -1838,10 +2115,156 @@ impl Launcher {
                         close = true;
                     }
                 }
+                Dialog::Update => {
+                    ui.heading("Update");
+                    ui.add_space(theme::UNIT);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "You are running {}.",
+                            update::current_label()
+                        ))
+                        .small()
+                        .color(t.text_dim),
+                    );
+                    ui.add_space(theme::UNIT);
+                    // Cloned rather than borrowed: the buttons underneath
+                    // take `&mut self`.
+                    let state = self.updater.state().clone();
+                    match &state {
+                        State::Idle => {
+                            ui.label("Not checked yet. Choose Check now.");
+                        }
+                        State::Checking => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Asking github.com…");
+                            });
+                        }
+                        State::UpToDate => {
+                            ui.label("This is the newest release.");
+                        }
+                        State::Found(found) => {
+                            ui.label(format!("LynxRDP {} is available.", found.tag));
+                            let day = found.published.split('T').next().unwrap_or_default();
+                            if !day.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!("Published {day}."))
+                                        .small()
+                                        .color(t.text_dim),
+                                );
+                            }
+                            ui.add_space(theme::UNIT);
+                            match &found.blocker {
+                                Some(blocker) => {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(blocker.explain()).color(t.warn),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} - {}",
+                                            found.asset.name,
+                                            human_size(found.asset.size)
+                                        ))
+                                        .small()
+                                        .color(t.text_dim),
+                                    );
+                                    ui.add_space(theme::UNIT);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(UPDATE_TRUST)
+                                                .small()
+                                                .color(t.text_dim),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            }
+                            if !found.notes_url.is_empty() {
+                                ui.add_space(theme::UNIT);
+                                ui.hyperlink_to("Release notes", &found.notes_url);
+                            }
+                        }
+                        State::Downloading { done, total } => {
+                            let text = match total {
+                                Some(total) => {
+                                    format!("{} of {}", human_size(*done), human_size(*total))
+                                }
+                                None => human_size(*done),
+                            };
+                            // A total the release listing did not give us
+                            // leaves a bar that moves without claiming to
+                            // know how far along it is.
+                            let bar = match total.filter(|t| *t > 0) {
+                                Some(total) => egui::ProgressBar::new(
+                                    (*done as f32 / total as f32).clamp(0.0, 1.0),
+                                )
+                                .text(text),
+                                None => egui::ProgressBar::new(0.0).animate(true).text(text),
+                            };
+                            ui.add(bar);
+                        }
+                        State::Installed => {
+                            ui.label("Installed.");
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(UPDATE_RESTART_HINT)
+                                        .small()
+                                        .color(t.text_dim),
+                                )
+                                .wrap(),
+                            );
+                        }
+                        State::HandedOff => {
+                            ui.label("The installer is running. This window will close.");
+                        }
+                        State::Failed(e) => {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(e.as_str())
+                                        .color(ui.visuals().error_fg_color),
+                                )
+                                .wrap(),
+                            );
+                        }
+                    }
+                    ui.add_space(2.5 * theme::UNIT);
+                    ui.horizontal(|ui| {
+                        if state == State::Installed {
+                            if ui.add(theme::primary_button(&t, "Restart now")).clicked() {
+                                pending = Some(Action::RestartForUpdate);
+                                close = true;
+                            }
+                        } else if self.enabled(&Action::InstallUpdate) {
+                            if ui.add(theme::primary_button(&t, "Install")).clicked() {
+                                pending = Some(Action::InstallUpdate);
+                            }
+                        } else if ui
+                            .add_enabled(
+                                self.enabled(&Action::CheckForUpdates),
+                                egui::Button::new("Check now"),
+                            )
+                            .clicked()
+                        {
+                            self.update_asked = true;
+                            self.start_check();
+                        }
+                        if ui.button("Close").clicked() || confirmed {
+                            close = true;
+                        }
+                    });
+                }
             }
         });
         if !close && !response.should_close() {
             self.dialog = Some(dialog);
+        }
+        if let Some(action) = pending {
+            self.perform(action, ctx);
         }
     }
 
@@ -1935,6 +2358,11 @@ impl Launcher {
     fn draw(&mut self, ctx: &egui::Context) {
         self.sessions.reap();
         self.drain_failures();
+        // The updater runs on its own thread and says nothing until asked.
+        if self.updater.poll() {
+            self.on_update_change(ctx);
+        }
+        self.maybe_auto_check();
 
         // Accelerators are answered *before* the panels are built, not with
         // the buttons afterwards. A key that only took effect on the next
@@ -2057,8 +2485,11 @@ impl Launcher {
         }
 
         // A session may exit at any time and the count in the status bar
-        // should notice without needing a mouse move.
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        // should notice without needing a mouse move. A download wants a
+        // finer beat than that, or the progress bar advances in half-second
+        // jumps and reads as a stall.
+        let beat = if self.updater.animating() { 50 } else { 500 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(beat));
     }
 }
 
@@ -2172,6 +2603,25 @@ fn path_field(ui: &mut egui::Ui, path: &mut String) {
 }
 
 /// "1 session" / "3 sessions".
+/// A download size, to one decimal place.
+///
+/// Whole megabytes for a twenty-megabyte file would jump in five-per-cent
+/// steps and look stuck; bytes would be unreadable. Binary units, because
+/// that is what the operating system's own file properties will say.
+fn human_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if b < KIB * KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else if b < KIB * KIB * KIB {
+        format!("{:.1} MiB", b / (KIB * KIB))
+    } else {
+        format!("{:.1} GiB", b / (KIB * KIB * KIB))
+    }
+}
+
 fn plural(count: usize, noun: &str) -> String {
     if count == 1 {
         format!("{count} {noun}")
@@ -3083,6 +3533,148 @@ mod tests {
         run(launcher, vec![egui::Event::PointerMoved(at)])
     }
 
+    /// A release that is newer than whatever this build is.
+    fn offer(blocker: Option<update::Blocker>) -> update::Found {
+        update::Found {
+            tag: "v9.9.9".into(),
+            version: update::parse_tag("v9.9.9").unwrap(),
+            notes_url: "https://github.com/guitar24t/lynxrdp/releases/tag/v9.9.9".into(),
+            published: "2026-09-04T19:28:06Z".into(),
+            asset: update::Asset {
+                name: "lynxrdp-9.9.9-linux-x86_64.tar.gz".into(),
+                browser_download_url: "https://example.invalid/a.tar.gz".into(),
+                size: 12 * 1024 * 1024,
+            },
+            blocker,
+        }
+    }
+
+    #[test]
+    fn a_build_that_cannot_update_itself_does_not_ask_whether_it_should() {
+        // The test suite runs on exactly such a build, so this is also what
+        // stops `draw` reaching the network in every window test below.
+        let (_dir, mut launcher) = stocked();
+        assert!(
+            update::current_tag().is_none(),
+            "the tests assume they are not running a release build"
+        );
+        launcher.maybe_auto_check();
+        assert_eq!(*launcher.updater.state(), State::Idle);
+        assert_eq!(launcher.settings.updates.last_check, None);
+    }
+
+    #[test]
+    fn the_automatic_check_is_considered_once_a_run() {
+        let (_dir, mut launcher) = stocked();
+        launcher.settings.updates.check = false;
+        launcher.maybe_auto_check();
+        assert!(launcher.auto_checked);
+        // Turning it on later does not restart it mid-run: the flag is the
+        // whole of "we have already thought about this".
+        launcher.settings.updates.check = true;
+        launcher.maybe_auto_check();
+        assert_eq!(*launcher.updater.state(), State::Idle);
+    }
+
+    #[test]
+    fn an_available_update_is_announced_above_the_list_and_can_be_put_off() {
+        let (_dir, mut launcher) = stocked();
+        launcher.updater.offer_for_test(offer(None));
+        let painted = window(&mut launcher);
+        assert!(painted.has_text("LynxRDP v9.9.9 is available"));
+        assert!(painted.has_text("Install"));
+        // The list is still the point of the window.
+        assert!(painted.has_text("work"));
+
+        launcher.perform(Action::DismissUpdate, &ctx());
+        let painted = window(&mut launcher);
+        assert!(!painted.has_text("v9.9.9 is available"));
+        // Put off, not forgotten: Help > Check for Updates still shows it.
+        assert!(launcher.updater.found().is_some());
+    }
+
+    #[test]
+    fn an_update_that_cannot_be_installed_here_offers_no_install_button() {
+        // A packaged install must not get a button whose only outcome is an
+        // error; it gets the sentence that says what to do instead.
+        let (_dir, mut launcher) = stocked();
+        launcher
+            .updater
+            .offer_for_test(offer(Some(update::Blocker::PackageManaged(
+                "/usr/bin/lynxrdp".into(),
+            ))));
+        assert!(!launcher.enabled(&Action::InstallUpdate));
+        launcher.dialog = Some(Dialog::Update);
+        let painted = window(&mut launcher);
+        assert!(painted.has_text("apt or dnf"), "the way out is named");
+        assert!(!painted.has_text("Install"));
+    }
+
+    #[test]
+    fn the_update_window_shows_what_would_be_downloaded() {
+        let (_dir, mut launcher) = stocked();
+        launcher.updater.offer_for_test(offer(None));
+        launcher.dialog = Some(Dialog::Update);
+        let painted = window(&mut launcher);
+        assert!(painted.has_text("lynxrdp-9.9.9-linux-x86_64.tar.gz"));
+        assert!(painted.has_text("12.0 MiB"));
+        assert!(painted.has_text("Published 2026-09-04"));
+        // The two things a user is weighing, both said.
+        assert!(painted.has_text("SHA256SUMS"));
+        assert!(painted.has_text("not code signed") || painted.has_text("code signed"));
+    }
+
+    #[test]
+    fn restarting_is_offered_only_once_something_is_installed() {
+        let (_dir, mut launcher) = stocked();
+        assert!(!launcher.enabled(&Action::RestartForUpdate));
+        launcher.updater.offer_for_test(offer(None));
+        assert!(!launcher.enabled(&Action::RestartForUpdate));
+    }
+
+    #[test]
+    fn choosing_prereleases_writes_the_choice_down() {
+        // The default is "whatever kind of build I am running", which is not
+        // a value in the file. The first click has to turn that into one, or
+        // the checkbox would appear to do nothing.
+        let (_dir, mut launcher) = stocked();
+        assert_eq!(launcher.settings.updates.prereleases, None);
+        let was = launcher.prereleases();
+        launcher.perform(Action::TogglePrereleases, &ctx());
+        assert_eq!(launcher.settings.updates.prereleases, Some(!was));
+        assert_eq!(launcher.prereleases(), !was);
+        // And it survives, because it went to the settings file.
+        let reloaded = Settings::load(&launcher.settings_path).unwrap();
+        assert_eq!(reloaded.updates.prereleases, Some(!was));
+    }
+
+    #[test]
+    fn no_message_has_a_gap_torn_in_it() {
+        // A wrapped string literal whose backslash goes missing keeps its
+        // source indentation, and the result is a sentence with a hole in the
+        // middle of it that no compiler and no reviewer reliably notices --
+        // it only shows up in a screenshot. These are every message long
+        // enough to have been wrapped.
+        for text in [
+            UPDATE_TRUST,
+            UPDATE_CHECK_HINT,
+            UPDATE_PRERELEASE_HINT,
+            UPDATE_RESTART_HINT,
+        ] {
+            assert!(!text.contains("  "), "a torn line continuation: {text:?}");
+            assert!(text.ends_with('.'), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn download_sizes_are_readable() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(999), "999 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(12 * 1024 * 1024), "12.0 MiB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
     #[test]
     fn every_menu_lists_what_it_promises() {
         // Each of these is backed by something that exists; there are no
@@ -3124,7 +3716,14 @@ mod tests {
             ),
             (
                 "Help",
-                &["Keyboard Shortcuts", "Documentation", "About LynxRDP"][..],
+                &[
+                    "Keyboard Shortcuts",
+                    "Documentation",
+                    "Check for Updates",
+                    "Check Automatically",
+                    "Include Prereleases",
+                    "About LynxRDP",
+                ][..],
             ),
         ] {
             let painted = menu(&mut launcher, title);

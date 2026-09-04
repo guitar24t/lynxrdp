@@ -52,6 +52,45 @@ impl From<ThemeChoice> for eframe::egui::ThemePreference {
     }
 }
 
+/// What the updater is allowed to do.
+///
+/// A separate table so the settings file says plainly what it is: the one
+/// preference here that reaches the network is worth being able to find and
+/// turn off with an editor, on a machine where the window is not convenient.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Updates {
+    /// Ask GitHub for the release list, once a day at most.
+    pub check: bool,
+    /// Offer release candidates.
+    ///
+    /// `None` -- the default, and an absent key in the file -- means "the
+    /// same kind of build I am running". Every release so far is a
+    /// candidate, so a plain `false` would tell everyone who has one that
+    /// they are up to date forever; and once `v0.1.0` proper exists, someone
+    /// who installed it should not be moved onto the next candidate series
+    /// without having asked. `Some` is an explicit choice and is obeyed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prereleases: Option<bool>,
+    /// When the last check happened, in seconds since the epoch, so that
+    /// starting the launcher five times in a morning is still one request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_check: Option<u64>,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Self {
+            // On, because a remote desktop client that silently stays on an
+            // old build is the worse failure -- and the check only ever
+            // *offers*: nothing is downloaded or replaced without a click.
+            check: true,
+            prereleases: None,
+            last_check: None,
+        }
+    }
+}
+
 /// Everything the View menu remembers.
 ///
 /// Not `deny_unknown_fields`, unlike the connections file: a preference
@@ -67,6 +106,9 @@ pub struct Settings {
     pub show_command_line: bool,
     /// egui zoom factor, the low-vision path.
     pub zoom: f32,
+    /// Update checking. Last, because it is a table: TOML requires every
+    /// plain value to be written before the first one.
+    pub updates: Updates,
 }
 
 impl Default for Settings {
@@ -76,6 +118,7 @@ impl Default for Settings {
             compact_rows: false,
             show_command_line: false,
             zoom: 1.0,
+            updates: Updates::default(),
         }
     }
 }
@@ -154,6 +197,11 @@ mod tests {
             compact_rows: true,
             show_command_line: true,
             zoom: 1.5,
+            updates: Updates {
+                check: false,
+                prereleases: Some(true),
+                last_check: Some(1_757_000_000),
+            },
         };
         assert_eq!(roundtrip(&settings), settings);
     }
