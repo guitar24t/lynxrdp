@@ -76,6 +76,17 @@ offer from the other:
   side allocate without limit. A drag-and-drop is capped at
   `MAX_DROPPED_FILES` and does not follow symlinks.
 
+  Anything a transfer holds in memory rather than streaming to a file is
+  bounded twice over, by `MAX_MEMORY_TRANSFER_SIZE` and by how many such
+  transfers may run at once. Both are enforced in the transfer manager
+  rather than in each side's policy: there are two policies, and a rule
+  that has to be repeated on both ends of a protocol is one that will
+  eventually be applied on only one of them.
+
+  The screen dimensions in `ServerHello` and `ScreenResized` are checked
+  against `MAX_SCREEN_DIM` before they reach an allocation. They are two
+  `u16`s in a very small message, and unchecked they are a 17 GB request.
+
 None of this replaces trusting the server: a session you log in to runs
 your own code as you. The boundary these rules defend is the *client's*
 filesystem against a server that turns out to be hostile, and the server's

@@ -44,6 +44,20 @@ Frame pipeline:
    the pixels are compared to confirm it). A match becomes a `CopyRect`:
    the client moves pixels it already holds, so scrolling costs a dozen
    bytes instead of a screenful.
+
+   The search runs **per damage region, never over their union**. A union
+   spanning a scrolling pane and an unrelated change beside it contains
+   rows that moved for two different reasons, and then no single shift
+   explains any of them -- folding does not weaken detection, it ends it.
+   Rows that did not change are compared before anything is hashed, which
+   is what keeps an idle screen from paying for the search.
+
+   Every copy found across every region is applied to the reference in
+   **one batch**. The decoder reads all sources before writing any
+   destination, so applying them one at a time would leave the encoder's
+   reference holding a different picture from the client's framebuffer
+   wherever two copies overlap -- silently, permanently, and invisibly to
+   the tile pass that is supposed to catch differences.
 4. The encoder then compares each 64×64 tile against the reference frame
    and trims to the bounding box of changed pixels. Each tile is stored
    either as packed 24-bit RGB or, when it has at most 256 distinct
@@ -77,6 +91,14 @@ little endian, no TLS (the SSH tunnel provides confidentiality and
 integrity). Handshake: `ClientHello` → `ServerHello | Rejected` → full
 `ScreenUpdate`. Everything is versioned by a single `PROTOCOL_VERSION`.
 
+Message tags below 128 are **structural**: a peer that cannot decode one
+cannot stay in sync, so an unknown tag there is fatal. Tags at or above 128
+are **skippable extensions**, discarded whole by the framing layer, which
+costs nothing because the length prefix already says how much to throw
+away. That range exists so a newer peer can send an optional message
+without dropping the connection to an older one -- its value is entirely in
+the *older* peer, which is why it is worth having before anything uses it.
+
 Pixels travel as tightly packed 24-bit RGB. The client keeps a framebuffer
 in `0x00RRGGBB` and presents it with `softbuffer`, which maps directly to
 the window system's native format on all three platforms.
@@ -91,8 +113,15 @@ never stall interaction:
 
 * Chunks are capped at `CHUNK_SIZE`, so a frame waits for at most one chunk
   to drain rather than a whole file.
-* The sender keeps at most `WINDOW_CHUNKS` chunks unacknowledged, which
-  bounds how much of a large file can be in flight.
+* The sender keeps at most `WINDOW_CHUNKS` chunks of any one transfer
+  unacknowledged, which bounds how much of a large file can be in flight.
+* `GLOBAL_WINDOW_CHUNKS` bounds the total across *all* transfers. The
+  per-transfer window alone says nothing about how many transfers there
+  are, and staging a clipboard file copy fans out one per file -- so the
+  guarantee above is about the queue only because this third bound exists.
+* Transfers that land in memory rather than on disk are capped separately,
+  in size and in number: `MAX_TRANSFER_SIZE` is the right bound for
+  something streaming to a file and the wrong one for a `Sink::Memory`.
 
 A receiver decides what to do with each offer through a `TransferPolicy`,
 which returns either an in-memory sink or a file. That is the single place
