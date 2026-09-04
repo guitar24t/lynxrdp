@@ -920,15 +920,45 @@ impl TransferManager {
                 self.pump_one(*id, &mut out);
             }
             Message::TransferEnd { id, ok, message } => {
-                let was_incoming = self.incoming.remove(id).is_some();
+                let incoming = self.incoming.remove(id);
                 let was_pending = self.pending.remove(id);
                 let outgoing = self.outgoing.remove(id);
                 if *ok {
-                    // The peer confirmed it received everything we sent.
-                    if let Some(o) = outgoing {
-                        out.sent.push((*id, o.purpose, o.name));
+                    // "ok" is the peer's claim, not a fact, and both directions
+                    // have to check it against what actually moved.
+                    //
+                    // Still holding an incoming record here means the sender
+                    // declared the transfer finished before its chunks arrived.
+                    // Dropping the receiver at this point skipped `finish()`
+                    // altogether, so the truncation check never ran: a short
+                    // file was left at exactly the path the user asked for, no
+                    // event was emitted, and the id stayed registered, so the
+                    // requester waited on a transfer that had already ended.
+                    if let Some(i) = incoming {
+                        let (purpose, name) = (i.purpose, i.name);
+                        match i.receiver.finish() {
+                            Ok(_) => out.completed.push(Completed {
+                                id: *id,
+                                purpose,
+                                name,
+                                data: None,
+                            }),
+                            Err(e) => out.failed.push((*id, e.to_string())),
+                        }
                     }
-                } else if was_incoming || was_pending || outgoing.is_some() {
+                    if let Some(o) = outgoing {
+                        // Symmetrically: a peer that acknowledges more than we
+                        // managed to send has not received what it thinks.
+                        if o.sender.is_complete() {
+                            out.sent.push((*id, o.purpose, o.name));
+                        } else {
+                            out.failed.push((
+                                *id,
+                                "peer reported success before the transfer finished".to_string(),
+                            ));
+                        }
+                    }
+                } else if incoming.is_some() || was_pending || outgoing.is_some() {
                     out.failed.push((*id, message.clone()));
                 }
             }
@@ -1152,6 +1182,63 @@ mod manager_tests {
         assert_eq!(back.failed.len(), 1);
         assert!(back.failed[0].1.contains("declined"), "{:?}", back.failed);
         assert_eq!(client.in_flight(), (0, 0));
+    }
+
+    /// A peer claiming success mid-transfer must not produce a silent
+    /// truncated file.
+    ///
+    /// `TransferEnd { ok: true }` used to drop the receiver without calling
+    /// `finish()`, so the truncation check never ran. The short file was left
+    /// at exactly the path the user asked for, nothing was reported, and the
+    /// requester went on waiting for a transfer that had already ended.
+    #[test]
+    fn a_premature_success_is_reported_as_a_failure() {
+        // `true` = the initiating side; irrelevant here, we only receive.
+        let mut m = TransferManager::new(true);
+        let mut policy = MemoryPolicy;
+        let id = 1;
+        let out = m
+            .handle(
+                &Message::TransferOffer {
+                    id,
+                    purpose: TransferPurpose::FileDownload,
+                    name: "f.bin".into(),
+                    size: 4096,
+                },
+                &mut policy,
+            )
+            .expect("offer handled");
+        assert!(matches!(
+            out.replies.as_slice(),
+            [Message::TransferAccept { accepted: true, .. }]
+        ));
+
+        // One short chunk, then the sender claims it is done.
+        m.handle(
+            &Message::TransferData {
+                id,
+                seq: 0,
+                data: vec![0u8; 16],
+            },
+            &mut policy,
+        )
+        .expect("chunk handled");
+        let out = m
+            .handle(
+                &Message::TransferEnd {
+                    id,
+                    ok: true,
+                    message: String::new(),
+                },
+                &mut policy,
+            )
+            .expect("end handled");
+
+        assert!(
+            out.completed.is_empty(),
+            "a 16-byte prefix of a 4096-byte file was reported as complete"
+        );
+        assert_eq!(out.failed.len(), 1, "truncation was not reported: {out:?}");
     }
 
     #[test]

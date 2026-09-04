@@ -171,6 +171,13 @@ impl Kind {
             70 => Kind::FileList,
             71 => Kind::ClipboardOffer,
             72 => Kind::ClipboardRequest,
+            // Tags at or above `frame::EXTENSION_TAG_MIN` (128) never reach
+            // here: the framing layer discards those frames whole, so an
+            // optional message a newer peer invents does not drop the
+            // connection. Anything unknown *below* that is structural, and a
+            // peer that cannot decode it cannot stay in sync, so it stays
+            // fatal. New message types that both ends must understand belong
+            // below 128; new optional ones belong at or above it.
             other => return Err(DecodeError::InvalidTag(u32::from(other))),
         })
     }
@@ -411,6 +418,18 @@ pub const MAX_TILES_PER_UPDATE: usize = 65_536;
 pub const MAX_COPIES_PER_UPDATE: usize = 4_096;
 /// Maximum cursor dimension accepted.
 pub const MAX_CURSOR_DIM: u16 = 256;
+/// Largest screen dimension a *client* will accept from a server.
+///
+/// This is the same ceiling `session.max_width`/`max_height` are validated
+/// against, so it rejects nothing a correctly configured server can produce.
+/// Without it, the two `u16`s in a seven-byte `ScreenResized` reach
+/// `Framebuffer::new` unchecked: 65535 x 65535 x 4 bytes is a 17 GB
+/// allocation, which is an abort rather than an error on some platforms.
+///
+/// It deliberately does *not* apply to `ClientHello` or `ResizeRequest`. Those
+/// are decoded by the server, which already clamps them harmlessly, and a
+/// client asking for something silly is not the threat this guards against.
+pub const MAX_SCREEN_DIM: u16 = 16_384;
 
 impl Message {
     /// Kind tag of this message.
@@ -637,15 +656,27 @@ impl Message {
                 width: r.u16()?,
                 height: r.u16()?,
             },
-            Kind::ServerHello => Message::ServerHello {
-                version: r.u16()?,
-                server_name: r.string()?,
-                features: r.u32()?,
-                session_id: r.u64()?,
-                username: r.string()?,
-                width: r.u16()?,
-                height: r.u16()?,
-            },
+            Kind::ServerHello => {
+                let version = r.u16()?;
+                let server_name = r.string()?;
+                let features = r.u32()?;
+                let session_id = r.u64()?;
+                let username = r.string()?;
+                let width = r.u16()?;
+                let height = r.u16()?;
+                if width > MAX_SCREEN_DIM || height > MAX_SCREEN_DIM {
+                    return Err(DecodeError::InvalidValue("screen size"));
+                }
+                Message::ServerHello {
+                    version,
+                    server_name,
+                    features,
+                    session_id,
+                    username,
+                    width,
+                    height,
+                }
+            }
             Kind::Rejected => Message::Rejected {
                 code: r.u16()?,
                 reason: r.string()?,
@@ -741,10 +772,14 @@ impl Message {
                     tiles,
                 }
             }
-            Kind::ScreenResized => Message::ScreenResized {
-                width: r.u16()?,
-                height: r.u16()?,
-            },
+            Kind::ScreenResized => {
+                let width = r.u16()?;
+                let height = r.u16()?;
+                if width > MAX_SCREEN_DIM || height > MAX_SCREEN_DIM {
+                    return Err(DecodeError::InvalidValue("screen size"));
+                }
+                Message::ScreenResized { width, height }
+            }
             Kind::CursorShape => {
                 let width = r.u16()?;
                 let height = r.u16()?;
@@ -1127,6 +1162,55 @@ mod tests {
         assert_eq!(
             Message::decode(w.as_slice()),
             Err(DecodeError::InvalidValue("cursor size"))
+        );
+    }
+
+    /// A tiny message must not be able to ask the client for gigabytes.
+    ///
+    /// `ScreenResized` is seven bytes on the wire, and its two dimensions used
+    /// to reach `Framebuffer::new` unchecked: a hostile or simply broken server
+    /// could name 65535 x 65535 and demand 17 GB, which on some platforms is
+    /// `handle_alloc_error` and a process abort rather than an error a client
+    /// can report and recover from. The cap is the same ceiling the server's
+    /// own configuration is validated against, so nothing a correctly
+    /// configured server can produce is refused.
+    #[test]
+    fn oversized_screen_dimensions_are_refused() {
+        let mut w = Writer::new();
+        w.u8(Kind::ScreenResized as u8);
+        w.u16(MAX_SCREEN_DIM + 1);
+        w.u16(1080);
+        assert_eq!(
+            Message::decode(w.as_slice()),
+            Err(DecodeError::InvalidValue("screen size"))
+        );
+
+        let mut w = Writer::new();
+        w.u8(Kind::ServerHello as u8);
+        w.u16(1);
+        w.string("srv");
+        w.u32(0);
+        w.u64(1);
+        w.string("alice");
+        w.u16(u16::MAX);
+        w.u16(u16::MAX);
+        assert_eq!(
+            Message::decode(w.as_slice()),
+            Err(DecodeError::InvalidValue("screen size"))
+        );
+
+        // The ceiling itself has to stay usable, or a legitimately large screen
+        // becomes unreachable.
+        let mut w = Writer::new();
+        w.u8(Kind::ScreenResized as u8);
+        w.u16(MAX_SCREEN_DIM);
+        w.u16(MAX_SCREEN_DIM);
+        assert_eq!(
+            Message::decode(w.as_slice()),
+            Ok(Message::ScreenResized {
+                width: MAX_SCREEN_DIM,
+                height: MAX_SCREEN_DIM,
+            })
         );
     }
 
