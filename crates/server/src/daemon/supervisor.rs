@@ -160,6 +160,8 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
     let (control_fd, log_fd) = (args.control_fd, args.log_fd);
     let (uid, gid) = (args.uid, args.gid);
     let c_user = CString::new(args.user.as_str())?;
+    // Captured before the fork so the child can tell whether we are still here.
+    let parent_pid = std::process::id() as libc::pid_t;
     // SAFETY: only async-signal-safe calls in the child before exec.
     unsafe {
         cmd.pre_exec(move || {
@@ -203,6 +205,27 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
                 if uid != 0 && libc::setuid(0) == 0 {
                     return Err(std::io::Error::other("privilege drop failed"));
                 }
+            }
+            // Die with the supervisor.
+            //
+            // This must come *after* the credential switch above: the kernel
+            // clears the parent-death signal on any uid change (commit_creds),
+            // so setting it earlier would leave it silently unset -- which is
+            // precisely the state that let a SIGKILLed supervisor orphan
+            // lynxrdp-session, and with it Xvfb, the desktop, and the user's
+            // logind session, on an unlinked socket, indefinitely.
+            //
+            // Xvfb and the desktop already have this link to the session; the
+            // session did not have one to the supervisor, so the chain broke at
+            // exactly the point the daemon reaches for when a handoff fails.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Close the race the flag cannot: if the supervisor died between
+            // the fork and the prctl above, the signal has already been sent
+            // and missed, and this child would run on forever unattached.
+            if libc::getppid() != parent_pid {
+                libc::_exit(1);
             }
             Ok(())
         });

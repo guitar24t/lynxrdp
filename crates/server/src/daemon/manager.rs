@@ -144,8 +144,7 @@ impl SessionManager {
                     );
                     if let Some(mut rec) = self.sessions.remove(&user.uid) {
                         if let Some(c) = rec.supervisor.as_mut() {
-                            let _ = c.kill();
-                            let _ = c.wait();
+                            terminate(c, HANDOFF_TERMINATE_GRACE);
                         }
                     }
                     let _ = fs::remove_file(&socket_path);
@@ -180,8 +179,7 @@ impl SessionManager {
             Err(e) => {
                 if let Some(mut rec) = self.sessions.remove(&user.uid) {
                     if let Some(c) = rec.supervisor.as_mut() {
-                        let _ = c.kill();
-                        let _ = c.wait();
+                        terminate(c, HANDOFF_TERMINATE_GRACE);
                     }
                 }
                 let _ = fs::remove_file(&socket_path);
@@ -302,23 +300,39 @@ impl SessionManager {
     pub fn stop_all(&mut self) {
         for (_, mut rec) in self.sessions.drain() {
             if let Some(c) = rec.supervisor.as_mut() {
-                // SAFETY: signalling our own child.
-                unsafe {
-                    libc::kill(c.id() as i32, libc::SIGTERM);
-                }
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while Instant::now() < deadline {
-                    if let Ok(Some(_)) = c.try_wait() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                let _ = c.kill();
-                let _ = c.wait();
+                terminate(c, Duration::from_secs(5));
             }
             let _ = fs::remove_file(&rec.socket_path);
         }
     }
+}
+
+/// How long a supervisor gets to shut down cleanly when a handoff has failed.
+///
+/// Deliberately shorter than `stop_all`'s: this runs on the daemon's single
+/// accept loop, where every extra second is a second no other user can connect.
+const HANDOFF_TERMINATE_GRACE: Duration = Duration::from_secs(1);
+
+/// Stop a supervisor politely, and only then insistently.
+///
+/// SIGKILL on its own is wrong here. The supervisor holds the PAM session open
+/// and only its SIGTERM handler runs `pam_close_session`, so killing it
+/// outright leaked a logind session on every failed attempt -- and, because
+/// `lynxrdp-session` had no parent-death link, the whole desktop with it.
+fn terminate(child: &mut Child, grace: Duration) {
+    // SAFETY: signalling our own child.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn try_handoff(
@@ -336,21 +350,10 @@ fn try_handoff(
         username: user.name.clone(),
         peer: peer.to_string(),
     };
-    match send_handoff_with_timeout(&control, &h, client_fd, timeout)? {
+    match send_handoff(&control, &h, client_fd, timeout)? {
         Reply::Accepted => Ok(()),
         Reply::Refused => bail!("session refused the handoff"),
     }
-}
-
-fn send_handoff_with_timeout(
-    control: &UnixStream,
-    h: &Handoff,
-    fd: RawFd,
-    timeout: Duration,
-) -> Result<Reply> {
-    control.set_read_timeout(Some(timeout))?;
-    let r = send_handoff(control, h, fd)?;
-    Ok(r)
 }
 
 fn new_session_id() -> u64 {
