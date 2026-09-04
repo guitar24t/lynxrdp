@@ -6,9 +6,18 @@
 //!        ▼ loopback TCP, socket owned by `user`
 //!  lynxrdpd  ── identifies uid via /proc/net/tcp ── access policy
 //!        │
+//!        ▼ handoff worker pool
 //!        ├─ existing session?  ── SCM_RIGHTS handoff ──▶ lynxrdp-session (user)
 //!        └─ else: lynxrdpd --supervise (root, PAM) ──▶ lynxrdp-session (user)
 //! ```
+//!
+//! Only the top half of that runs on the listening thread. Accepting,
+//! identifying the peer and applying the access policy are all microseconds,
+//! and the `/proc/net/tcp` lookup has to happen there in any case -- it needs
+//! the peer's socket to still be in the kernel's table, which it will not be
+//! by the time a worker gets round to it. Everything below the pool is slow
+//! and unbounded: see [`manager`] for what one stalled session used to do to
+//! everybody else's connection.
 
 pub mod access;
 pub mod manager;
@@ -16,8 +25,7 @@ pub mod pam;
 pub mod supervisor;
 pub mod users;
 
-use std::io::Write;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, RawFd};
 use std::time::Duration;
 
 use lynxrdp_proto::frame::frame_message;
@@ -60,8 +68,20 @@ pub fn decide(cfg: &Config, peer: Option<PeerIdentity>) -> Decision {
     }
 }
 
-/// Best-effort: tell the client why it was refused, then close.
-pub fn send_rejection(fd: RawFd, code: u16, reason: &str) {
+/// Best-effort: tell the client why it was refused. The caller still owns the
+/// descriptor and still has to close it.
+///
+/// The descriptor is borrowed rather than raw, and rather than duplicated into
+/// a `File` as this used to do, because refusals are now sent from two places
+/// -- the accept loop and a pool worker -- and "who closes this" has to have
+/// one answer no matter which. It is the owner, and it is never this function.
+///
+/// The send is non-blocking. A rejection is advisory: the close that follows
+/// says the same thing, and on the accept loop a peer that has stopped reading
+/// must not be able to hold up the next user's connection while it is told
+/// something it is not listening to. The frame is around a hundred bytes into
+/// an empty socket buffer, so a client that is actually there receives it.
+pub fn send_rejection(fd: BorrowedFd<'_>, code: u16, reason: &str) {
     let mut buf = Vec::new();
     frame_message(
         &Message::Rejected {
@@ -70,35 +90,29 @@ pub fn send_rejection(fd: RawFd, code: u16, reason: &str) {
         },
         &mut buf,
     );
-    // SAFETY: we own the fd; a short write timeout keeps a stuck peer from
-    // blocking the daemon.
-    unsafe {
-        let tv = libc::timeval {
-            tv_sec: 2,
-            tv_usec: 0,
+    let mut sent = 0usize;
+    while sent < buf.len() {
+        // SAFETY: `fd` is a live borrowed socket and the slice is in bounds.
+        let n = unsafe {
+            libc::send(
+                fd.as_raw_fd(),
+                buf[sent..].as_ptr() as *const libc::c_void,
+                buf.len() - sent,
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+            )
         };
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDTIMEO,
-            &tv as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        );
-        let mut f = std::fs::File::from(std::os::unix::io::OwnedFd::from_raw_fd_dup(fd));
-        let _ = f.write_all(&buf);
-        let _ = f.flush();
-    }
-}
-
-trait DupFd {
-    unsafe fn from_raw_fd_dup(fd: RawFd) -> Self;
-}
-
-impl DupFd for std::os::unix::io::OwnedFd {
-    unsafe fn from_raw_fd_dup(fd: RawFd) -> Self {
-        use std::os::unix::io::FromRawFd;
-        let d = libc::dup(fd);
-        Self::from_raw_fd(d)
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // EAGAIN, EPIPE, a reset: there is nothing useful left to try.
+            return;
+        }
+        if n == 0 {
+            return;
+        }
+        sent += n as usize;
     }
 }
 
@@ -132,6 +146,3 @@ pub fn poll_listeners(fds: &[RawFd], timeout: Duration) -> std::io::Result<Optio
         .iter()
         .position(|p| p.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0))
 }
-
-#[allow(dead_code)]
-fn _uses(_: &dyn AsRawFd) {}

@@ -7,6 +7,7 @@ lynxrdpd (root)
  ├─ listens 127.0.0.1:3390 (and optionally a Unix socket)
  ├─ identifies the peer uid: /proc/net/tcp for TCP, SO_PEERCRED for Unix
  ├─ access policy (min uid, allow/deny lists, groups)
+ ├─ handoff worker pool (one connection per uid at a time)
  └─ per user: lynxrdpd --supervise (root)
               ├─ pam_open_session("lynxrdp")   ← systemd-logind session, XDG_RUNTIME_DIR, limits
               └─ lynxrdp-session (setuid user, own session id)
@@ -15,6 +16,15 @@ lynxrdpd (root)
                    ├─ core thread: capture, encode, input, cursor, clipboard, flow control
                    └─ control socket: accepts client fds handed over by lynxrdpd
 ```
+
+Only the first three lines run on the listening thread. They cost
+microseconds, and the `/proc/net/tcp` lookup has to happen there because it
+needs the peer's socket to still be in the kernel's table. The handoff itself
+does not: a cold start budgets 45 seconds for Xvfb, and a session its owner
+has stopped never answers at all, so it runs on a pool of workers. The pool
+admits one connection per uid at a time -- two spawning at once would leave
+one supervisor holding an X server on a socket the other had just unlinked --
+and refuses rather than queues when it is full.
 
 The daemon never touches pixels or input. Once it has handed the client
 socket to the session process (`SCM_RIGHTS` over a root-only Unix socket in
