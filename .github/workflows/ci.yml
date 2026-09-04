@@ -35,18 +35,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install X test dependencies
+        # openssh-server is for tunnel_e2e, which starts a throwaway sshd and
+        # is the only test that exercises the transport the product ships over.
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q xvfb xterm xdotool xclip x11-utils x11-xserver-utils libxkbcommon-x11-0 libxkbcommon0
+          sudo apt-get install -y -q xvfb xterm xdotool xclip x11-utils x11-xserver-utils libxkbcommon-x11-0 libxkbcommon0 openssh-server openssh-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets
       - name: Unit tests
         run: cargo test --workspace --lib --bins
+      # LYNXRDP_REQUIRE_E2E turns every "dependency missing, skipping" guard
+      # into a failure. Without it a skipped test is reported as a pass, so
+      # losing xvfb from the apt line above would leave these steps green while
+      # covering nothing at all. It is set here and nowhere else: a developer
+      # without Xvfb still gets skips rather than failures.
       - name: End-to-end tests (session)
+        env:
+          LYNXRDP_REQUIRE_E2E: "1"
         run: cargo test -p lynxrdp-server --test e2e -- --test-threads=2
       - name: End-to-end tests (daemon)
+        env:
+          LYNXRDP_REQUIRE_E2E: "1"
         run: cargo test -p lynxrdp-server --test daemon -- --test-threads=1
+      - name: End-to-end tests (SSH tunnel)
+        env:
+          LYNXRDP_REQUIRE_E2E: "1"
+        run: cargo test -p lynxrdp-server --test tunnel_e2e -- --test-threads=1
       - name: Doc tests
         run: cargo test --workspace --doc
 

@@ -1,6 +1,7 @@
 //! End-to-end tests for `lynxrdpd` in `--allow-non-root` mode: the daemon
 //! identifies the connecting uid, spawns a supervisor and a session for it,
-//! and hands the connection over. Needs Xvfb.
+//! and hands the connection over. Needs Xvfb; skipped without it unless
+//! `LYNXRDP_REQUIRE_E2E` is set, which makes its absence a failure.
 
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
@@ -8,15 +9,8 @@ use std::time::{Duration, Instant};
 
 use lynxrdp_client::connection::{Client, ClientEvent, ConnectOptions};
 
-fn have(prog: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {prog}"))
-        .stdout(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+mod common;
+use common::{have, skip_unless};
 
 struct Daemon {
     child: Child,
@@ -95,8 +89,7 @@ impl Drop for Daemon {
 
 #[test]
 fn daemon_spawns_session_and_hands_off() {
-    if !have("Xvfb") {
-        eprintln!("SKIP: Xvfb not installed");
+    if skip_unless(have("Xvfb"), "Xvfb not installed") {
         return;
     }
     let mut d = Daemon::start("");
@@ -127,8 +120,7 @@ fn daemon_spawns_session_and_hands_off() {
 
 #[test]
 fn daemon_rejects_denied_user() {
-    if !have("Xvfb") {
-        eprintln!("SKIP: Xvfb not installed");
+    if skip_unless(have("Xvfb"), "Xvfb not installed") {
         return;
     }
     let own = lynxrdp_server::daemon::users::user_by_uid(lynxrdp_server::peer::own_uid()).unwrap();

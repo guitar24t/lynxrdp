@@ -2,7 +2,8 @@
 //! `lynxrdp-session`, tunnelled through a throwaway `sshd`.
 //!
 //! Skipped unless `sshd`, `ssh` and `Xvfb` are available and a loopback SSH
-//! login for the current user with a generated key works.
+//! login for the current user with a generated key works -- unless
+//! `LYNXRDP_REQUIRE_E2E` is set, which makes any of those missing a failure.
 
 use std::io::Write;
 use std::net::TcpListener;
@@ -13,16 +14,8 @@ use std::time::{Duration, Instant};
 use lynxrdp_client::connection::{Client, ClientEvent, ConnectOptions};
 use lynxrdp_client::tunnel::{RemoteTarget, Tunnel, TunnelConfig};
 
-fn have(prog: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {prog} || test -x /usr/sbin/{prog}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+mod common;
+use common::{have, skip_unless};
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -154,13 +147,14 @@ fn start_session() -> (Child, u16) {
 
 #[test]
 fn connects_through_a_real_ssh_tunnel() {
-    if !have("Xvfb") {
-        eprintln!("SKIP: Xvfb not installed");
+    if skip_unless(have("Xvfb"), "Xvfb not installed") {
         return;
     }
     let Some(sshd) = Sshd::start() else {
-        eprintln!("SKIP: could not start a private sshd");
-        return;
+        if skip_unless(false, "could not start a private sshd") {
+            return;
+        }
+        unreachable!("skip_unless(false) either panics or returns true");
     };
     let (mut session, session_port) = start_session();
 
@@ -180,10 +174,12 @@ fn connects_through_a_real_ssh_tunnel() {
     let tunnel = match Tunnel::open(&cfg, Duration::from_secs(20)) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("SKIP: ssh login not available in this environment: {e}");
             let _ = session.kill();
             let _ = session.wait();
-            return;
+            if skip_unless(false, &format!("ssh login not available here: {e}")) {
+                return;
+            }
+            unreachable!("skip_unless(false) either panics or returns true");
         }
     };
 

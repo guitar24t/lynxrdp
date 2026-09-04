@@ -2,7 +2,8 @@
 //! the headless protocol client.
 //!
 //! These need `Xvfb` and `xterm` installed and are skipped (with a message)
-//! when they are not.
+//! when they are not -- unless `LYNXRDP_REQUIRE_E2E` is set, which turns a
+//! missing dependency into a failure. CI sets it; see `tests/common/mod.rs`.
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
@@ -12,20 +13,12 @@ use std::time::{Duration, Instant};
 use lynxrdp_client::connection::{Client, ClientEvent, ConnectOptions};
 use lynxrdp_proto::{keysym, Rect};
 
-fn have(prog: &str) -> bool {
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {prog}"))
-        .stdout(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+mod common;
+use common::{have, skip_unless};
 
 macro_rules! require_xvfb {
     () => {
-        if !have("Xvfb") {
-            eprintln!("SKIP: Xvfb not installed");
+        if skip_unless(have("Xvfb"), "Xvfb not installed") {
             return;
         }
     };
@@ -493,13 +486,11 @@ fn pointer_events_are_injected() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let _ = c.poll_event(Duration::from_millis(50));
-        let out = if have("xdotool") {
-            let o = s.x("xdotool", &["getmouselocation"]);
-            String::from_utf8_lossy(&o.stdout).to_string()
-        } else {
-            eprintln!("SKIP pointer check: xdotool not installed");
+        if skip_unless(have("xdotool"), "xdotool not installed (pointer check)") {
             return;
-        };
+        }
+        let o = s.x("xdotool", &["getmouselocation"]);
+        let out = String::from_utf8_lossy(&o.stdout).to_string();
         if out.contains("x:123 y:45") {
             break;
         }
@@ -572,8 +563,10 @@ fn second_client_replaces_first() {
 #[test]
 fn clipboard_roundtrip() {
     require_xvfb!();
-    if !have("xclip") && !have("xsel") {
-        eprintln!("SKIP: neither xclip nor xsel installed");
+    if skip_unless(
+        have("xclip") || have("xsel"),
+        "neither xclip nor xsel installed",
+    ) {
         return;
     }
     let s = Session::start(320, 240, "none", &[]);
@@ -635,8 +628,7 @@ fn sample_png(w: usize, h: usize) -> Vec<u8> {
 #[test]
 fn clipboard_image_from_client_reaches_the_session() {
     require_xvfb!();
-    if !have("xclip") {
-        eprintln!("SKIP: xclip not installed");
+    if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
     let s = Session::start(320, 240, "none", &[]);
@@ -668,8 +660,7 @@ fn clipboard_image_from_client_reaches_the_session() {
 #[test]
 fn clipboard_image_from_the_session_reaches_the_client() {
     require_xvfb!();
-    if !have("xclip") {
-        eprintln!("SKIP: xclip not installed");
+    if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -802,8 +793,7 @@ fn downloading_a_missing_file_fails_cleanly() {
 #[test]
 fn clipboard_files_from_the_client_are_staged_for_the_session() {
     require_xvfb!();
-    if !have("xclip") {
-        eprintln!("SKIP: xclip not installed");
+    if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
     let s = Session::start(320, 240, "none", &[]);
@@ -856,8 +846,7 @@ fn clipboard_files_from_the_client_are_staged_for_the_session() {
 #[test]
 fn clipboard_files_copied_in_the_session_are_offered_to_the_client() {
     require_xvfb!();
-    if !have("xclip") {
-        eprintln!("SKIP: xclip not installed");
+    if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
