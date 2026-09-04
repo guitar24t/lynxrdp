@@ -1845,7 +1845,11 @@ impl App {
         if self.pending_size.is_some() {
             d = d.min(RESIZE_DEBOUNCE / 2);
         }
-        if self.overlay.visible() {
+        // A dwell in progress is timed against the same 100 ms tick the bar's
+        // figures use, so the reveal lands within a tick of `REVEAL_DELAY`
+        // rather than within the 250 ms idle wake -- the difference between a
+        // delay that feels chosen and one that feels random.
+        if self.overlay.visible() || self.overlay.revealing() {
             d = d.min(OVERLAY_TICK);
         }
         d
@@ -1950,13 +1954,19 @@ impl App {
 
     fn on_pointer_moved(&mut self, pos: PhysicalPosition<f64>) {
         // A drag that started on the remote screen keeps the pointer even when
-        // it crosses the top edge, and the bar does not come up under it.
-        let claimed = !self.remote_drag()
-            && self.overlay.track(
+        // it crosses the top edge, and the bar does not come up under it --
+        // not by claiming the pointer, and not by completing a dwell either.
+        let claimed = if self.remote_drag() {
+            self.overlay.pointer_taken();
+            false
+        } else {
+            self.overlay.track(
                 pos.x.max(0.0) as u32,
                 pos.y.max(0.0) as u32,
                 self.overlay_scale(),
-            );
+                Instant::now(),
+            )
+        };
         if claimed {
             if !self.pointer_on_bar {
                 self.pointer_on_bar = true;
@@ -2610,6 +2620,10 @@ impl ApplicationHandler<Wake> for App {
                 };
                 if down {
                     self.remote_buttons |= bit;
+                    // A press in the hot zone is a press: it stops the dwell
+                    // from raising the bar over whatever was clicked, even if
+                    // the pointer then never moves.
+                    self.overlay.pointer_taken();
                 } else {
                     self.remote_buttons &= !bit;
                 }
