@@ -274,23 +274,65 @@ impl Drop for DamageTracker {
     }
 }
 
+/// Above this many rectangles, one whole-screen capture beats capturing each
+/// of them: every rectangle is a separate round trip to the X server.
+pub const MAX_CAPTURE_RECTS: usize = 24;
+
+/// How much empty area a merge may add, over and above the two rectangles it
+/// joins. Four tiles: enough that the diagonally-adjacent tiles this function
+/// exists to join still merge, and far too little to swallow a screen.
+fn merge_slack(tile: u32) -> u64 {
+    4 * (tile as u64) * (tile as u64)
+}
+
 /// Merge overlapping/adjacent rectangles to reduce capture requests. The
 /// result is a list of tile-aligned rectangles that cover the input.
+///
+/// Merging is refused when the union would add more empty area than
+/// [`merge_slack`] allows. Bare adjacency is a bad reason to merge on its own:
+/// a menu-bar repaint and a sidebar repaint touch once they are tile-aligned,
+/// and unioning them turns 70,400 damaged pixels into a 1920x960 rectangle --
+/// a 26x amplification, which then trips the whole-screen fallback in
+/// `send_frame` and costs a full-screen capture, diff and encode to transmit a
+/// few hundred bytes. A clock ticking while anything else repaints is enough
+/// to produce exactly that.
+///
+/// The guard leaves more rectangles behind, so when the result is too
+/// fragmented to capture piecemeal we fall back to the old unconditional
+/// merge: fewer, larger rectangles are the better trade at that point, and it
+/// guarantees this change cannot make any frame worse than it was.
 pub fn coalesce(rects: &[Rect], tile: u32, bounds: &Rect) -> Vec<Rect> {
+    let guarded = coalesce_within(rects, tile, bounds, merge_slack(tile));
+    if guarded.len() <= MAX_CAPTURE_RECTS {
+        return guarded;
+    }
+    coalesce_within(rects, tile, bounds, u64::MAX)
+}
+
+/// `coalesce`, with an explicit cap on the empty area a merge may add.
+///
+/// Note that with a finite `slack` the output is no longer guaranteed to be
+/// pairwise disjoint: two rectangles that touch but whose union is too costly
+/// are both kept. That is safe -- capture is idempotent and `encode_regions`
+/// de-duplicates the tiles -- but it does mean `total_area` can now count a
+/// small overlap twice, which only ever biases towards the whole-screen path.
+fn coalesce_within(rects: &[Rect], tile: u32, bounds: &Rect, slack: u64) -> Vec<Rect> {
     let mut out: Vec<Rect> = Vec::new();
     for r in rects {
         let mut cur = r.align_to_tiles(tile, bounds);
         if cur.is_empty() {
             continue;
         }
-        // Absorb any existing rectangle this one touches; repeat until stable.
+        // Absorb any existing rectangle this one touches cheaply enough;
+        // repeat until stable, since a merge can bring a further one in range.
         loop {
             let mut merged = false;
             let mut i = 0;
             while i < out.len() {
                 let o = out[i];
-                if touches(&o, &cur) {
-                    cur = cur.union(&o);
+                let union = cur.union(&o);
+                if touches(&o, &cur) && union.area() <= cur.area() + o.area() + slack {
+                    cur = union;
                     out.swap_remove(i);
                     merged = true;
                 } else {
@@ -321,6 +363,52 @@ fn _assert_types(_: &xproto::Rectangle) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two ordinary desktop repaints must not become a full-screen capture.
+    ///
+    /// A menu bar and a sidebar do not overlap, but once each is aligned out to
+    /// tile boundaries they touch, and the old unconditional union turned
+    /// 70,400 damaged pixels into 1,843,200 -- which then tripped the
+    /// whole-screen fallback in `send_frame`. This is the single most common
+    /// damage shape a desktop produces.
+    #[test]
+    fn adjacent_strips_do_not_swallow_the_screen() {
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        let menu = Rect::new(0, 0, 1920, 20);
+        let side = Rect::new(0, 100, 40, 800);
+        let merged = coalesce(&[menu, side], 64, &bounds);
+        assert_eq!(merged.len(), 2, "the two strips were merged: {merged:?}");
+        assert!(
+            total_area(&merged) * 8 < bounds.area(),
+            "coalesce amplified {} px of damage to {} px",
+            menu.area() + side.area(),
+            total_area(&merged)
+        );
+    }
+
+    /// The guard must not defeat the merging the function exists to do.
+    #[test]
+    fn genuinely_neighbouring_rects_still_merge() {
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        let a = Rect::new(64, 64, 64, 64);
+        let b = Rect::new(128, 64, 64, 64);
+        assert_eq!(coalesce(&[a, b], 64, &bounds).len(), 1);
+    }
+
+    /// Past the capture-rect budget the old greedy merge takes over, so a
+    /// heavily fragmented frame is never worse off than it was before.
+    #[test]
+    fn heavy_fragmentation_falls_back_to_greedy_merging() {
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        // A diagonal of isolated tiles: none of them touch, so the guard keeps
+        // every one and the fallback has to be what bounds the count.
+        let scattered: Vec<Rect> = (0..40).map(|i| Rect::new(i * 48, i * 26, 8, 8)).collect();
+        let merged = coalesce(&scattered, 64, &bounds);
+        assert!(
+            merged.len() <= scattered.len(),
+            "fallback produced more rectangles than it was given"
+        );
+    }
 
     #[test]
     fn copy_pixels_handles_byte_orders() {

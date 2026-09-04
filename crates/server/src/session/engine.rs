@@ -51,6 +51,11 @@ const PONG_TIMEOUT: Duration = Duration::from_secs(30);
 const HOUSEKEEPING: Duration = Duration::from_millis(250);
 /// Outgoing message queue depth per client.
 const WRITE_QUEUE: usize = 256;
+/// How long `drop_client` lets the writer finish flushing before it shuts the
+/// socket down underneath it. Long enough that a healthy client still receives
+/// the queued `Disconnect` reason -- two end-to-end tests assert exactly that --
+/// and short enough that a wedged one cannot hold the session core hostage.
+const WRITER_FLUSH_GRACE: Duration = Duration::from_millis(500);
 
 /// Supported feature bits.
 const SUPPORTED_FEATURES: u32 = features::LOCAL_CURSOR
@@ -418,13 +423,27 @@ impl Core {
             _ => {}
         }
         if self.clipboard.is_some() {
-            let events = self
-                .clipboard
-                .as_mut()
-                .expect("checked")
-                .handle_event(&ev)?;
+            // Clipboard failures are logged, never propagated. `?` here reaches
+            // `Core::run` as `Exit::XError`, which SIGTERMs the desktop -- so a
+            // conversion this session could not perform ended the user's whole
+            // login and their unsaved work with it. Pasting an image larger
+            // than one X request is ordinary user action, not an attack.
+            //
+            // Losing the X connection for real is still fatal, but it arrives
+            // as `CoreEvent::XError` from the event reader thread rather than
+            // through here, so nothing is being swallowed that should not be.
+            // The neighbouring `MappingNotify` arm already takes this view.
+            let events = match self.clipboard.as_mut().expect("checked").handle_event(&ev) {
+                Ok(events) => events,
+                Err(e) => {
+                    log::warn!("clipboard: {e:#}");
+                    Vec::new()
+                }
+            };
             for event in events {
-                self.on_clipboard_event(event)?;
+                if let Err(e) = self.on_clipboard_event(event) {
+                    log::warn!("clipboard: {e:#}");
+                }
             }
         }
         // Keep the queue type in use for future ordering needs.
@@ -622,7 +641,9 @@ impl Core {
                 let Some(png) = done.data else { return Ok(()) };
                 log::debug!("clipboard image <- client ({} bytes)", png.len());
                 if let Some(cb) = self.clipboard.as_mut() {
-                    cb.set_image(png)?;
+                    if let Err(e) = cb.set_image(png) {
+                        log::warn!("clipboard: setting the image failed: {e:#}");
+                    }
                 }
             }
             TransferPurpose::FileUpload => {
@@ -642,7 +663,9 @@ impl Core {
                         files.len()
                     );
                     if let Some(cb) = self.clipboard.as_mut() {
-                        cb.set_files(files)?;
+                        if let Err(e) = cb.set_files(files) {
+                            log::warn!("clipboard: offering staged files failed: {e:#}");
+                        }
                     }
                 }
             }
@@ -744,12 +767,30 @@ impl Core {
                 reason: text.to_string(),
             });
         }
-        // Close the queue so the writer flushes what it has and exits.
+        // Close the queue so the writer drains what is already in it -- the
+        // Disconnect notice above is the last entry -- and exits by itself.
         drop(c.writer_tx);
-        if let Some(w) = c.writer.take() {
-            let _ = w.join();
+        // Then give it a bounded moment, and take the socket down whether or
+        // not it finished. The writer is not necessarily parked on the channel:
+        // against a peer that has stopped reading (a laptop asleep behind
+        // sshd, a stalled forward) it is parked inside `write_all` on a full
+        // socket, where closing the queue means nothing to it. Joining first is
+        // therefore an unbounded wait *on the session core thread* -- no
+        // frames, no input, no housekeeping, no idle timeout, and
+        // `accept_client` never runs again, so the user cannot even reconnect
+        // to the session they are still paying for. Only the shutdown unblocks
+        // that write, so it has to come before the join, not after it.
+        let writer = c.writer.take();
+        if let Some(w) = &writer {
+            let deadline = Instant::now() + WRITER_FLUSH_GRACE;
+            while !w.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
         c.socket.shutdown();
+        if let Some(w) = writer {
+            let _ = w.join();
+        }
         if let Some(r) = c.reader.take() {
             let _ = r.join();
         }
@@ -850,7 +891,12 @@ impl Core {
                 self.last_clipboard_received = Some(text.clone());
                 if let Some(cb) = self.clipboard.as_mut() {
                     log::debug!("clipboard <- client ({} bytes)", text.len());
-                    cb.set_text(text)?;
+                    // Non-fatal for the same reason as in `handle_x_event`:
+                    // this arrives from the client, and nothing a client sends
+                    // should be able to end the user's desktop session.
+                    if let Err(e) = cb.set_text(text) {
+                        log::warn!("clipboard: setting text failed: {e:#}");
+                    }
                 }
             }
             Message::Pong { nonce } => {
@@ -877,16 +923,14 @@ impl Core {
             }
             Message::ClipboardRequest { format } => {
                 if let Some(cb) = self.clipboard.as_mut() {
-                    cb.request_format(format)?;
+                    if let Err(e) = cb.request_format(format) {
+                        log::warn!("clipboard: requesting format {format:#x} failed: {e:#}");
+                    }
                 }
             }
             Message::FileRequest { id, path } => self.on_file_request(id, &path),
             Message::FileList { files, .. } => self.stage_client_files(files),
-            Message::RefreshRequest => {
-                if let Some(c) = self.client.as_mut() {
-                    c.full_refresh = true;
-                }
-            }
+            Message::RefreshRequest => self.force_full_refresh(),
             Message::Disconnect { reason } => {
                 log::info!("client requested disconnect: {reason}");
                 self.drop_client(None)?;
@@ -944,7 +988,6 @@ impl Core {
         };
         c.ready = true;
         c.features = features;
-        c.full_refresh = true;
         log::info!(
             "client {} ({client_name}) accepted: features 0x{features:x}, screen {w}x{h}",
             c.description
@@ -961,7 +1004,7 @@ impl Core {
         if features & features::LOCAL_CURSOR != 0 {
             self.refresh_cursor(true)?;
         }
-        self.encoder.invalidate(&Rect::new(0, 0, w, h));
+        self.force_full_refresh();
         Ok(())
     }
 
@@ -993,10 +1036,8 @@ impl Core {
         let (w, h) = self.display.size();
         self.screen = Framebuffer::new(w, h);
         self.encoder.resize(w, h);
-        self.encoder.invalidate(&Rect::new(0, 0, w, h));
-        self.damage.mark_dirty();
+        self.force_full_refresh();
         if let Some(c) = self.client.as_mut() {
-            c.full_refresh = true;
             if c.ready {
                 c.send(&Message::ScreenResized {
                     width: w as u16,
@@ -1009,6 +1050,24 @@ impl Core {
     }
 
     /// Send a frame if one is due, and sync the pointer position.
+    /// Arrange for the next frame to be a complete one.
+    ///
+    /// Both halves are required and neither is sufficient. `full_refresh` makes
+    /// `send_frame` capture the whole screen rather than the damage list;
+    /// invalidating the encoder's reference is what makes that capture actually
+    /// produce tiles, because the tile diff is against that reference and an
+    /// untouched reference matches the screen exactly. Setting only the flag
+    /// captures the screen, finds nothing changed and sends nothing -- which is
+    /// how `RefreshRequest` used to answer the one client with a reason to ask.
+    fn force_full_refresh(&mut self) {
+        let (w, h) = self.display.size();
+        self.encoder.invalidate(&Rect::new(0, 0, w, h));
+        self.damage.mark_dirty();
+        if let Some(c) = self.client.as_mut() {
+            c.full_refresh = true;
+        }
+    }
+
     fn pump(&mut self) -> Result<()> {
         let Some(c) = self.client.as_ref() else {
             return Ok(());
@@ -1045,7 +1104,9 @@ impl Core {
             let mut merged = coalesce(&raw, TILE_SIZE, &bounds);
             // Many scattered rectangles cost more round trips than one
             // capture of the whole screen.
-            if merged.len() > 24 || crate::x11::capture::total_area(&merged) * 2 > bounds.area() {
+            if merged.len() > crate::x11::capture::MAX_CAPTURE_RECTS
+                || crate::x11::capture::total_area(&merged) * 2 > bounds.area()
+            {
                 merged = vec![bounds];
             }
             merged

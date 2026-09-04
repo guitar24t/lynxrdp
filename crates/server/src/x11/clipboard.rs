@@ -17,14 +17,25 @@
 //! able to answer a conversion request promptly; deferring a reply until a
 //! blob arrived over the network would block the pasting application.
 //!
-//! `INCR` transfers are handled in both directions, so content larger than
-//! the X server's maximum request size works rather than silently truncating.
+//! Incoming `INCR` transfers are handled, so a session application offering
+//! content larger than the X server's maximum request size is read in full
+//! rather than truncated.
+//!
+//! Outgoing `INCR` is *not* implemented: when the client puts something on the
+//! clipboard that will not fit in one `ChangeProperty`, that format is declined
+//! (`property: NONE`) and left out of `TARGETS`, so the pasting application
+//! falls back to a format that fits instead of receiving nothing. Until this
+//! gap is closed, a very large image copied on the client cannot be pasted into
+//! a session application -- which is a limitation, where propagating the
+//! resulting protocol error used to end the whole session.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use lynxrdp_proto::message::clipboard_format;
-use x11rb::connection::Connection;
+// RequestConnection carries `maximum_request_bytes`. It is a supertrait of
+// Connection, but Rust still wants the defining trait in scope to call it.
+use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::protocol::xproto::{
     self, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Property,
     SelectionNotifyEvent, SelectionRequestEvent, WindowClass, SELECTION_NOTIFY_EVENT,
@@ -495,25 +506,65 @@ impl Clipboard {
         Ok(())
     }
 
+    /// The largest payload one `ChangeProperty` can carry on this connection.
+    ///
+    /// The X maximum request length is a property of the connection (and of
+    /// whether BIG-REQUESTS was negotiated), not a constant: it is around
+    /// 256 KiB without the extension and 16 MiB with it. A `change_property8`
+    /// over that limit is a protocol error, and a protocol error here used to
+    /// end the session.
+    ///
+    /// The real fix for an oversized selection is outgoing INCR, which this
+    /// module does not implement in that direction. Until it does, an
+    /// unservable format is better declined than promised: `serve` returns
+    /// `Ok(false)`, which `on_selection_request` turns into the
+    /// protocol-correct `property: NONE`, and it is left out of `TARGETS` so
+    /// the pasting application falls back to a format that does fit instead of
+    /// choosing one that cannot work.
+    fn max_property_bytes(&self) -> usize {
+        // The ChangeProperty header is 24 bytes; leave a little more than that
+        // so a rounding difference cannot turn into a protocol error.
+        self.display
+            .conn()
+            .maximum_request_bytes()
+            .saturating_sub(64)
+    }
+
+    /// The `text/uri-list` payload for the files currently owned, if any.
+    fn uri_list_payload(&self, gnome: bool) -> Option<String> {
+        let files = self.owned_files.as_ref()?;
+        let list = lynxrdp_proto::urilist::build(files);
+        // GNOME's variant is the same list prefixed with the operation.
+        Some(if gnome {
+            format!("copy\n{}", list.replace("\r\n", "\n"))
+        } else {
+            list
+        })
+    }
+
     /// Answer one conversion request; returns whether it was satisfied.
     fn serve(&mut self, e: &SelectionRequestEvent, property: xproto::Atom) -> Result<bool> {
         if e.selection != self.atoms.clipboard {
             return Ok(false);
         }
+        let limit = self.max_property_bytes();
         let conn = self.display.conn();
         if e.target == self.atoms.targets {
             let mut list = vec![self.atoms.targets, self.atoms.timestamp];
-            if self.owned_text.is_some() {
+            if self.owned_text.as_ref().is_some_and(|t| t.len() <= limit) {
                 list.extend([
                     self.atoms.utf8_string,
                     self.atoms.text,
                     AtomEnum::STRING.into(),
                 ]);
             }
-            if self.owned_png.is_some() {
+            if self.owned_png.as_ref().is_some_and(|p| p.len() <= limit) {
                 list.push(self.atoms.png);
             }
-            if self.owned_files.is_some() {
+            if self
+                .uri_list_payload(false)
+                .is_some_and(|l| l.len() <= limit)
+            {
                 list.push(self.atoms.uri_list);
                 list.push(self.atoms.gnome_copied);
             }
@@ -537,16 +588,17 @@ impl Clipboard {
             return Ok(true);
         }
         if e.target == self.atoms.uri_list || e.target == self.atoms.gnome_copied {
-            let Some(files) = self.owned_files.as_ref() else {
+            let Some(payload) = self.uri_list_payload(e.target == self.atoms.gnome_copied) else {
                 return Ok(false);
             };
-            let list = lynxrdp_proto::urilist::build(files);
-            // GNOME's variant is the same list prefixed with the operation.
-            let payload = if e.target == self.atoms.gnome_copied {
-                format!("copy\n{}", list.replace("\r\n", "\n"))
-            } else {
-                list
-            };
+            if payload.len() > limit {
+                log::warn!(
+                    "clipboard: file list of {} bytes exceeds the {limit}-byte \
+                     property limit; declining the conversion",
+                    payload.len()
+                );
+                return Ok(false);
+            }
             conn.change_property8(
                 PropMode::REPLACE,
                 e.requestor,
@@ -560,6 +612,16 @@ impl Clipboard {
             let Some(png) = self.owned_png.as_ref() else {
                 return Ok(false);
             };
+            if png.len() > limit {
+                // The common way to reach this: copy a large screenshot on the
+                // client, then press Ctrl+V in the session.
+                log::warn!(
+                    "clipboard: PNG of {} bytes exceeds the {limit}-byte property \
+                     limit; declining the conversion",
+                    png.len()
+                );
+                return Ok(false);
+            }
             conn.change_property8(
                 PropMode::REPLACE,
                 e.requestor,
@@ -572,6 +634,14 @@ impl Clipboard {
         let Some(text) = self.owned_text.as_ref() else {
             return Ok(false);
         };
+        if text.len() > limit {
+            log::warn!(
+                "clipboard: text of {} bytes exceeds the {limit}-byte property \
+                 limit; declining the conversion",
+                text.len()
+            );
+            return Ok(false);
+        }
         if e.target == self.atoms.utf8_string || e.target == self.atoms.text {
             conn.change_property8(
                 PropMode::REPLACE,

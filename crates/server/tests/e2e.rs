@@ -220,6 +220,55 @@ fn handshake_and_first_frame() {
     c.disconnect("test done");
 }
 
+/// A refresh request must actually produce a frame.
+///
+/// `RefreshRequest` used to set the "send a whole frame" flag without
+/// invalidating the encoder's reference. `send_frame` then captured the entire
+/// screen, diffed it against a reference that still matched it exactly, found
+/// nothing changed and returned having sent nothing -- while clearing the flag,
+/// so the request was consumed. The one client with a reason to ask (its
+/// framebuffer is wrong) was the one client guaranteed to get no answer.
+///
+/// The test leans on that: with the screen quiescent, ordinary damage produces
+/// no frames at all, so any frame arriving after the request came from the
+/// request.
+#[test]
+fn refresh_request_resends_the_screen() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+    s.x("xsetroot", &["-solid", "#00ff00"]);
+    assert!(wait_for(&mut c, Duration::from_secs(5), |_, c| c
+        .framebuffer()
+        .get(1, 1)
+        == 0x00ff00));
+
+    // Let the screen go quiet, and confirm it really is quiet.
+    let settle = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < settle {
+        let _ = c.poll_event(Duration::from_millis(50));
+    }
+    let before = c.frames_received();
+    let quiet = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < quiet {
+        let _ = c.poll_event(Duration::from_millis(50));
+    }
+    assert_eq!(
+        c.frames_received(),
+        before,
+        "screen is not quiescent; the test cannot attribute a frame to the request"
+    );
+
+    c.request_refresh().unwrap();
+    assert!(
+        wait_for(&mut c, Duration::from_secs(5), |_, c| c.frames_received()
+            > before),
+        "refresh request produced no frame"
+    );
+    assert_eq!(c.framebuffer().get(1, 1), 0x00ff00);
+    c.disconnect("test done");
+}
+
 #[test]
 fn incremental_updates_only_send_changes() {
     require_xvfb!();
