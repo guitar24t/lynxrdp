@@ -5,6 +5,11 @@
 //! scaling and text stays sharp. The pointer is drawn locally from the
 //! cursor images the server sends, which makes it feel instantaneous even
 //! on slow links.
+//!
+//! There is no widget toolkit here: the window owns raw pixels. The connection
+//! bar in [`crate::overlay`] is composited into the *presented* buffer after
+//! the blit, never into the decoded framebuffer, because the server sends
+//! incremental frames that diff against the pixels it believes we hold.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -17,11 +22,12 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::connection::{Client, ClientEvent};
 use crate::keymap;
+use crate::overlay::{self, Overlay};
 
 /// How long to wait after the last resize before asking the server.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -29,6 +35,27 @@ const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
 const CLIPBOARD_POLL: Duration = Duration::from_millis(700);
 /// RTT probe interval.
 const PING_INTERVAL: Duration = Duration::from_secs(3);
+/// How long the link may stay silent before the bar says so. Two probe
+/// intervals: one missed pong is a slow link, two is a link that has stopped.
+const STALL_AFTER: Duration = Duration::from_secs(2 * PING_INTERVAL.as_secs());
+/// How often the window repaints while the bar is up, so the round-trip and
+/// upload figures on it are not stale.
+const OVERLAY_TICK: Duration = Duration::from_millis(100);
+
+/// Pixels of trackpad scroll that make one wheel detent.
+///
+/// The protocol has no sub-detent scroll -- [`Message::Scroll`] counts whole
+/// button-4/5 clicks, which is all an X11 session understands -- so a pixel
+/// delta has to be divided by something. 24 is at the calm end of what X
+/// clients move for one wheel click (a three-line jump at a typical line
+/// height), and it is what [`ScrollCarry`] accumulates towards.
+///
+/// The old code divided by 40 and rounded, which made 20 px a whole detent
+/// (twice the gain this constant gives) and threw everything below 20 px away
+/// -- and a macOS trackpad emits ~3 px per event, so it threw away everything.
+/// Truncating with a carry never discards a pixel, so the divisor can be the
+/// honest one.
+pub const PX_PER_DETENT: f32 = 24.0;
 
 /// Options for the GUI.
 #[derive(Clone, Debug)]
@@ -78,10 +105,56 @@ pub struct App {
     last_ping: Instant,
     rtt: Option<Duration>,
     dirty: Option<Rect>,
+    /// Where the local cursor was drawn last frame, so the pixels it is
+    /// leaving are presented along with the ones it is entering.
+    last_cursor: Option<Rect>,
     full_redraw: bool,
+    /// Whether the next `RedrawRequested` is one we asked for.
+    ///
+    /// A redraw nobody asked for is an expose: X11 reports one as a bare
+    /// `RedrawRequested` with nothing else to distinguish it, and it means
+    /// the window's pixels are gone. A damage list built from our own state
+    /// would then present the cursor rectangle and leave the rest of the
+    /// window showing whatever uncovered it, because `present_with_damage`
+    /// copies only the rectangles it is given.
+    redraw_asked: bool,
     exit_reason: Option<String>,
     fullscreen: bool,
     pressed_keys: Vec<u32>,
+    /// Keysyms consumed as part of a bar accelerator. Their release is
+    /// consumed too: by then the user may have let go of Ctrl, so the
+    /// modifier test that recognised the press would no longer fire.
+    swallowed: Vec<u32>,
+    /// The connection bar.
+    overlay: Overlay,
+    /// The pointer is over the bar, so its events are ours and not the
+    /// session's.
+    pointer_on_bar: bool,
+    /// A press that landed on the bar; its release belongs to the bar too,
+    /// wherever it happens.
+    bar_press: bool,
+    /// Which pointer buttons are held down on the remote screen, one bit per
+    /// button. The bar stays out of the way until every one of them is up, or
+    /// dragging a window whose title bar sits under the top edge would break
+    /// the moment the bar appeared -- and releasing the second button of a
+    /// two-button drag must not be mistaken for the end of the drag.
+    remote_buttons: u8,
+    /// Wheel remainder, so a trackpad's few-pixel events add up instead of
+    /// rounding to nothing.
+    scroll: ScrollCarry,
+    /// When the connection was made; the fallback for "last known alive".
+    started: Instant,
+    /// When the last pong arrived.
+    last_pong: Option<Instant>,
+    /// Whether the link was answering at the last check, so a change can show
+    /// the bar without documentation.
+    link_ok: bool,
+    /// When the bar was last repainted for its own sake.
+    ///
+    /// `about_to_wait` runs again as soon as a redraw it asked for has been
+    /// served, so an unconditional request there is a spin at 100% of a core.
+    /// This paces the bar's own repaints instead.
+    last_overlay_frame: Instant,
     frames: u64,
     last_title_update: Instant,
 }
@@ -101,6 +174,7 @@ impl App {
             None
         };
         let cursor = client.cursor().cloned();
+        let now = Instant::now();
         Self {
             client,
             fullscreen: opts.fullscreen,
@@ -118,15 +192,27 @@ impl App {
             uploads: Vec::new(),
             clipboard_files: Vec::new(),
             clipboard_pending: 0,
-            last_clipboard_poll: Instant::now(),
-            last_ping: Instant::now(),
+            last_clipboard_poll: now,
+            last_ping: now,
             rtt: None,
             dirty: None,
+            last_cursor: None,
             full_redraw: true,
+            redraw_asked: false,
             exit_reason: None,
             pressed_keys: Vec::new(),
+            swallowed: Vec::new(),
+            overlay: Overlay::new(now),
+            pointer_on_bar: false,
+            bar_press: false,
+            remote_buttons: 0,
+            scroll: ScrollCarry::default(),
+            started: now,
+            last_pong: None,
+            link_ok: true,
+            last_overlay_frame: now,
             frames: 0,
-            last_title_update: Instant::now(),
+            last_title_update: now,
         }
     }
 
@@ -208,13 +294,35 @@ impl App {
         self.client.info().features & features::LOCAL_CURSOR != 0
     }
 
+    /// Repaint the window and present what actually changed.
+    ///
+    /// The whole window is still blitted every frame -- the framebuffer copy
+    /// is cheap and, more to the point, it means the buffer is complete
+    /// whichever of `softbuffer`'s buffers we were handed, so damage can be
+    /// declared without any buffer-age reasoning. What the damage list saves
+    /// is the upload: without it the compositor takes a full-window texture
+    /// for a two-line terminal cursor.
     fn redraw(&mut self) -> Result<()> {
-        let local_cursor = self.uses_local_cursor();
-        let Some(gfx) = self.gfx.as_mut() else {
+        let Some(size) = self.gfx.as_ref().map(|g| g.window.inner_size()) else {
             return Ok(());
         };
-        let size = gfx.window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            return Ok(());
+        };
+        let win = Rect::new(0, 0, size.width, size.height);
+        let scale = self.overlay_scale();
+        let status = self.overlay_status(Instant::now());
+        // While the pointer is on the bar it is the OS cursor the user is
+        // steering, not the session's, so ours is neither drawn nor moved.
+        let cursor_now = match (
+            self.uses_local_cursor() && !self.pointer_on_bar,
+            &self.cursor,
+        ) {
+            (true, Some(cur)) => self.pointer.map(|(px, py)| cursor_bounds(cur, px, py)),
+            _ => None,
+        };
+
+        let Some(gfx) = self.gfx.as_mut() else {
             return Ok(());
         };
         gfx.surface
@@ -224,23 +332,95 @@ impl App {
             .surface
             .buffer_mut()
             .map_err(|e| anyhow::anyhow!("surface buffer: {e}"))?;
-        let fb = self.client.framebuffer();
-        blit(&mut buf, size.width, size.height, fb);
-        if local_cursor {
+        blit(&mut buf, size.width, size.height, self.client.framebuffer());
+        // After the blit and before the cursor: the bar sits over the remote
+        // screen and under the pointer, and it is drawn into this buffer
+        // rather than into the framebuffer the next frame will diff against.
+        let (bar, bar_was) = self
+            .overlay
+            .draw(&mut buf, size.width, size.height, scale, &status);
+        if cursor_now.is_some() {
             if let (Some(cur), Some((px, py))) = (&self.cursor, self.pointer) {
                 draw_cursor(&mut buf, size.width, size.height, cur, px, py);
             }
         }
-        buf.present().map_err(|e| anyhow::anyhow!("present: {e}"))?;
+        let parts = [
+            self.dirty.unwrap_or_default(),
+            self.last_cursor.unwrap_or_default(),
+            cursor_now.unwrap_or_default(),
+            bar.unwrap_or_default(),
+            // What the bar covered last frame but does not now: the blit has
+            // already restored those pixels, but nothing would present them.
+            bar_was.unwrap_or_default(),
+        ];
+        let damage: Vec<softbuffer::Rect> = damage_regions(win, self.full_redraw, &parts)
+            .into_iter()
+            .filter_map(surface_rect)
+            .collect();
+        buf.present_with_damage(&damage)
+            .map_err(|e| anyhow::anyhow!("present: {e}"))?;
+        self.last_cursor = cursor_now;
         self.dirty = None;
         self.full_redraw = false;
         Ok(())
     }
 
-    fn request_redraw(&self) {
+    /// The integer pixel scale the bar is drawn at.
+    fn overlay_scale(&self) -> u32 {
+        overlay::pixel_scale(self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor()))
+    }
+
+    /// Everything the bar is allowed to say, and nothing else: the handshake
+    /// identity, the remote size, the last real round-trip sample and real
+    /// upload progress. No rate is offered because `Client::bytes_received` is
+    /// a cumulative counter, and a counter is not a rate.
+    fn overlay_status(&self, now: Instant) -> overlay::Status {
+        let info = self.client.info();
+        let mut st = overlay::Status::new(
+            &format!("{}@{}", info.username, info.server_name),
+            self.client.size(),
+            self.rtt,
+        );
+        st.stalled = self.stalled_for(now);
+        if !self.uploads.is_empty() {
+            let (done, total) = self.uploads.iter().fold((0u64, 0u64), |(d, t), (id, _)| {
+                let (a, b) = self.client.transfer_progress(*id).unwrap_or((0, 0));
+                (d + a, t + b)
+            });
+            st.uploads = Some((
+                self.uploads.len(),
+                (done * 100).checked_div(total).unwrap_or(0),
+            ));
+        }
+        st
+    }
+
+    /// How long the link has been silent, when that is long enough to say so.
+    ///
+    /// Before the first pong there is nothing to measure from, so the
+    /// connection's own start stands in: the handshake completing is itself
+    /// proof the link was alive, and calling a three-second-old session
+    /// "stalled" because our first probe has not come back yet would be a lie.
+    ///
+    /// `Client` keeps a better signal -- `last_message_at`, which any message
+    /// refreshes, not only a pong -- but it is private and `connection.rs` is
+    /// not this change's to edit. If it grows an accessor, prefer it here: it
+    /// notices a wedged session without depending on our own probe.
+    fn stalled_for(&self, now: Instant) -> Option<Duration> {
+        let quiet = now.saturating_duration_since(self.last_pong.unwrap_or(self.started));
+        (quiet > STALL_AFTER).then_some(quiet)
+    }
+
+    fn request_redraw(&mut self) {
         if let Some(g) = &self.gfx {
+            self.redraw_asked = true;
             g.window.request_redraw();
         }
+    }
+
+    /// Whether a pointer button is down on the remote screen.
+    fn remote_drag(&self) -> bool {
+        self.remote_buttons != 0
     }
 
     fn drain_network(&mut self, event_loop: &ActiveEventLoop) {
@@ -317,6 +497,7 @@ impl App {
                     ClientEvent::Notice(text) => log::info!("server: {text}"),
                     ClientEvent::Rtt(rtt) => {
                         self.rtt = Some(rtt);
+                        self.last_pong = Some(Instant::now());
                     }
                     ClientEvent::Disconnected(reason) => {
                         log::info!("disconnected: {reason}");
@@ -365,6 +546,89 @@ impl App {
             if let Some(g) = &self.gfx {
                 g.window.set_title(&self.title());
             }
+        }
+        // A link that stops answering, or starts again, shows the bar for a
+        // moment: it is the one status change a user needs to see without
+        // having gone looking for it.
+        let ok = self.stalled_for(now).is_none();
+        if ok != self.link_ok {
+            self.link_ok = ok;
+            self.overlay.flash(now);
+        }
+        if self.overlay.tick(now) {
+            // The bar covers remote pixels, so both showing and hiding it are
+            // a full repaint; the blit restores what was underneath.
+            self.full_redraw = true;
+            if !self.overlay.visible() && self.pointer_on_bar {
+                // It went away under a stationary pointer (a lost focus, an
+                // unpin). Hand the pointer back rather than leaving the
+                // session unable to see it.
+                self.pointer_on_bar = false;
+                self.bar_press = false;
+                self.restore_cursor();
+            }
+            self.request_redraw();
+        } else if self.overlay.visible()
+            && now.duration_since(self.last_overlay_frame) >= OVERLAY_TICK
+        {
+            // The round-trip and upload figures move while it is up.
+            self.last_overlay_frame = now;
+            self.request_redraw();
+        }
+    }
+
+    /// Show or hide the OS pointer according to who is drawing it now.
+    fn restore_cursor(&self) {
+        if let Some(g) = &self.gfx {
+            g.window
+                .set_cursor_visible(!self.uses_local_cursor() || self.cursor.is_none());
+        }
+    }
+
+    /// Do what a bar button or its accelerator asks.
+    fn run_overlay_action(&mut self, action: overlay::Action, event_loop: &ActiveEventLoop) {
+        match action {
+            overlay::Action::Fullscreen => self.toggle_fullscreen(),
+            overlay::Action::SecureAttention => self.send_secure_attention(),
+            overlay::Action::Disconnect => {
+                // The same path CloseRequested takes, so there is one exit.
+                self.exit_reason = Some("disconnected by the user".into());
+                event_loop.exit();
+            }
+        }
+    }
+
+    /// Send Ctrl+Alt+Del into the session.
+    ///
+    /// The modifiers are synthesised only when they are not already physically
+    /// down. From the bar's button nothing is held, so all three keys are
+    /// pressed and released in order; from Ctrl+Alt+End the session has
+    /// already seen the modifiers go down, and pressing them again -- or
+    /// releasing them afterwards while the user is still holding them --
+    /// would leave our idea of the keyboard and the session's disagreeing.
+    ///
+    /// Whatever is synthesised goes on `pressed_keys` for the duration, so a
+    /// focus loss in the middle still releases it, and comes off again at the
+    /// end so `release_all_keys` does not send a second release for a key that
+    /// is already up.
+    fn send_secure_attention(&mut self) {
+        let held = |a: u32, b: u32| self.pressed_keys.iter().any(|&k| k == a || k == b);
+        let mut synth = Vec::new();
+        if !held(keysym::CONTROL_L, keysym::CONTROL_R) {
+            synth.push(keysym::CONTROL_L);
+        }
+        if !held(keysym::ALT_L, keysym::ALT_R) {
+            synth.push(keysym::ALT_L);
+        }
+        for &ks in &synth {
+            self.pressed_keys.push(ks);
+            let _ = self.client.key(ks, true);
+        }
+        let _ = self.client.key(keysym::DELETE, true);
+        let _ = self.client.key(keysym::DELETE, false);
+        for &ks in synth.iter().rev() {
+            self.pressed_keys.retain(|&k| k != ks);
+            let _ = self.client.key(ks, false);
         }
     }
 
@@ -556,22 +820,49 @@ impl App {
         if self.pending_size.is_some() {
             d = d.min(RESIZE_DEBOUNCE / 2);
         }
+        if self.overlay.visible() {
+            d = d.min(OVERLAY_TICK);
+        }
         d
     }
 
-    fn on_key(&mut self, event: KeyEvent) {
-        // Fullscreen toggle: Ctrl+Alt+Enter (never forwarded).
-        if event.state == ElementState::Pressed
-            && matches!(event.logical_key, Key::Named(NamedKey::Enter))
-            && self.modifiers.control_key()
-            && self.modifiers.alt_key()
-        {
-            self.toggle_fullscreen();
-            return;
-        }
+    /// The accelerators this window keeps for itself.
+    ///
+    /// A closed list, deliberately: a raw framebuffer has no focus model, so
+    /// the bar cannot own keys the way a widget would, and every key not named
+    /// here -- Esc, Tab, the function keys, everything -- belongs to the
+    /// session. The bar prints these next to the matching button, which is the
+    /// whole of its keyboard story.
+    fn accelerator(&self, event: &KeyEvent) -> Option<Accelerator> {
+        accelerator_for(self.modifiers, &event.logical_key, event.physical_key)
+    }
+
+    fn on_key(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
         let Some(ks) = keymap::keysym_for(&event.logical_key, event.location) else {
             return;
         };
+        if event.state == ElementState::Pressed {
+            if let Some(acc) = self.accelerator(&event) {
+                self.swallowed.push(ks);
+                match acc {
+                    Accelerator::Fullscreen => self.toggle_fullscreen(),
+                    Accelerator::SecureAttention => self.send_secure_attention(),
+                    Accelerator::Pin => {
+                        self.overlay.toggle_pin();
+                        // Flash either way: pinning wants confirmation and
+                        // unpinning wants a last look before it goes.
+                        self.overlay.flash(Instant::now());
+                    }
+                    Accelerator::Disconnect => {
+                        self.run_overlay_action(overlay::Action::Disconnect, event_loop)
+                    }
+                }
+                return;
+            }
+        } else if let Some(i) = self.swallowed.iter().position(|&k| k == ks) {
+            self.swallowed.swap_remove(i);
+            return;
+        }
         // Numpad digits should arrive as KP_ keysyms.
         let ks = match (&event.logical_key, event.location) {
             (Key::Character(s), winit::keyboard::KeyLocation::Numpad) => s
@@ -598,6 +889,9 @@ impl App {
         for ks in std::mem::take(&mut self.pressed_keys) {
             let _ = self.client.key(ks, false);
         }
+        // The releases for these will arrive with the window unfocused, or not
+        // at all; either way there is nothing left to match them against.
+        self.swallowed.clear();
     }
 
     fn toggle_fullscreen(&mut self) {
@@ -611,10 +905,37 @@ impl App {
     }
 
     fn on_pointer_moved(&mut self, pos: PhysicalPosition<f64>) {
+        // A drag that started on the remote screen keeps the pointer even when
+        // it crosses the top edge, and the bar does not come up under it.
+        let claimed = !self.remote_drag()
+            && self.overlay.track(
+                pos.x.max(0.0) as u32,
+                pos.y.max(0.0) as u32,
+                self.overlay_scale(),
+            );
+        if claimed {
+            if !self.pointer_on_bar {
+                self.pointer_on_bar = true;
+                // Hand the pointer back to the OS: ours is the session's
+                // cursor and it has no business over our own controls.
+                if let Some(g) = &self.gfx {
+                    g.window.set_cursor_visible(true);
+                }
+            }
+            self.request_redraw();
+            return;
+        }
+        // Leaving the bar resyncs the session's pointer even when our idea of
+        // the position has not changed, because it has been moving under the
+        // bar without the session hearing about it.
+        let resync = std::mem::take(&mut self.pointer_on_bar);
+        if resync {
+            self.restore_cursor();
+        }
         let (w, h) = self.client.size();
         let x = pos.x.max(0.0).min(f64::from(w.saturating_sub(1))) as u32;
         let y = pos.y.max(0.0).min(f64::from(h.saturating_sub(1))) as u32;
-        if self.pointer != Some((x, y)) {
+        if resync || self.pointer != Some((x, y)) {
             self.pointer = Some((x, y));
             let _ = self.client.pointer_move(x as u16, y as u16);
             if self.uses_local_cursor() {
@@ -622,6 +943,188 @@ impl App {
             }
         }
     }
+}
+
+/// The protocol button code and our own held-buttons bit for a winit button.
+///
+/// The bit is not the protocol code: `button::BACK` and `FORWARD` are 8 and 9
+/// and would not fit in a byte of flags. It has to be one bit per button so
+/// that letting go of the second button of a two-button drag is not mistaken
+/// for the end of the drag.
+fn button_codes(b: MouseButton) -> Option<(u8, u8)> {
+    Some(match b {
+        MouseButton::Left => (button::LEFT, 1),
+        MouseButton::Middle => (button::MIDDLE, 2),
+        MouseButton::Right => (button::RIGHT, 4),
+        MouseButton::Back => (button::BACK, 8),
+        MouseButton::Forward => (button::FORWARD, 16),
+        MouseButton::Other(_) => return None,
+    })
+}
+
+/// Match a key event against the bar's accelerators.
+///
+/// The layout's answer wins where it gives one: on Dvorak the key labelled B
+/// is what should pin, whatever physical code it sits on. The physical code is
+/// consulted only when the layout produced no letter at all, which is exactly
+/// the macOS case -- Option is applied before winit sees the event, so
+/// Ctrl+Alt+B arrives as the character U+222B and Ctrl+Alt+Q as U+0153.
+///
+/// Falling through to the physical code unconditionally would be worse than
+/// not having it: on a Dvorak layout the physical B key types `x`, so
+/// Ctrl+Alt+X would be quietly swallowed instead of reaching the session. The
+/// price of the guard is that the two letter accelerators are unreachable on
+/// macOS with a non-QWERTY layout; both buttons are still on the bar.
+fn accelerator_for(
+    modifiers: ModifiersState,
+    logical: &Key,
+    physical: PhysicalKey,
+) -> Option<Accelerator> {
+    if !(modifiers.control_key() && modifiers.alt_key()) {
+        return None;
+    }
+    match logical {
+        Key::Named(NamedKey::Enter) => return Some(Accelerator::Fullscreen),
+        Key::Named(NamedKey::End) => return Some(Accelerator::SecureAttention),
+        Key::Character(c) if c.eq_ignore_ascii_case("b") => return Some(Accelerator::Pin),
+        Key::Character(c) if c.eq_ignore_ascii_case("q") => return Some(Accelerator::Disconnect),
+        // A letter the layout produced that is not one of ours is the
+        // layout's final word; the session gets it.
+        Key::Character(c) if c.chars().all(|c| c.is_ascii_alphanumeric()) => return None,
+        _ => {}
+    }
+    match physical {
+        PhysicalKey::Code(KeyCode::KeyB) => Some(Accelerator::Pin),
+        PhysicalKey::Code(KeyCode::KeyQ) => Some(Accelerator::Disconnect),
+        _ => None,
+    }
+}
+
+/// An accelerator this window keeps rather than forwarding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Accelerator {
+    /// Ctrl+Alt+Enter.
+    Fullscreen,
+    /// Ctrl+Alt+End.
+    SecureAttention,
+    /// Ctrl+Alt+B.
+    Pin,
+    /// Ctrl+Alt+Q.
+    Disconnect,
+}
+
+/// Turn a wheel event into detents, before any accumulation.
+///
+/// Winit's y grows as the content moves up; [`Message::Scroll`]'s grows
+/// downwards, like X11 button 5, so the sign flips here and only here.
+pub fn scroll_units(delta: MouseScrollDelta) -> (f32, f32) {
+    match delta {
+        MouseScrollDelta::LineDelta(x, y) => (x, -y),
+        MouseScrollDelta::PixelDelta(p) => {
+            (p.x as f32 / PX_PER_DETENT, -(p.y as f32) / PX_PER_DETENT)
+        }
+    }
+}
+
+/// The fractional part of a scroll gesture, held between events.
+///
+/// Without this a macOS trackpad cannot scroll at all: it emits a stream of
+/// two- and three-pixel deltas, each of which is a fraction of a detent on its
+/// own, and rounding each one independently rounds every one of them to zero.
+/// Keeping the remainder turns the stream into whole detents at the rate the
+/// finger actually moved.
+///
+/// The remainder is dropped when the axis reverses, so flicking back does not
+/// have to repay the fraction the previous direction left behind, and when the
+/// window loses focus, because a remainder is part of one gesture.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScrollCarry {
+    carry: (f32, f32),
+}
+
+impl ScrollCarry {
+    /// Forget the remainder on both axes.
+    pub fn reset(&mut self) {
+        self.carry = (0.0, 0.0);
+    }
+
+    /// Add a delta in detents and take out whole ones.
+    pub fn feed(&mut self, dx: f32, dy: f32) -> (i16, i16) {
+        (
+            Self::axis(&mut self.carry.0, dx),
+            Self::axis(&mut self.carry.1, dy),
+        )
+    }
+
+    fn axis(carry: &mut f32, delta: f32) -> i16 {
+        if !delta.is_finite() {
+            return 0;
+        }
+        if delta != 0.0 && *carry != 0.0 && delta.is_sign_positive() != carry.is_sign_positive() {
+            *carry = 0.0;
+        }
+        *carry += delta;
+        // `trunc`, not `round`: rounding would emit a detent for half a
+        // detent's movement and then owe the carry the other half back.
+        let whole = carry.trunc();
+        *carry -= whole;
+        whole.clamp(f32::from(-i16::MAX), f32::from(i16::MAX)) as i16
+    }
+}
+
+/// The window rectangle a cursor image covers at `(px, py)`, clamped to the
+/// positive quadrant. Used to present the pixels the pointer leaves behind.
+pub fn cursor_bounds(cur: &CursorImage, px: u32, py: u32) -> Rect {
+    let x = i64::from(px) - i64::from(cur.hot_x);
+    let y = i64::from(py) - i64::from(cur.hot_y);
+    let (x0, y0) = (x.max(0), y.max(0));
+    Rect::new(
+        x0 as u32,
+        y0 as u32,
+        (x + i64::from(cur.width) - x0).max(0) as u32,
+        (y + i64::from(cur.height) - y0).max(0) as u32,
+    )
+}
+
+/// Work out what to present.
+///
+/// `parts` are candidate damaged rectangles in window coordinates; empty ones
+/// are ignored and the rest are clipped to `win`. A rectangle already covered
+/// by another is dropped, so a full-window part collapses the list rather than
+/// presenting the same pixels twice.
+///
+/// An empty result means the whole window: it is what a compositor-driven
+/// expose looks like, where nothing in our own state changed but the pixels
+/// still have to go out. Presenting too much is slow; presenting too little
+/// leaves the user looking at pixels that are not there any more.
+pub fn damage_regions(win: Rect, full: bool, parts: &[Rect]) -> Vec<Rect> {
+    if full {
+        return vec![win];
+    }
+    let mut out: Vec<Rect> = Vec::new();
+    for p in parts {
+        let r = p.intersect(&win);
+        if r.is_empty() || out.iter().any(|o| o.contains(&r)) {
+            continue;
+        }
+        out.retain(|o| !r.contains(o));
+        out.push(r);
+    }
+    if out.is_empty() {
+        vec![win]
+    } else {
+        out
+    }
+}
+
+/// Convert to softbuffer's rectangle, dropping empty ones.
+fn surface_rect(r: Rect) -> Option<softbuffer::Rect> {
+    Some(softbuffer::Rect {
+        x: r.x,
+        y: r.y,
+        width: NonZeroU32::new(r.width)?,
+        height: NonZeroU32::new(r.height)?,
+    })
 }
 
 /// Shared slot through which the reader thread reaches the event loop proxy.
@@ -667,6 +1170,14 @@ impl ApplicationHandler<Wake> for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
+                // A redraw nobody asked for is an expose. Our own state says
+                // nothing changed, so the damage list would name at most the
+                // cursor -- and `present_with_damage` copies only what it is
+                // given, leaving the rest of the window showing whatever
+                // uncovered it. Repaint the lot instead.
+                if !std::mem::take(&mut self.redraw_asked) {
+                    self.full_redraw = true;
+                }
                 self.drain_network(event_loop);
                 if let Err(e) = self.redraw() {
                     log::error!("redraw failed: {e:#}");
@@ -682,18 +1193,29 @@ impl ApplicationHandler<Wake> for App {
             }
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                self.overlay.set_focused(f);
                 if f {
                     self.poll_clipboard();
                 } else {
                     self.release_all_keys();
+                    // A wheel remainder from before the window lost focus is
+                    // not part of whatever gesture comes next.
+                    self.scroll.reset();
+                    // Nor is a drag: the release may be delivered to whoever
+                    // took the pointer instead of to us, and a button left
+                    // recorded as held would keep the bar down for the rest
+                    // of the session.
+                    self.remote_buttons = 0;
                 }
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
             }
-            WindowEvent::KeyboardInput { event, .. } => self.on_key(event),
+            WindowEvent::KeyboardInput { event, .. } => self.on_key(event, event_loop),
             WindowEvent::CursorMoved { position, .. } => self.on_pointer_moved(position),
             WindowEvent::CursorLeft { .. } => {
+                self.overlay.pointer_left();
+                self.pointer_on_bar = false;
                 if let Some(g) = &self.gfx {
                     g.window.set_cursor_visible(true);
                 }
@@ -707,26 +1229,41 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::MouseInput {
                 state, button: b, ..
             } => {
-                let btn = match b {
-                    MouseButton::Left => button::LEFT,
-                    MouseButton::Middle => button::MIDDLE,
-                    MouseButton::Right => button::RIGHT,
-                    MouseButton::Back => button::BACK,
-                    MouseButton::Forward => button::FORWARD,
-                    MouseButton::Other(_) => return,
+                let down = state == ElementState::Pressed;
+                // A press that started on the bar owns its release wherever
+                // that lands, or the session would see a release it never saw
+                // a press for.
+                if !down && std::mem::take(&mut self.bar_press) {
+                    if let Some(action) = self.overlay.release() {
+                        self.run_overlay_action(action, event_loop);
+                    }
+                    self.request_redraw();
+                    return;
+                }
+                if self.pointer_on_bar {
+                    if down && b == MouseButton::Left {
+                        self.bar_press = true;
+                        self.overlay.press();
+                        self.request_redraw();
+                    }
+                    return;
+                }
+                let Some((btn, bit)) = button_codes(b) else {
+                    return;
                 };
-                let _ = self
-                    .client
-                    .pointer_button(btn, state == ElementState::Pressed);
+                if down {
+                    self.remote_buttons |= bit;
+                } else {
+                    self.remote_buttons &= !bit;
+                }
+                let _ = self.client.pointer_button(btn, down);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x, y),
-                    // Pixel deltas (touchpads): ~40 px per detent.
-                    MouseScrollDelta::PixelDelta(p) => ((p.x / 40.0) as f32, (p.y / 40.0) as f32),
-                };
-                let sx = dx.round() as i16;
-                let sy = (-dy).round() as i16;
+                if self.pointer_on_bar {
+                    return;
+                }
+                let (dx, dy) = scroll_units(delta);
+                let (sx, sy) = self.scroll.feed(dx, dy);
                 if sx != 0 || sy != 0 {
                     let _ = self.client.send(&Message::Scroll { dx: sx, dy: sy });
                 }
@@ -976,6 +1513,263 @@ mod tests {
         let mut small = vec![0u32; 2];
         blit(&mut small, 2, 1, &fb);
         assert_eq!(small, vec![0x123456, 0x123456]);
+    }
+
+    #[test]
+    fn a_trackpads_small_deltas_add_up_instead_of_vanishing() {
+        // The bug this replaces: (3.0 / 40.0).round() == 0, for every event
+        // forever, so a macOS trackpad could not scroll at all.
+        let mut c = ScrollCarry::default();
+        let mut sent = 0i32;
+        for _ in 0..8 {
+            let (dx, dy) = scroll_units(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+                0.0, -3.0,
+            )));
+            let (sx, sy) = c.feed(dx, dy);
+            assert_eq!(sx, 0);
+            sent += i32::from(sy);
+        }
+        // Eight three-pixel events are 24 px, which is exactly one detent.
+        assert_eq!(sent, 1);
+    }
+
+    #[test]
+    fn a_detent_is_never_rounded_up() {
+        // Truncate-and-carry, not round: 23 px is not yet a detent, and the
+        // 23 px are still owed rather than discarded.
+        let mut c = ScrollCarry::default();
+        let (dx, dy) = scroll_units(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+            0.0, -23.0,
+        )));
+        assert_eq!(c.feed(dx, dy), (0, 0));
+        let (dx, dy) = scroll_units(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+            0.0, -1.0,
+        )));
+        assert_eq!(c.feed(dx, dy), (0, 1));
+    }
+
+    #[test]
+    fn reversing_direction_drops_the_carry() {
+        // Otherwise a flick back up would first have to repay the fraction
+        // the downward flick left behind, and the first event of the new
+        // gesture would do nothing.
+        let mut c = ScrollCarry::default();
+        assert_eq!(c.feed(0.0, 0.9), (0, 0));
+        assert_eq!(c.feed(0.0, -1.0), (0, -1));
+    }
+
+    #[test]
+    fn a_line_delta_and_a_pixel_delta_scroll_the_same_way() {
+        // Winit\'s y grows as the content moves up; the protocol\'s grows down.
+        // Both arms must flip it, which is what the old code got right for
+        // lines and the new code has to keep right for both.
+        let (_, up_lines) = scroll_units(MouseScrollDelta::LineDelta(0.0, 1.0));
+        let (_, up_pixels) = scroll_units(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+            0.0, 48.0,
+        )));
+        assert!(up_lines < 0.0 && up_pixels < 0.0);
+        assert_eq!(up_pixels, -2.0);
+        let (dx, _) = scroll_units(MouseScrollDelta::LineDelta(1.0, 0.0));
+        assert_eq!(dx, 1.0);
+    }
+
+    #[test]
+    fn a_wild_delta_cannot_overflow_the_wire_type() {
+        let mut c = ScrollCarry::default();
+        let (sx, sy) = c.feed(1e12, -1e12);
+        assert_eq!((sx, sy), (i16::MAX, -i16::MAX));
+        assert_eq!(c.feed(f32::NAN, f32::INFINITY), (0, 0));
+    }
+
+    #[test]
+    fn focus_loss_forgets_the_remainder() {
+        let mut c = ScrollCarry::default();
+        c.feed(0.0, 0.9);
+        c.reset();
+        assert_eq!(c.feed(0.0, 0.5), (0, 0));
+    }
+
+    #[test]
+    fn damage_names_only_what_moved() {
+        let win = Rect::new(0, 0, 800, 600);
+        let got = damage_regions(
+            win,
+            false,
+            &[
+                Rect::new(10, 10, 20, 20),
+                Rect::default(),
+                Rect::new(700, 500, 32, 32),
+            ],
+        );
+        assert_eq!(
+            got,
+            vec![Rect::new(10, 10, 20, 20), Rect::new(700, 500, 32, 32)]
+        );
+    }
+
+    #[test]
+    fn damage_is_clipped_and_deduplicated() {
+        let win = Rect::new(0, 0, 800, 600);
+        // A rectangle running off the edge is clipped, not refused: a cursor
+        // half off the window still has to be presented.
+        let got = damage_regions(win, false, &[Rect::new(790, 590, 32, 32)]);
+        assert_eq!(got, vec![Rect::new(790, 590, 10, 10)]);
+        // A part covering another collapses the list rather than uploading
+        // the same pixels twice.
+        let got = damage_regions(
+            win,
+            false,
+            &[Rect::new(10, 10, 4, 4), win, Rect::new(0, 0, 8, 8)],
+        );
+        assert_eq!(got, vec![win]);
+    }
+
+    #[test]
+    fn nothing_to_present_still_presents_everything() {
+        // A redraw we did not ask for is an expose: our own state says nothing
+        // changed, but the pixels still have to go out.
+        let win = Rect::new(0, 0, 800, 600);
+        assert_eq!(damage_regions(win, false, &[]), vec![win]);
+        assert_eq!(damage_regions(win, false, &[Rect::default()]), vec![win]);
+        assert_eq!(
+            damage_regions(win, true, &[Rect::new(1, 1, 2, 2)]),
+            vec![win]
+        );
+    }
+
+    #[test]
+    fn a_cursor_rectangle_covers_every_pixel_the_cursor_draws() {
+        let cur = CursorImage {
+            width: 16,
+            height: 16,
+            hot_x: 4,
+            hot_y: 4,
+            argb: vec![0xFF00_0000; 256],
+        };
+        assert_eq!(cursor_bounds(&cur, 100, 100), Rect::new(96, 96, 16, 16));
+        // Clamped at the top-left corner: the visible part only.
+        assert_eq!(cursor_bounds(&cur, 1, 2), Rect::new(0, 0, 13, 14));
+        // Wholly off the top-left: nothing to present.
+        assert!(
+            cursor_bounds(&cur, 0, 0)
+                .intersect(&Rect::new(0, 0, 800, 600))
+                .area()
+                <= 144
+        );
+    }
+
+    #[test]
+    fn the_layout_has_the_last_word_on_which_letter_is_which() {
+        use winit::keyboard::SmolStr;
+        let ctrl_alt = ModifiersState::CONTROL | ModifiersState::ALT;
+        let ch = |c: &str| Key::Character(SmolStr::new(c));
+
+        // The ordinary case: the layout says `b`, and it sits on the physical
+        // B key.
+        assert_eq!(
+            accelerator_for(ctrl_alt, &ch("b"), PhysicalKey::Code(KeyCode::KeyB)),
+            Some(Accelerator::Pin)
+        );
+        // macOS applies Option first, so the letter never arrives; the
+        // physical code is all there is left to go on.
+        assert_eq!(
+            accelerator_for(ctrl_alt, &ch("\u{222b}"), PhysicalKey::Code(KeyCode::KeyB)),
+            Some(Accelerator::Pin)
+        );
+        assert_eq!(
+            accelerator_for(ctrl_alt, &ch("\u{153}"), PhysicalKey::Code(KeyCode::KeyQ)),
+            Some(Accelerator::Disconnect)
+        );
+        // Dvorak: the key labelled B is physically N, and it still pins...
+        assert_eq!(
+            accelerator_for(ctrl_alt, &ch("b"), PhysicalKey::Code(KeyCode::KeyN)),
+            Some(Accelerator::Pin)
+        );
+        // ...while the physical B key types `x` there, and Ctrl+Alt+X belongs
+        // to the session. Falling through to the physical code here would
+        // swallow it, which is the whole reason for the guard.
+        assert_eq!(
+            accelerator_for(ctrl_alt, &ch("x"), PhysicalKey::Code(KeyCode::KeyB)),
+            None
+        );
+        // The named keys do not depend on the layout at all.
+        assert_eq!(
+            accelerator_for(
+                ctrl_alt,
+                &Key::Named(NamedKey::End),
+                PhysicalKey::Code(KeyCode::End)
+            ),
+            Some(Accelerator::SecureAttention)
+        );
+        // And nothing at all fires without both modifiers.
+        for m in [
+            ModifiersState::empty(),
+            ModifiersState::CONTROL,
+            ModifiersState::ALT,
+        ] {
+            assert_eq!(
+                accelerator_for(
+                    m,
+                    &Key::Named(NamedKey::Enter),
+                    PhysicalKey::Code(KeyCode::Enter)
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn every_pointer_button_gets_its_own_bit() {
+        // Sharing a bit would mean releasing Back cleared Forward's flag, and
+        // the bar would come up in the middle of a two-button drag.
+        let buttons = [
+            MouseButton::Left,
+            MouseButton::Middle,
+            MouseButton::Right,
+            MouseButton::Back,
+            MouseButton::Forward,
+        ];
+        let mut seen = 0u8;
+        for b in buttons {
+            let (_, bit) = button_codes(b).expect("a named button has a code");
+            assert_eq!(bit.count_ones(), 1, "{b:?} is not a single bit");
+            assert_eq!(seen & bit, 0, "{b:?} shares a bit with an earlier button");
+            seen |= bit;
+        }
+        assert!(button_codes(MouseButton::Other(9)).is_none());
+    }
+
+    #[test]
+    fn the_bar_leaves_no_trace_in_the_framebuffer() {
+        // The single correctness point of the overlay: it is composited into
+        // the presented buffer, so the next frame\'s blit erases it whole. If
+        // it were ever drawn into the decoded framebuffer instead, the
+        // server\'s next incremental frame would diff against pixels it never
+        // sent and the smear would be permanent.
+        let mut fb = Framebuffer::new(200, 80);
+        fb.fill(&fb.bounds(), 0x0033_6699);
+        let before = fb.clone();
+
+        let (w, h) = (200u32, 80u32);
+        let mut clean = vec![0u32; (w * h) as usize];
+        blit(&mut clean, w, h, &fb);
+
+        let mut buf = vec![0u32; (w * h) as usize];
+        blit(&mut buf, w, h, &fb);
+        let status = crate::overlay::Status::new("a@b", (200, 80), None);
+        crate::overlay::paint(
+            &mut buf,
+            w,
+            h,
+            &crate::overlay::bar_layout(w, 2, &status),
+            None,
+            None,
+        );
+        assert_ne!(buf, clean, "the bar should have drawn something");
+        assert_eq!(fb, before, "the framebuffer must be untouched");
+
+        blit(&mut buf, w, h, &fb);
+        assert_eq!(buf, clean, "the next blit must erase every trace of it");
     }
 
     #[test]
