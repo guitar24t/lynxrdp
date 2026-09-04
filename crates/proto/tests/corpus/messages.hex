@@ -1,0 +1,55 @@
+# LynxRDP wire corpus. Generated; see crates/proto/tests/wire_corpus.rs.
+#
+# The exact bytes of every protocol message, as this build encodes them. These
+# are what a peer compiled from an older commit will be handed, and the floor
+# below is the promise that such a peer can still read them. An entry that
+# changes without that number changing is a compatibility break, so the test
+# fails and regeneration refuses.
+#
+# One entry per line: NAME = lowercase hex of `Message::encode`, no framing
+# (the 4-byte little-endian length prefix belongs to `frame.rs`, which pins it
+# with its own tests).
+#
+# Regenerate with:
+#     cargo test -p lynxrdp-proto --test wire_corpus -- --ignored regenerate
+
+min-compatible-version = 3
+
+ClientHello/all-features         = 010300150000006c796e787264702d636c69656e742f636f727075733f00000080073804
+KeyEvent/press                   = 020dff000001
+KeyEvent/release                 = 024100000000
+PointerMotion/typical            = 03ff04cf02
+PointerButton/middle-press       = 040201
+Scroll/negative-dx               = 05fdff0500
+FrameAck/max                     = 06ffffffffffffffff
+ResizeRequest/typical            = 0700040003
+ClipboardText/utf8               = 0811000000746162096865726520e29c8220f09f9880
+Pong/nonce                       = 090807060504030201
+Disconnect/reason                = 0a12000000636c6f736564206279207468652075736572
+RefreshRequest/empty             = 0b
+ServerHello/typical              = 2003000f0000006c796e787264702d73657373696f6e15000000341200efbeadde0005000000616c69636580073804
+Rejected/version                 = 2101003400000070726f746f636f6c2076657273696f6e2032206e6f7420737570706f72746564202873657276657220666c6f6f72206973203329
+ScreenUpdate/copies-and-tiles    = 220700000000000000020000000b00160021002c00370042008002e0010100020003000400010000008000c000400020000104000000deadbeef
+ScreenUpdate/empty               = 2200000000000000000000000000000000
+ScreenUpdate/every-tile-encoding = 2201000000000000000000000007000000000000004000400000030000001122334000000040004000010300000011223380000000400040000203000000112233c0000000400040000303000000112233000100004000400004030000001122334001000040004000050300000011223380010000400040000603000000112233
+ScreenResized/typical            = 23000aa005
+CursorShape/2x2                  = 24020002000100000004000000000000ff0000ff0000ff0000ff000000
+CursorShape/hidden               = 24000000000000000000000000
+CursorShape/4x3-offset-hotspot   = 2404000300010002000c000000010101ff020202ff030303ff040404ff050505ff060606ff070707ff080808ff090909ff0a0a0aff0b0b0bff0c0c0cff
+CursorPosition/typical           = 252a009210
+Ping/nonce                       = 260102030405060708
+Notice/text                      = 270f00000073657373696f6e20726573756d6564
+TransferOffer/clipboard-image    = 408877665544332211000d000000636c6970626f6172642e706e670100010000000000
+TransferOffer/file-upload        = 40020000000000000001140000002f686f6d652f616c6963652f6e6f7465732e6d640010000000000000
+TransferOffer/file-download      = 400300000000000000020a0000007265706f72742e7064660100004000000000
+TransferAccept/accepted          = 4104000000000000000100000000
+TransferAccept/declined          = 41050000000000000000220000006c6172676572207468616e207468652072656365697665722077696c6c20686f6c64
+TransferData/chunk               = 4206000000000000000d0c0b0a06000000000102fdfeff
+TransferAck/chunk                = 4307000000000000000d0c0b0a
+TransferEnd/ok                   = 4408000000000000000100000000
+TransferEnd/failed               = 44090000000000000000190000007472756e63617465643a203132206f66203334206279746573
+FileRequest/path                 = 450a000000000000001e0000002f686f6d652f616c6963652f70686f746f732f686f6c696461792e6a7067
+FileList/two-entries             = 460b000000000000000200000005000000612e7478740c00000000000000090000007375622f622e62696e7766554433221100
+FileList/empty                   = 460c0000000000000000000000
+ClipboardOffer/all-formats       = 4707000000
+ClipboardRequest/png             = 4802000000
