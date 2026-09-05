@@ -171,6 +171,7 @@ enum Action {
     Quit,
 
     Connect,
+    ManageSessions,
     Edit,
     CopyCommandLine,
     CopyConnectionsPath,
@@ -377,6 +378,7 @@ struct Launcher {
     dialog: Option<Dialog>,
     selected: Option<usize>,
     sessions: Sessions,
+    remote_sessions: Option<crate::remote_sessions::Window>,
     /// What the list is filtered down to. Not persisted: a filter is a thing
     /// you are doing now, not a preference.
     filter: String,
@@ -456,6 +458,7 @@ impl Launcher {
             dialog: None,
             selected,
             sessions: Sessions::default(),
+            remote_sessions: None,
             filter: String::new(),
             focus_filter: false,
             scroll_to_selection: false,
@@ -681,7 +684,9 @@ impl Launcher {
             // Exporting an empty list because the real one could not be read
             // would write a file that misrepresents what the user has.
             Action::AskExport => writable,
-            Action::Connect | Action::Edit | Action::CopyCommandLine => selection,
+            Action::Connect | Action::ManageSessions | Action::Edit | Action::CopyCommandLine => {
+                selection
+            }
             Action::MoveAside => self.load_failed,
             // Every one of these would otherwise be a button that starts a
             // second thread, or one that offers an install nothing found.
@@ -736,6 +741,11 @@ impl Launcher {
             }
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
 
+            Action::ManageSessions => {
+                if let Some(profile) = self.selected_profile().cloned() {
+                    self.remote_sessions = Some(crate::remote_sessions::Window::new(profile));
+                }
+            }
             Action::Connect => {
                 if let Some(index) = self.selected {
                     self.connect(index);
@@ -1154,6 +1164,13 @@ impl Launcher {
 
     fn connection_menu(&mut self, ui: &mut egui::Ui, chosen: &mut Option<Action>) {
         ui.menu_button("Connection", |ui| {
+            self.item(
+                ui,
+                "Running Desktops...",
+                Action::ManageSessions,
+                None,
+                chosen,
+            );
             self.item(ui, "Connect", Action::Connect, Some(keys::CONNECT), chosen)
                 .on_disabled_hover_text("Select a connection first.");
             self.item(ui, "Edit…", Action::Edit, Some(keys::EDIT), chosen)
@@ -2356,6 +2373,16 @@ impl Launcher {
     /// layout tests below run, so what they measure is what ships rather than
     /// a reconstruction of it.
     fn draw(&mut self, ctx: &egui::Context) {
+        if let Some(window) = self.remote_sessions.as_mut() {
+            if let Some(profile) = window.show(ctx) {
+                if let Err(e) = self.sessions.start(&profile) {
+                    self.error = Some(format!("{e:#}"));
+                }
+            }
+            if !window.open {
+                self.remote_sessions = None;
+            }
+        }
         self.sessions.reap();
         self.drain_failures();
         // The updater runs on its own thread and says nothing until asked.

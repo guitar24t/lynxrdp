@@ -19,6 +19,7 @@ name = "lynxrdp_client"
 path = "src/lib.rs"
 
 [dependencies]
+ctrlc = "3"
 lynxrdp-proto = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }

@@ -142,6 +142,41 @@ Clipboard contents are fetched on demand: an offer names the formats
 available, and the bytes only move if the other side asks for them. Copying
 a large image you never paste therefore costs nothing.
 
+## File I/O and clipboard batches
+
+The session's bounded file worker owns all file handles. The core submits jobs
+without waiting for a queue slot; overload fails a transfer rather than stopping
+input and capture. Read adapters return `WouldBlock` until data arrives, preserving
+partial chunks in the transfer sender. Final publication is also polled: the
+receiver retains its sink until the worker confirms the rename, then reports
+success. Worker events wake the core, with housekeeping retries and a timeout
+for stalled reads and publication. Pending opens are capped at 64 per session.
+Dropping an adapter cancels queued work without sending a blocking cleanup job;
+the worker releases cancelled handles when it can next run.
+
+Both sides use `proto::clipboard_batch::ClipBatch` for unique cross-platform
+names, eight concurrent file requests, cancellation of superseded batches, and
+settling every success or failure. A partial batch publishes the successful
+files and reports the missing ones. Disconnect clears transfer state but keeps
+the server's ID allocator advancing. Open callbacks are generation-checked
+before their pending entry is removed.
+
+`proto::atomic_file` stages on the destination filesystem and publishes only on
+successful completion. The server resolves upload parents using directory
+handles and `openat(O_NOFOLLOW)`, then retains the parent handle through the
+rename. Both sides preserve existing destinations unless explicitly instructed
+to replace them. The `ATOMIC_FILES` feature bit negotiates the optional
+`TransferOptions` message (extension tag 129); every existing wire layout and
+the protocol floor remain unchanged. Unknown extensions are still skipped;
+known extensions are decoded normally.
+
+Session administration uses a separate SSH command, not a desktop connection.
+`lynxrdp-session --list-sessions` inspects only the caller's process ownership
+and session executable identity. Termination opens a pidfd and rechecks the
+process start token and owner before sending SIGTERM, avoiding PID reuse.
+The launcher performs these commands on a worker and exposes reconnect and
+confirmed termination in its Running Desktops window.
+
 ## Client
 
 `crates/client/src/connection.rs` is a UI-free protocol client used by the

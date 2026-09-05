@@ -1200,3 +1200,166 @@ fn latency_probe() {
         |ev, _| matches!(ev, ClientEvent::Rtt(d) if *d < Duration::from_secs(1))
     ));
 }
+
+#[test]
+fn clipboard_duplicates_and_partial_failure_publish_the_successful_files() {
+    require_xvfb!();
+    if skip_unless(have("xclip"), "xclip not installed") {
+        return;
+    }
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+    let source = tempfile::tempdir().unwrap();
+    let a = source.path().join("a/notes.txt");
+    let b = source.path().join("b/notes.txt");
+    let gone = source.path().join("gone");
+    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+    std::fs::write(&a, b"first").unwrap();
+    std::fs::write(&b, b"second").unwrap();
+    std::fs::write(&gone, b"gone").unwrap();
+    c.offer_clipboard_files(&[a, b, gone.clone()]).unwrap();
+    // The client has not handled any requests yet, so this failure is deterministic.
+    std::fs::remove_file(gone).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        c.poll_event(Duration::from_millis(30)).unwrap();
+        let out = s.x(
+            "xclip",
+            &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
+        );
+        let files = lynxrdp_proto::urilist::parse(&String::from_utf8_lossy(&out.stdout));
+        if files.len() == 2 {
+            assert_ne!(files[0], files[1]);
+            let mut contents: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+            contents.sort();
+            assert_eq!(contents, vec![b"first".to_vec(), b"second".to_vec()]);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "partial clipboard batch never published"
+        );
+    }
+}
+
+#[test]
+fn uploads_preserve_existing_files_unless_replacement_is_chosen() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+    let source = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"new").unwrap();
+    let dest = s.upload_dir.path().join("file");
+    std::fs::write(&dest, b"original").unwrap();
+    let id = c.send_file(source.path(), "file").unwrap();
+    assert!(c.run_transfer(id, Duration::from_secs(10)).is_err());
+    assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+    let id = c
+        .send_file_with_overwrite(source.path(), "file", true)
+        .unwrap();
+    c.run_transfer(id, Duration::from_secs(10)).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    // A partial replacement must not publish when the connection disappears.
+    let id = 9_999;
+    c.send(&lynxrdp_proto::Message::TransferOptions { id, replace: true })
+        .unwrap();
+    c.send(&lynxrdp_proto::Message::TransferOffer {
+        id,
+        purpose: lynxrdp_proto::TransferPurpose::FileUpload,
+        name: "file".into(),
+        size: 100_000,
+    })
+    .unwrap();
+    c.send(&lynxrdp_proto::Message::TransferData {
+        id,
+        seq: 0,
+        data: vec![8; 100],
+    })
+    .unwrap();
+    drop(c);
+    let _replacement = s.connect(None);
+    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+}
+
+#[test]
+fn reconnect_clears_abandoned_transfers_and_a_stalled_worker_does_not_block_input() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("large");
+    std::fs::write(&path, vec![4; 4 * 1024 * 1024]).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let a = c
+        .request_file(path.to_str().unwrap(), out.path().join("abandoned-a"))
+        .unwrap();
+    let b = c
+        .request_file(path.to_str().unwrap(), out.path().join("abandoned-b"))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    for id in [a, b] {
+        c.send(&lynxrdp_proto::Message::TransferAccept {
+            id,
+            accepted: true,
+            reason: String::new(),
+        })
+        .unwrap();
+    }
+    // Neither offer nor queued chunks are consumed by the client event loop.
+    std::thread::sleep(Duration::from_millis(150));
+    drop(c);
+    let mut c = s.connect(None);
+    let id = c
+        .request_file(path.to_str().unwrap(), out.path().join("complete"))
+        .unwrap();
+    c.run_transfer(id, Duration::from_secs(15)).unwrap();
+    assert_eq!(
+        std::fs::metadata(out.path().join("complete"))
+            .unwrap()
+            .len(),
+        4 * 1024 * 1024
+    );
+    // A FIFO open with no writer parks the file worker but must never park the core.
+    let fifo = source.path().join("fifo");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    c.request_file(fifo.to_str().unwrap(), out.path().join("fifo-copy"))
+        .unwrap();
+    for n in 0..140 {
+        let _ = c.request_file(
+            path.to_str().unwrap(),
+            out.path().join(format!("queued-{n}")),
+        );
+    }
+    c.send(&lynxrdp_proto::Message::Ping { nonce: 932 })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // A new handshake also requires the core to drain and cancel the old adapters.
+    let replacement = s.connect(None);
+    assert!(Instant::now() < deadline);
+    drop(replacement);
+}
+
+#[test]
+fn session_management_lists_without_takeover_and_checks_the_start_token() {
+    require_xvfb!();
+    let mut s = Session::start(320, 240, "none", &[]);
+    let c = s.connect(None);
+    let rows = lynxrdp_server::session::admin::list().unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r.pid == s.child.id())
+        .expect("desktop listed");
+    assert!(lynxrdp_server::session::admin::terminate(row.pid, row.started + 1).is_err());
+    c.send(&lynxrdp_proto::Message::Ping { nonce: 55 }).unwrap();
+    lynxrdp_server::session::admin::terminate(row.pid, row.started).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while s.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

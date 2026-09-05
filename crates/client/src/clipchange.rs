@@ -335,13 +335,13 @@ mod tests {
         // A counter that changed every time it was read would make the watcher
         // useless in exactly the way that is hardest to notice: everything
         // would still work, and every tick would pay the full read.
-        assert!(HAS_COUNTER);
-        match change_counter() {
-            Some(first) => assert_eq!(change_counter(), Some(first)),
-            // A Windows station without clipboard access is the documented
-            // degradation, not a failure -- the watcher falls back to the
-            // backoff. macOS has no such case and must answer.
-            None => assert!(cfg!(windows), "the pasteboard did not answer"),
+        const { assert!(HAS_COUNTER) };
+        let first = change_counter();
+        // Windows may lack clipboard access; macOS must answer.
+        #[cfg(target_os = "macos")]
+        assert!(first.is_some(), "the pasteboard did not answer");
+        if let Some(first) = first {
+            assert_eq!(change_counter(), Some(first));
         }
     }
 

@@ -242,6 +242,58 @@ Closing the window disconnects but leaves the session running. Reconnect
 later to pick up where you left off. Connecting again from another device
 takes the session over.
 
+## Managing running desktops
+
+Select a saved connection and choose **Connection > Running Desktops**.
+The list shows the SSH user's existing sessions without creating a desktop or
+taking over an active connection. **Reconnect** opens that desktop;
+**Terminate** asks before closing its applications. Unsaved work may be lost.
+Refresh the list after a termination request.
+
+```sh
+lynxrdp sessions user@host
+# Use the PID and start token printed by the list:
+lynxrdp terminate user@host 1234 --started 987654 --yes
+```
+
+These commands run `lynxrdp-session` over SSH and need the updated server
+installed on the remote host's PATH. They only manage processes owned by the
+SSH user. The start token prevents a stale list from terminating a reused PID.
+For a directly served session, Reconnect uses its reported listening port.
+
+## Transfer controls
+
+Choose **Transfers** on the connection bar, or press **Ctrl+Alt+T**.
+Drop files or folders onto the window to queue uploads, review the
+existing-file choice, then choose **Start queued uploads**. To download, enter
+the remote file's full path and its local destination, then choose **Download
+file**. Fields support typing, Backspace, and pasting with Ctrl+V (Command+V on
+macOS). Tab switches fields.
+
+The panel shows bytes transferred in both directions. Click a transfer's
+**Cancel** row to cancel it, or choose **Cancel all transfers**. Scroll to see
+additional transfers. F2/F3 select the path fields, F4 changes the overwrite
+choice, F5 starts queued uploads, F6 cancels all, and Escape closes the panel.
+Closing the panel lets transfers continue.
+
+Files are received into temporary files beside their destinations and published
+only after complete receipt. Existing files are **kept by default**: a conflicting
+transfer fails. Select **Replace after receipt** to replace them explicitly.
+Cancellation or a failed transfer preserves an existing destination; a transfer
+already published before cancellation cannot be rolled back.
+
+```sh
+lynxrdp send user@host report.pdf
+lynxrdp send user@host report.pdf --overwrite
+lynxrdp get user@host /home/user/report.pdf ./report.pdf --overwrite
+```
+
+Command-line transfers print progress and support Ctrl+C to cancel. Updated
+clients refuse uploads without overwrite consent to older servers that cannot
+guarantee safe file delivery; update the server to enable atomic uploads.
+Explicit `--overwrite` permits the older server's existing upload behavior.
+Downloads are staged atomically by the updated client regardless of server version.
+
 ## Running without the daemon ("user mode")
 
 If you cannot or do not want to install a system service, run your own

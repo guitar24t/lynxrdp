@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+tempfile = "3"
 lz4_flex = { workspace = true }
 zstd = { workspace = true }
 log = { workspace = true }

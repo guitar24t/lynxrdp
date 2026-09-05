@@ -84,7 +84,11 @@ impl Sshd {
             "Port {port}\nListenAddress 127.0.0.1\nHostKey {hk}\nPidFile {pid}\n\
              AuthorizedKeysFile {ak}\nPasswordAuthentication no\nPubkeyAuthentication yes\n\
              UsePAM no\nAllowUsers {user}\nStrictModes no\nAllowTcpForwarding yes\n\
-             PermitOpen any\nLogLevel ERROR",
+             PermitOpen any\nLogLevel ERROR\nSetEnv PATH={bin}:/usr/bin:/bin",
+            bin = std::path::Path::new(env!("CARGO_BIN_EXE_lynxrdp-session"))
+                .parent()
+                .unwrap()
+                .display(),
             hk = hostkey.display(),
             pid = d.join("sshd.pid").display(),
             ak = authorized.display(),
@@ -197,6 +201,16 @@ fn connects_through_a_real_ssh_tunnel() {
         .expect("connect through tunnel");
     assert_eq!(client.size(), (400, 300));
 
+    // Management uses another SSH channel and must not take over this desktop.
+    let records = lynxrdp_client::remote_sessions::run(&cfg, None).expect("list sessions over SSH");
+    let record = records
+        .iter()
+        .find(|r| r.pid == session.id())
+        .expect("running desktop listed");
+    assert!(
+        lynxrdp_client::remote_sessions::run(&cfg, Some((record.pid, record.started + 1))).is_err()
+    );
+
     // A heartbeat proves the full path (client -> ssh -> sshd -> session and
     // back) carries protocol traffic in both directions.
     client.ping().unwrap();
@@ -210,6 +224,13 @@ fn connects_through_a_real_ssh_tunnel() {
     }
     assert!(rtt, "no round-trip through the tunnel");
 
+    lynxrdp_client::remote_sessions::run(&cfg, Some((record.pid, record.started)))
+        .expect("terminate desktop over SSH");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
     client.disconnect("done");
     drop(tunnel);
     let _ = session.kill();

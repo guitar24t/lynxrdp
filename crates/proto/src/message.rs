@@ -99,6 +99,8 @@ pub mod features {
     pub const FILE_TRANSFER: u32 = 1 << 4;
     /// Files on the clipboard (copy in one place, paste in the other).
     pub const CLIPBOARD_FILES: u32 = 1 << 5;
+    /// Atomic uploads with an explicit per-transfer replacement choice.
+    pub const ATOMIC_FILES: u32 = 1 << 6;
 }
 
 /// Clipboard content types, as a bitmask in [`super::Message::ClipboardOffer`].
@@ -200,6 +202,8 @@ pub enum Kind {
     ClipboardOffer = 71,
     /// [`Message::ClipboardRequest`]
     ClipboardRequest = 72,
+    /// [`Message::TransferOptions`] (negotiated extension).
+    TransferOptions = 129,
 }
 
 impl Kind {
@@ -234,13 +238,9 @@ impl Kind {
             70 => Kind::FileList,
             71 => Kind::ClipboardOffer,
             72 => Kind::ClipboardRequest,
-            // Tags at or above `frame::EXTENSION_TAG_MIN` (128) never reach
-            // here: the framing layer discards those frames whole, so an
-            // optional message a newer peer invents does not drop the
-            // connection. Anything unknown *below* that is structural, and a
-            // peer that cannot decode it cannot stay in sync, so it stays
-            // fatal. New message types that both ends must understand belong
-            // below 128; new optional ones belong at or above it.
+            129 => Kind::TransferOptions,
+            // Unknown extensions are skipped by framing; known ones reach
+            // this decoder so malformed payloads are still rejected.
             other => return Err(DecodeError::InvalidTag(u32::from(other))),
         })
     }
@@ -459,9 +459,14 @@ pub enum Message {
         /// Explanation when it did not.
         message: String,
     },
-    /// Ask the peer to send a file. It replies with a
-    /// [`Message::TransferOffer`] carrying the same `id`, or a
-    /// [`Message::TransferEnd`] explaining why not.
+    /// Options for the immediately following upload offer. Requires ATOMIC_FILES.
+    TransferOptions {
+        /// Upload identifier.
+        id: u64,
+        /// Replace an existing destination only after successful receipt.
+        replace: bool,
+    },
+    /// Request a file from the peer, answered by a TransferOffer or a failed TransferEnd.
     FileRequest {
         /// Identifier the peer should use for the resulting transfer.
         id: u64,
@@ -537,6 +542,7 @@ impl Message {
             Message::TransferAck { .. } => Kind::TransferAck,
             Message::TransferEnd { .. } => Kind::TransferEnd,
             Message::FileRequest { .. } => Kind::FileRequest,
+            Message::TransferOptions { .. } => Kind::TransferOptions,
             Message::FileList { .. } => Kind::FileList,
             Message::ClipboardOffer { .. } => Kind::ClipboardOffer,
             Message::ClipboardRequest { .. } => Kind::ClipboardRequest,
@@ -703,6 +709,10 @@ impl Message {
                 w.u64(*id);
                 w.bool(*ok);
                 w.string(message);
+            }
+            Message::TransferOptions { id, replace } => {
+                w.u64(*id);
+                w.bool(*replace);
             }
             Message::FileRequest { id, path } => {
                 w.u64(*id);
@@ -930,6 +940,10 @@ impl Message {
                 id: r.u64()?,
                 ok: r.bool()?,
                 message: r.string()?,
+            },
+            Kind::TransferOptions => Message::TransferOptions {
+                id: r.u64()?,
+                replace: r.bool()?,
             },
             Kind::FileRequest => Message::FileRequest {
                 id: r.u64()?,

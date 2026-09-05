@@ -1,5 +1,6 @@
 //! The per-user session process.
 
+pub mod admin;
 pub mod desktop;
 pub mod engine;
 pub mod fileio;
@@ -121,4 +122,6 @@ pub enum CoreEvent {
     /// Boxed because every other variant is small and this one need not make
     /// the channel's element wider than the X events that dominate it.
     FileOpened(Box<fileio::FileOpened>),
+    /// The file worker can make more transfer progress.
+    FileReady,
 }

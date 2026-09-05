@@ -39,7 +39,9 @@ pub const EXTENSION_TAG_MIN: u8 = 128;
 /// Whether a frame payload carries a skippable extension message.
 fn is_skippable_extension(payload: &[u8]) -> bool {
     // An empty payload has no tag at all; let the decoder report it.
-    payload.first().is_some_and(|&tag| tag >= EXTENSION_TAG_MIN)
+    payload
+        .first()
+        .is_some_and(|&tag| tag >= EXTENSION_TAG_MIN && crate::message::Kind::from_u8(tag).is_err())
 }
 
 /// Errors from framing.

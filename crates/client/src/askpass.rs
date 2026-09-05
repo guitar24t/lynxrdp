@@ -35,7 +35,7 @@ use std::path::Path;
 
 use eframe::egui;
 
-use lynxrdp_client::theme;
+use crate::theme;
 
 /// Set on the connection manager's own process, and inherited by the sessions
 /// it starts. Its presence is the whole of "this session came from the GUI".
@@ -234,7 +234,7 @@ fn ask(prompt: &str) -> Option<String> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("LynxRDP")
-        .with_app_id(lynxrdp_client::APP_ID)
+        .with_app_id(crate::APP_ID)
         .with_inner_size([WIDTH, height_for(prompt, kind)])
         .with_resizable(true)
         // A credential prompt that opens behind the window that caused it is
@@ -243,7 +243,7 @@ fn ask(prompt: &str) -> Option<String> {
         // launcher, so nothing else will raise it.
         .with_always_on_top()
         .with_active(true);
-    if let Some(icon) = lynxrdp_client::icon::load() {
+    if let Some(icon) = crate::icon::load() {
         viewport = viewport.with_icon(egui::IconData {
             rgba: icon.rgba,
             width: icon.width,

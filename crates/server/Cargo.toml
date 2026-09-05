@@ -17,6 +17,8 @@ name = "lynxrdp-session"
 path = "src/bin/lynxrdp-session.rs"
 
 [dependencies]
+tempfile = "3"
+serde_json = "1"
 lynxrdp-proto = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
@@ -32,5 +34,4 @@ libloading = "0.8"
 x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "xtest", "randr", "allow-unsafe-code"] }
 
 [dev-dependencies]
-tempfile = "3"
 lynxrdp-client = { path = "../client" }

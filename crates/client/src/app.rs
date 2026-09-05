@@ -22,7 +22,9 @@
 //! the blit, never into the decoded framebuffer, because the server sends
 //! incremental frames that diff against the pixels it believes we hold.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -356,6 +358,9 @@ pub struct App {
     /// `MAX_DROPPED_FILES` bounds one dropped *path*, not the drop: five
     /// folders arrive as five separate events. See [`MAX_CONCURRENT_UPLOADS`].
     upload_queue: VecDeque<(PathBuf, String)>,
+    transfer_panel: crate::transfer_panel::Panel,
+    uploads_confirmed: bool,
+    upload_replace: bool,
     /// Uploads finished (or given up on) since the queue was last empty, so
     /// progress can be reported across a whole drop rather than per file.
     upload_done: usize,
@@ -490,6 +495,9 @@ impl App {
             clipwatch: ClipboardWatcher::new(now),
             uploads: Vec::new(),
             upload_queue: VecDeque::new(),
+            transfer_panel: Default::default(),
+            uploads_confirmed: false,
+            upload_replace: false,
             upload_done: 0,
             clipboard_batch: None,
             clipboard_batches: 0,
@@ -751,7 +759,7 @@ impl App {
         // is blended too. Repainting everything is cheap here precisely
         // because nothing is arriving to repaint -- these frames happen once a
         // second, when the wording changes.
-        let asked_full = self.full_redraw || notice.is_some();
+        let asked_full = self.full_redraw || notice.is_some() || self.transfer_panel.open;
 
         let Some(gfx) = self.gfx.as_mut() else {
             return Ok(());
@@ -820,7 +828,34 @@ impl App {
              blit did not cover the pixels the scrim was blended onto"
         );
         debug_assert_eq!(bar_was, self.last_bar, "the bar's own history drifted");
-        if cursor_now.is_some() {
+        if self.transfer_panel.open {
+            let rows = self.client.transfer_rows();
+            let lines = self.transfer_panel.lines(self.upload_queue.len(), &rows);
+            blend_rect(
+                &mut buf,
+                size.width,
+                size.height,
+                Rect::new(0, 0, size.width, size.height),
+                0x101820,
+                245,
+            );
+            for (i, line) in lines.iter().enumerate() {
+                let y = 40 + i as u32 * 18;
+                if y + 16 > size.height {
+                    break;
+                }
+                draw_text_line(
+                    &mut buf,
+                    size.width,
+                    size.height,
+                    2,
+                    (8, y),
+                    &fit_text(line, size.width.saturating_sub(16), 2),
+                    overlay::colour::TEXT,
+                );
+            }
+        }
+        if cursor_now.is_some() && !self.transfer_panel.open {
             if let (Some(cur), Some((px, py))) = (&self.cursor, self.pointer) {
                 draw_cursor_scaled(
                     &mut buf,
@@ -1026,14 +1061,18 @@ impl App {
                     ClientEvent::ClipboardImage(png) => self.on_remote_image(png),
                     ClientEvent::ClipboardFiles(files) => self.on_remote_files(files),
                     ClientEvent::FileDownloaded { id, path, name } => {
+                        self.transfer_panel.message =
+                            format!("Downloaded {name} to {}", path.display());
                         log::info!("downloaded {name} to {}", path.display());
                         self.on_clipboard_file(id, Some(path));
                     }
                     ClientEvent::FileUploaded { id, name } => {
+                        self.transfer_panel.message = format!("Uploaded {name}");
                         log::info!("uploaded {name}");
                         self.finish_upload(id);
                     }
                     ClientEvent::TransferFailed { id, reason } => {
+                        self.transfer_panel.message = format!("Transfer failed: {reason}");
                         // Either direction, and the id says which: a failure
                         // has to reach the batch as well as the upload list,
                         // or a refused download leaves a paste waiting on a
@@ -1373,6 +1412,9 @@ impl App {
     }
 
     fn housekeeping(&mut self) {
+        if self.transfer_panel.open {
+            self.request_redraw();
+        }
         let now = Instant::now();
         self.poll_reconnect(now);
         if let (Some(t), Some((w, h))) = (self.last_resize_event, self.pending_size) {
@@ -1460,14 +1502,85 @@ impl App {
     /// Show or hide the OS pointer according to who is drawing it now.
     fn restore_cursor(&self) {
         if let Some(g) = &self.gfx {
-            g.window
-                .set_cursor_visible(!self.draws_own_cursor() || self.cursor.is_none());
+            g.window.set_cursor_visible(
+                self.transfer_panel.open || !self.draws_own_cursor() || self.cursor.is_none(),
+            );
+        }
+    }
+
+    fn open_transfer_panel(&mut self) {
+        self.release_all_keys();
+        for (code, bit) in [
+            (button::LEFT, 1),
+            (button::MIDDLE, 2),
+            (button::RIGHT, 4),
+            (button::BACK, 8),
+            (button::FORWARD, 16),
+        ] {
+            if self.remote_buttons & bit != 0 {
+                self.send(&Message::PointerButton {
+                    button: code,
+                    down: false,
+                });
+            }
+        }
+        self.remote_buttons = 0;
+        self.transfer_panel.open = true;
+        self.full_redraw = true;
+        if let Some(g) = &self.gfx {
+            g.window.set_cursor_visible(true);
+        }
+        self.request_redraw();
+    }
+
+    fn transfer_action(&mut self, action: crate::transfer_panel::Action) {
+        use crate::transfer_panel::Action;
+        match action {
+            Action::None => {}
+            Action::Download => {
+                let result = self
+                    .transfer_panel
+                    .destination()
+                    .map_err(anyhow::Error::msg)
+                    .and_then(|dest| {
+                        self.client.request_file_with_overwrite(
+                            &self.transfer_panel.remote,
+                            dest,
+                            self.transfer_panel.replace,
+                        )
+                    });
+                self.transfer_panel.message = match result {
+                    Ok(_) => "Download requested".into(),
+                    Err(e) => format!("{e:#}"),
+                };
+            }
+            Action::Upload => {
+                self.upload_replace = self.transfer_panel.replace;
+                self.uploads_confirmed = true;
+                self.pump_uploads();
+            }
+            Action::Cancel(id) => {
+                self.client.cancel_transfer(id);
+                self.on_clipboard_file(id, None);
+                self.finish_upload(id);
+                self.transfer_panel.message = "Cancellation requested".into();
+            }
+            Action::CancelAll => {
+                self.upload_queue.clear();
+                self.uploads.clear();
+                self.clipboard_batch = None;
+                for (id, _) in self.client.transfer_rows() {
+                    self.client.cancel_transfer(id);
+                }
+                self.transfer_panel.message = "Transfers cancelled".into();
+            }
         }
     }
 
     /// Do what a bar button or its accelerator asks.
     fn run_overlay_action(&mut self, action: overlay::Action, event_loop: &ActiveEventLoop) {
         match action {
+            overlay::Action::Transfers => self.open_transfer_panel(),
             overlay::Action::Fullscreen => self.toggle_fullscreen(),
             overlay::Action::SecureAttention => self.send_secure_attention(),
             overlay::Action::Disconnect => self.close(event_loop, "disconnected by the user"),
@@ -1569,16 +1682,23 @@ impl App {
         }
         log::info!("queued {} file(s) from {}", files.len(), path.display());
         self.upload_queue.extend(files);
-        self.pump_uploads();
+        self.uploads_confirmed = false;
+        self.open_transfer_panel();
     }
 
     /// Start as many queued uploads as the concurrency limit allows.
     fn pump_uploads(&mut self) {
-        while self.link_up() && self.uploads.len() < MAX_CONCURRENT_UPLOADS {
+        while self.link_up()
+            && self.uploads_confirmed
+            && self.uploads.len() < MAX_CONCURRENT_UPLOADS
+        {
             let Some((local, dest)) = self.upload_queue.pop_front() else {
                 break;
             };
-            match self.client.send_file(&local, &dest) {
+            match self
+                .client
+                .send_file_with_overwrite(&local, &dest, self.upload_replace)
+            {
                 Ok(id) => {
                     log::debug!("uploading {} as {dest}", local.display());
                     self.uploads.push((id, dest));
@@ -1876,6 +1996,24 @@ impl App {
     }
 
     fn on_key(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
+        if self.transfer_panel.open {
+            if event.state == ElementState::Pressed {
+                if (self.modifiers.control_key() || self.modifiers.super_key())
+                    && matches!(&event.logical_key,Key::Character(c) if c.eq_ignore_ascii_case("v"))
+                {
+                    if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
+                        self.transfer_panel.paste(&text);
+                    }
+                } else {
+                    let action = self.transfer_panel.key(&event.logical_key);
+                    self.transfer_action(action);
+                }
+                self.restore_cursor();
+                self.full_redraw = true;
+                self.request_redraw();
+            }
+            return;
+        }
         let Some(ks) = keymap::keysym_for(&event.logical_key, event.location) else {
             return;
         };
@@ -1883,6 +2021,7 @@ impl App {
             if let Some(acc) = self.accelerator(&event.logical_key, event.physical_key) {
                 self.swallowed.push(ks);
                 match acc {
+                    Accelerator::Transfers => self.open_transfer_panel(),
                     Accelerator::Fullscreen => self.toggle_fullscreen(),
                     Accelerator::SecureAttention => self.send_secure_attention(),
                     Accelerator::Pin => {
@@ -1953,6 +2092,10 @@ impl App {
     }
 
     fn on_pointer_moved(&mut self, pos: PhysicalPosition<f64>) {
+        if self.transfer_panel.open {
+            self.transfer_panel.pointer_y = pos.y;
+            return;
+        }
         // A drag that started on the remote screen keeps the pointer even when
         // it crosses the top edge, and the bar does not come up under it --
         // not by claiming the pointer, and not by completing a dwell either.
@@ -2047,6 +2190,7 @@ fn accelerator_for(
     }
     match logical {
         Key::Named(NamedKey::Enter) => return Some(Accelerator::Fullscreen),
+        Key::Character(c) if c.eq_ignore_ascii_case("t") => return Some(Accelerator::Transfers),
         Key::Named(NamedKey::End) => return Some(Accelerator::SecureAttention),
         Key::Character(c) if c.eq_ignore_ascii_case("b") => return Some(Accelerator::Pin),
         Key::Character(c) if c.eq_ignore_ascii_case("r") => return Some(Accelerator::Reconnect),
@@ -2057,6 +2201,7 @@ fn accelerator_for(
         _ => {}
     }
     match physical {
+        PhysicalKey::Code(KeyCode::KeyT) => Some(Accelerator::Transfers),
         PhysicalKey::Code(KeyCode::KeyB) => Some(Accelerator::Pin),
         PhysicalKey::Code(KeyCode::KeyR) => Some(Accelerator::Reconnect),
         PhysicalKey::Code(KeyCode::KeyQ) => Some(Accelerator::Disconnect),
@@ -2067,6 +2212,8 @@ fn accelerator_for(
 /// An accelerator this window keeps rather than forwarding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Accelerator {
+    /// Ctrl+Alt+T.
+    Transfers,
     /// Ctrl+Alt+Enter.
     Fullscreen,
     /// Ctrl+Alt+End.
@@ -2588,6 +2735,16 @@ impl ApplicationHandler<Wake> for App {
                 state, button: b, ..
             } => {
                 let down = state == ElementState::Pressed;
+                if self.transfer_panel.open {
+                    if down && b == MouseButton::Left && self.transfer_panel.pointer_y >= 40.0 {
+                        let row = ((self.transfer_panel.pointer_y - 40.0) / 18.0) as usize;
+                        let action = self.transfer_panel.click(row);
+                        self.transfer_action(action);
+                        self.full_redraw = true;
+                        self.request_redraw();
+                    }
+                    return;
+                }
                 // A press that started on the bar owns its release wherever
                 // that lands, or the session would see a release it never saw
                 // a press for.
@@ -2630,7 +2787,14 @@ impl ApplicationHandler<Wake> for App {
                 self.send(&Message::PointerButton { button: btn, down });
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.pointer_on_bar || !self.link_up() {
+                if self.transfer_panel.open {
+                    let (_, dy) = scroll_units(delta);
+                    self.transfer_panel
+                        .scroll(dy, self.client.transfer_rows().len());
+                    self.request_redraw();
+                    return;
+                }
+                if self.transfer_panel.open || self.pointer_on_bar || !self.link_up() {
                     return;
                 }
                 let (dx, dy) = scroll_units(delta);
@@ -2738,14 +2902,17 @@ pub const MAX_PENDING_UPLOADS: usize = 4 * MAX_DROPPED_FILES;
 /// the receiving side creates a file per accepted offer and holds it open
 /// until the transfer ends, and a session may copy up to `MAX_FILE_LIST`
 /// (4096) files in one go.
-pub const MAX_CONCURRENT_CLIPBOARD_FILES: usize = 8;
+pub use lynxrdp_proto::clipboard_batch::{
+    safe_file_name, unique_name, ClipBatch, MAX_CONCURRENT_CLIPBOARD_FILES,
+};
 
 /// Longest staged file name, in bytes.
 ///
 /// Comfortably inside the 255-byte component limit that ext4, APFS and NTFS
 /// all share, with room for the disambiguating suffix and the extension that
 /// are appended after the truncation.
-const MAX_STAGED_NAME: usize = 200;
+#[cfg(test)]
+use lynxrdp_proto::clipboard_batch::MAX_STAGED_NAME;
 
 /// Create a fresh directory for one clipboard copy.
 ///
@@ -2799,202 +2966,6 @@ pub fn prune_batches(root: &Path, keep: usize) {
         if let Err(e) = std::fs::remove_dir_all(&path) {
             log::debug!("could not remove {}: {e}", path.display());
         }
-    }
-}
-
-/// Reduce a name from the session to one every platform can create.
-///
-/// Sanitising happens on all three platforms, not under `cfg(windows)`, for
-/// two reasons. The obvious one is that the staged file has to be creatable
-/// here; the less obvious one is that the *result* has to be predictable,
-/// because the caller deduplicates names and a rule that differs per platform
-/// gives a different set of collisions per platform -- so the case that
-/// silently overwrites a file would only ever appear on the platform nobody
-/// tested on.
-///
-/// What is removed: the path separators and the characters Windows rejects
-/// outright, control characters (a newline in a file name is legal on Linux
-/// and a menace everywhere else), trailing dots and spaces, which Windows
-/// strips when it resolves a name so that `report.` and `report` are the same
-/// file, and the device names that are reserved whatever the extension.
-pub fn safe_file_name(raw: &str) -> String {
-    const FORBIDDEN: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-    // `CON.txt` opens the console on Windows, not a file. The check is on the
-    // part before the first dot, which is how Windows resolves them.
-    const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-
-    let mut name: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_control() || FORBIDDEN.contains(&c) {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-
-    if name.len() > MAX_STAGED_NAME {
-        // Keep the extension: it is what a file manager uses to decide what
-        // the pasted file is, and losing it turns a spreadsheet into a blob.
-        let ext = Path::new(&name)
-            .extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .filter(|e| e.len() <= 16)
-            .map(|e| format!(".{e}"))
-            .unwrap_or_default();
-        let mut cut = MAX_STAGED_NAME - ext.len();
-        while cut > 0 && !name.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        name.truncate(cut);
-        name.push_str(&ext);
-    }
-
-    // After the truncation, not before: cutting a name can expose a dot that
-    // was in the middle of it.
-    let trimmed = name.trim_end_matches([' ', '.']);
-    // This is also what rules out "." and "..", which trim to nothing.
-    let mut name = if trimmed.is_empty() {
-        "file".to_string()
-    } else {
-        trimmed.to_string()
-    };
-    let stem = name.split('.').next().unwrap_or_default();
-    if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
-        name.insert(0, '_');
-    }
-    name
-}
-
-/// Make `name` unique among the names already `taken`, recording it.
-///
-/// Two files called `notes.txt` from different directories in the session used
-/// to be staged over each other -- the second `File::create` truncated the
-/// first and the paste delivered one file where the user copied two, with no
-/// error anywhere. Comparison is case-insensitive because NTFS and a default
-/// APFS volume both resolve `Notes.txt` and `notes.txt` to the same file, so
-/// on those platforms the collision is real even when the names differ.
-pub fn unique_name(taken: &mut HashSet<String>, name: &str) -> String {
-    if taken.insert(name.to_lowercase()) {
-        return name.to_string();
-    }
-    let path = Path::new(name);
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| name.to_string());
-    let ext = path
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    // Terminates because `taken` is finite and every candidate is distinct.
-    let mut n = 2u32;
-    loop {
-        let candidate = format!("{stem} ({n}){ext}");
-        if taken.insert(candidate.to_lowercase()) {
-            return candidate;
-        }
-        n += 1;
-    }
-}
-
-/// One clipboard file copy, from the session's list to the local clipboard.
-///
-/// A batch cannot be tracked by a count, which is what it was: the counter
-/// only came down when a file arrived, so a single file that could not be
-/// created locally left it stuck above zero and the copy was never published
-/// at all. That is disproportionately a Windows failure -- `a:b.txt`,
-/// `what?.png`, `CON` and a trailing dot are all ordinary names in an X11
-/// session and none of them can be created on NTFS -- and the user's only
-/// symptom was Ctrl+V returning their old clipboard.
-///
-/// Here every file has a slot and every transfer has an id, each id is
-/// resolved exactly once whether it arrived or failed, and the batch finishes
-/// when there is nothing left outstanding. What did not arrive is simply
-/// missing from the published list.
-pub struct ClipBatch {
-    dir: PathBuf,
-    /// Not yet requested: (remote path, local destination, slot).
-    queued: VecDeque<(String, PathBuf, usize)>,
-    /// Requested and unresolved: transfer id to slot.
-    live: HashMap<u64, usize>,
-    /// Where each file landed, in the order the session listed them. Order is
-    /// kept because it is the order the user selected, and a file manager
-    /// shows a paste in the order it is given.
-    slots: Vec<Option<PathBuf>>,
-}
-
-impl ClipBatch {
-    /// Plan a copy: one slot per file, with a staged name that is safe on this
-    /// platform and unique within the batch.
-    pub fn new(dir: PathBuf, files: &[lynxrdp_proto::FileEntry]) -> Self {
-        let mut taken = HashSet::new();
-        let mut queued = VecDeque::with_capacity(files.len());
-        for (slot, f) in files.iter().enumerate() {
-            let base = f.path.rsplit(['/', '\\']).next().unwrap_or_default();
-            let name = unique_name(&mut taken, &safe_file_name(base));
-            queued.push_back((f.path.clone(), dir.join(name), slot));
-        }
-        Self {
-            dir,
-            queued,
-            live: HashMap::new(),
-            slots: vec![None; files.len()],
-        }
-    }
-
-    /// Where this batch is staged.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// How many files the session offered.
-    pub fn total(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// The next file to request, if the concurrency limit leaves room.
-    pub fn next_request(&mut self) -> Option<(String, PathBuf, usize)> {
-        if self.live.len() >= MAX_CONCURRENT_CLIPBOARD_FILES {
-            return None;
-        }
-        self.queued.pop_front()
-    }
-
-    /// Record the transfer id a request was given.
-    pub fn requested(&mut self, slot: usize, id: u64) {
-        self.live.insert(id, slot);
-    }
-
-    /// Resolve a transfer: `Some(path)` if it arrived, `None` if it failed.
-    /// Returns whether the id belonged to this batch.
-    pub fn resolve(&mut self, id: u64, path: Option<PathBuf>) -> bool {
-        let Some(slot) = self.live.remove(&id) else {
-            return false;
-        };
-        if let Some(p) = path {
-            self.slots[slot] = Some(p);
-        }
-        true
-    }
-
-    /// Transfers still in flight, for cancelling a superseded copy.
-    pub fn live_ids(&self) -> Vec<u64> {
-        self.live.keys().copied().collect()
-    }
-
-    /// Whether every file has arrived, failed or been given up on.
-    pub fn done(&self) -> bool {
-        self.queued.is_empty() && self.live.is_empty()
-    }
-
-    /// The files that actually landed, in the order they were copied.
-    pub fn into_files(self) -> Vec<PathBuf> {
-        self.slots.into_iter().flatten().collect()
     }
 }
 

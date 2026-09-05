@@ -61,7 +61,9 @@ offer from the other:
   `safe_relative_path` rejects any `..` component, rejects embedded NULs,
   and treats `\` as a separator as well as `/` so a Windows client cannot
   smuggle a path through as one odd filename. The result is always joined
-  onto the session's upload directory.
+  onto the session's upload directory. Parent components are opened relative
+  to directory handles with `O_NOFOLLOW`, and the parent handle is retained
+  through atomic publication, so a symlink cannot redirect the write.
 * **Neither side accepts a download it did not ask for.** A transfer is
   only written to disk if its id is already registered as one this side
   requested; anything else is refused as an "unsolicited download". This
@@ -91,6 +93,22 @@ None of this replaces trusting the server: a session you log in to runs
 your own code as you. The boundary these rules defend is the *client's*
 filesystem against a server that turns out to be hostile, and the server's
 upload directory against a malformed name.
+
+## File publication and session administration
+
+Transfers preserve existing destination files unless replacement is explicitly
+chosen. Files are staged beside the destination and only renamed after all
+promised bytes have arrived. Failure and cancellation remove the staged file
+when the file worker can run; killing the entire process may leave a temporary
+file. A successful rename is atomic visibility, not a power-loss durability
+guarantee. The server refuses symlink parent components; replacing a final
+symlink replaces the link itself rather than writing its target.
+
+The session list and termination helpers run through SSH as the authenticated
+user and inspect only that user's processes. Termination requires both PID and
+process start token, rechecks ownership and executable identity, and signals a
+pidfd. It provides no cross-user administration privilege and opens no network
+listener. Reconnect retains the existing loopback-only SSH transport.
 
 ## Monitoring reports
 

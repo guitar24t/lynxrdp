@@ -12,6 +12,8 @@
 pub const APP_ID: &str = "lynxrdp";
 
 pub mod app;
+/// SSH authentication prompts, shared by desktop and management connections.
+pub mod askpass;
 pub mod clipchange;
 pub mod connection;
 pub mod console;
@@ -30,3 +32,9 @@ pub mod update;
 
 /// Name reported to the server.
 pub const CLIENT_NAME: &str = concat!("LynxRDP client/", env!("CARGO_PKG_VERSION"));
+
+/// Inspect and manage desktops over SSH.
+pub mod remote_sessions;
+
+/// In-session file transfer controls.
+pub mod transfer_panel;

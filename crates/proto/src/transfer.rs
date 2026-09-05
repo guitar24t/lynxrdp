@@ -173,6 +173,7 @@ pub struct TransferSender<R> {
     next_seq: u32,
     acked: u32,
     eof: bool,
+    partial: Vec<u8>,
 }
 
 impl<R: Read> TransferSender<R> {
@@ -186,6 +187,7 @@ impl<R: Read> TransferSender<R> {
             next_seq: 0,
             acked: 0,
             eof: false,
+            partial: Vec::new(),
         }
     }
 
@@ -213,14 +215,21 @@ impl<R: Read> TransferSender<R> {
             return Ok(None);
         }
         let want = CHUNK_SIZE.min(remaining as usize);
-        let mut buf = vec![0u8; want];
-        let mut filled = 0usize;
+        let mut buf = std::mem::take(&mut self.partial);
+        let mut filled = buf.len();
+        buf.resize(want, 0);
         // read() may return short reads; fill the chunk so the stream is not
         // fragmented into tiny messages by an awkward source.
         while filled < want {
-            match self.source.read(&mut buf[filled..])? {
-                0 => break,
-                n => filled += n,
+            match self.source.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    buf.truncate(filled);
+                    self.partial = buf;
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
             }
         }
         if filled == 0 {
@@ -801,6 +810,30 @@ impl TransferManager {
         }
     }
 
+    /// Cancel connection-owned state while keeping the identifier sequence unique.
+    pub fn clear(&mut self) {
+        self.outgoing.clear();
+        self.incoming.clear();
+        self.pending.clear();
+        self.pump_cursor = 0;
+    }
+
+    /// Retry nonblocking sources and sinks when their worker has made progress.
+    pub fn poll(&mut self) -> Outcome {
+        let mut out = Outcome::default();
+        let ready: Vec<_> = self
+            .incoming
+            .iter()
+            .filter(|(_, i)| i.receiver.is_complete())
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ready {
+            self.complete_incoming(id, &mut out);
+        }
+        self.pump(&mut out);
+        out
+    }
+
     /// Refuse offers larger than this.
     pub fn set_max_size(&mut self, max: u64) {
         self.max_size = max;
@@ -889,6 +922,17 @@ impl TransferManager {
                 name,
                 size,
             } => {
+                if self.incoming.contains_key(id)
+                    || self.outgoing.contains_key(id)
+                    || self.incoming.len() >= 64
+                {
+                    out.replies.push(Message::TransferAccept {
+                        id: *id,
+                        accepted: false,
+                        reason: "transfer ID already active or receiver busy".into(),
+                    });
+                    return Some(out);
+                }
                 if *size > self.max_size {
                     out.replies.push(Message::TransferAccept {
                         id: *id,
@@ -1001,6 +1045,15 @@ impl TransferManager {
                 self.pump(&mut out);
             }
             Message::TransferEnd { id, ok, message } => {
+                if *ok
+                    && self
+                        .incoming
+                        .get(id)
+                        .is_some_and(|i| i.receiver.is_complete())
+                {
+                    self.complete_incoming(*id, &mut out);
+                    return Some(out);
+                }
                 let incoming = self.incoming.remove(id);
                 let was_pending = self.pending.remove(id);
                 let outgoing = self.outgoing.remove(id);
@@ -1049,9 +1102,25 @@ impl TransferManager {
     }
 
     fn complete_incoming(&mut self, id: u64, out: &mut Outcome) {
-        let Some(i) = self.incoming.remove(&id) else {
+        let Some(i) = self.incoming.get_mut(&id) else {
             return;
         };
+        if i.receiver.is_complete() {
+            if let Err(e) = i.receiver.sink.flush() {
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    return;
+                }
+                self.incoming.remove(&id);
+                out.failed.push((id, e.to_string()));
+                out.replies.push(Message::TransferEnd {
+                    id,
+                    ok: false,
+                    message: e.to_string(),
+                });
+                return;
+            }
+        }
+        let i = self.incoming.remove(&id).unwrap();
         let (purpose, name) = (i.purpose, i.name);
         match i.receiver.finish() {
             Ok(sink) => {
@@ -1121,7 +1190,13 @@ impl TransferManager {
                         out.replies.push(Message::TransferData { id, seq, data });
                         budget -= 1;
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        let (sent, total) = o.sender.progress();
+                        if o.sender.is_drained() && sent != total {
+                            failed.push((id, format!("source truncated: {sent} of {total} bytes")));
+                        }
+                        break;
+                    }
                     Err(e) => {
                         failed.push((id, e.to_string()));
                         break;
@@ -1142,6 +1217,20 @@ impl TransferManager {
         // A successful record stays until the peer confirms with TransferEnd:
         // that is what tells us the bytes actually landed, and it lets a late
         // failure be reported against the right transfer.
+    }
+
+    /// Snapshot identifiers in both directions for progress and cancellation controls.
+    pub fn active_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<_> = self
+            .outgoing
+            .keys()
+            .chain(self.incoming.keys())
+            .chain(self.pending.iter())
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     /// Describe a transfer in flight: its purpose, name and progress.
@@ -1168,6 +1257,173 @@ impl TransferManager {
 #[cfg(test)]
 mod manager_tests {
     use super::*;
+
+    #[test]
+    fn a_source_that_temporarily_blocks_preserves_partial_chunks() {
+        struct Source {
+            step: usize,
+        }
+        impl Read for Source {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.step += 1;
+                match self.step {
+                    1 => {
+                        out[..2].copy_from_slice(b"ab");
+                        Ok(2)
+                    }
+                    2 => Err(io::ErrorKind::WouldBlock.into()),
+                    3 => {
+                        out[..2].copy_from_slice(b"cd");
+                        Ok(2)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+        let mut sender = TransferSender::new(1, 4, Source { step: 0 });
+        assert!(sender.next_chunk().unwrap().is_none());
+        assert_eq!(sender.progress(), (0, 4));
+        assert_eq!(sender.next_chunk().unwrap(), Some((0, b"abcd".to_vec())));
+    }
+
+    #[test]
+    fn a_truncated_source_resolves_the_receiver_instead_of_hanging() {
+        let mut manager = TransferManager::new(false);
+        manager.offer_stream_with_id(
+            1,
+            TransferPurpose::FileDownload,
+            "short".into(),
+            10,
+            Box::new(io::Cursor::new(b"short")),
+        );
+        let out = manager
+            .handle(
+                &Message::TransferAccept {
+                    id: 1,
+                    accepted: true,
+                    reason: String::new(),
+                },
+                &mut MemoryPolicy,
+            )
+            .unwrap();
+        assert_eq!(out.failed.len(), 1);
+        assert!(out
+            .replies
+            .iter()
+            .any(|m| matches!(m, Message::TransferEnd { ok: false, .. })));
+    }
+
+    #[test]
+    fn reset_releases_the_global_window_and_old_identifiers() {
+        let mut manager = TransferManager::new(false);
+        for id in [1, 2] {
+            manager.offer_stream_with_id(
+                id,
+                TransferPurpose::FileDownload,
+                "old".into(),
+                2_000_000,
+                Box::new(io::repeat(0)),
+            );
+            manager.handle(
+                &Message::TransferAccept {
+                    id,
+                    accepted: true,
+                    reason: String::new(),
+                },
+                &mut MemoryPolicy,
+            );
+        }
+        manager.clear();
+        assert_eq!(manager.in_flight(), (0, 0));
+        manager.offer_stream_with_id(
+            1,
+            TransferPurpose::FileDownload,
+            "new".into(),
+            3,
+            Box::new(io::Cursor::new(b"new")),
+        );
+        let out = manager
+            .handle(
+                &Message::TransferAccept {
+                    id: 1,
+                    accepted: true,
+                    reason: String::new(),
+                },
+                &mut MemoryPolicy,
+            )
+            .unwrap();
+        assert!(out
+            .replies
+            .iter()
+            .any(|m| matches!(m,Message::TransferData { data,.. } if data == b"new")));
+    }
+
+    #[test]
+    fn asynchronous_publication_is_acknowledged_only_after_completion() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        struct Writer(Arc<AtomicBool>);
+        impl Write for Writer {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.0.load(Ordering::Relaxed) {
+                    Ok(())
+                } else {
+                    Err(io::ErrorKind::WouldBlock.into())
+                }
+            }
+        }
+        struct Policy(Arc<AtomicBool>);
+        impl TransferPolicy for Policy {
+            fn accept(
+                &mut self,
+                _: u64,
+                _: TransferPurpose,
+                _: &str,
+                _: u64,
+            ) -> Result<Sink, String> {
+                Ok(Sink::Stream(Box::new(Writer(self.0.clone()))))
+            }
+        }
+        let ready = Arc::new(AtomicBool::new(false));
+        let mut manager = TransferManager::new(false);
+        manager.handle(
+            &Message::TransferOffer {
+                id: 1,
+                purpose: TransferPurpose::FileUpload,
+                name: "file".into(),
+                size: 3,
+            },
+            &mut Policy(ready.clone()),
+        );
+        let out = manager
+            .handle(
+                &Message::TransferData {
+                    id: 1,
+                    seq: 0,
+                    data: b"abc".to_vec(),
+                },
+                &mut Policy(ready.clone()),
+            )
+            .unwrap();
+        assert!(out.completed.is_empty());
+        assert!(!out
+            .replies
+            .iter()
+            .any(|m| matches!(m, Message::TransferEnd { .. })));
+        assert!(manager.poll().completed.is_empty());
+        ready.store(true, Ordering::Relaxed);
+        let out = manager.poll();
+        assert_eq!(out.completed.len(), 1);
+        assert!(matches!(
+            &out.replies[..],
+            [Message::TransferEnd { ok: true, .. }]
+        ));
+    }
 
     /// Accepts everything into memory.
     struct MemoryPolicy;

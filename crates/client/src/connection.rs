@@ -40,7 +40,8 @@ impl Default for ConnectOptions {
                 | features::RESIZE
                 | features::CLIPBOARD_IMAGE
                 | features::FILE_TRANSFER
-                | features::CLIPBOARD_FILES,
+                | features::CLIPBOARD_FILES
+                | features::ATOMIC_FILES,
             timeout: Duration::from_secs(15),
             client_name: crate::CLIENT_NAME.to_string(),
         }
@@ -176,6 +177,7 @@ pub fn mentions_rejection(text: &str) -> bool {
 /// offer whose id we did not request is refused, so the session cannot write
 /// files onto the client's disk of its own accord.
 struct ClientTransferPolicy {
+    replacements: std::collections::HashSet<u64>,
     downloads: HashMap<u64, PathBuf>,
 }
 
@@ -208,7 +210,7 @@ impl ClientTransferPolicy {
                     .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
             }
         }
-        let f = std::fs::File::create(dest)
+        let f = lynxrdp_proto::atomic_file::AtomicFile::new(dest, self.replacements.contains(&id))
             .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
         Ok(Sink::Stream(Box::new(f)))
     }
@@ -262,6 +264,7 @@ pub struct Client {
     transfers: TransferManager,
     /// Destinations for downloads this client asked for.
     downloads: HashMap<u64, PathBuf>,
+    replacements: std::collections::HashSet<u64>,
     /// An image copied locally, held until the session asks for it.
     pending_image: Option<Vec<u8>>,
     /// Files this client offered on the clipboard, by the path it advertised.
@@ -418,6 +421,7 @@ impl Client {
             queued: std::collections::VecDeque::new(),
             transfers: TransferManager::new(true),
             downloads: HashMap::new(),
+            replacements: Default::default(),
             pending_image: None,
             offered_files: HashMap::new(),
         })
@@ -586,6 +590,20 @@ impl Client {
     /// Upload a local file into the session. `dest` is a path relative to the
     /// session's upload directory. Returns the transfer id.
     pub fn send_file(&mut self, local: &Path, dest: &str) -> Result<u64> {
+        self.send_file_with_overwrite(local, dest, false)
+    }
+
+    /// Upload with an explicit replacement choice. Older servers require explicit overwrite consent.
+    pub fn send_file_with_overwrite(
+        &mut self,
+        local: &Path,
+        dest: &str,
+        replace: bool,
+    ) -> Result<u64> {
+        anyhow::ensure!(
+            replace || self.info.features & features::ATOMIC_FILES != 0,
+            "update the server for safe uploads, or explicitly allow overwriting"
+        );
         anyhow::ensure!(
             self.info.features & features::FILE_TRANSFER != 0,
             "the server did not enable file transfer"
@@ -594,6 +612,9 @@ impl Client {
             std::fs::File::open(local).with_context(|| format!("opening {}", local.display()))?;
         let size = file.metadata()?.len();
         let id = self.transfers.next_id();
+        if self.info.features & features::ATOMIC_FILES != 0 {
+            self.send(&Message::TransferOptions { id, replace })?;
+        }
         let offer = self.transfers.offer_stream_with_id(
             id,
             TransferPurpose::FileUpload,
@@ -607,6 +628,16 @@ impl Client {
 
     /// Download `remote` out of the session to `local`. Returns the transfer id.
     pub fn request_file(&mut self, remote: &str, local: PathBuf) -> Result<u64> {
+        self.request_file_with_overwrite(remote, local, false)
+    }
+
+    /// Download atomically; existing files are preserved unless replace is true.
+    pub fn request_file_with_overwrite(
+        &mut self,
+        remote: &str,
+        local: PathBuf,
+        replace: bool,
+    ) -> Result<u64> {
         anyhow::ensure!(
             self.info.features & features::FILE_TRANSFER != 0,
             "the server did not enable file transfer"
@@ -614,6 +645,9 @@ impl Client {
         let id = self.transfers.next_id();
         self.transfers.expect(id);
         self.downloads.insert(id, local);
+        if replace {
+            self.replacements.insert(id);
+        }
         self.send(&Message::FileRequest {
             id,
             path: remote.to_string(),
@@ -630,9 +664,27 @@ impl Client {
     /// for this and already knows.
     pub fn cancel_transfer(&mut self, id: u64) {
         self.downloads.remove(&id);
+        self.replacements.remove(&id);
         if let Some(end) = self.transfers.cancel(id, "no longer wanted") {
             let _ = self.send(&end);
         }
+    }
+
+    /// Active transfer descriptions for a local progress view.
+    pub fn transfer_rows(&self) -> Vec<(u64, String)> {
+        self.transfers
+            .active_ids()
+            .into_iter()
+            .map(|id| {
+                let text = match self.transfers.describe(id) {
+                    Some((purpose, name, done, total)) => {
+                        format!("{:?} {name}: {done}/{total} bytes", purpose)
+                    }
+                    None => "Waiting for file offer".into(),
+                };
+                (id, text)
+            })
+            .collect()
     }
 
     /// Drive the connection until transfer `id` finishes.
@@ -732,6 +784,7 @@ impl Client {
     /// event that never happened from one that was thrown away.
     fn handle_transfer(&mut self, msg: &Message) -> Option<Result<Option<ClientEvent>>> {
         let mut policy = ClientTransferPolicy {
+            replacements: self.replacements.clone(),
             // Moved out and back rather than cloned: this runs for every
             // message on the connection, screen updates included, and staging
             // a clipboard copy can leave hundreds of entries in the map.
@@ -790,11 +843,13 @@ impl Client {
     /// Record a transfer as failed and release whatever it was holding.
     fn fail_transfer(&mut self, id: u64, reason: String) {
         self.downloads.remove(&id);
+        self.replacements.remove(&id);
         self.queued
             .push_back(ClientEvent::TransferFailed { id, reason });
     }
 
     fn on_completed(&mut self, done: Completed) -> Result<Option<ClientEvent>> {
+        self.replacements.remove(&done.id);
         Ok(match done.purpose {
             TransferPurpose::ClipboardImage => done.data.map(ClientEvent::ClipboardImage),
             TransferPurpose::FileDownload => {

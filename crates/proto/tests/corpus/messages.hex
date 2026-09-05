@@ -15,6 +15,7 @@
 
 min-compatible-version = 3
 
+TransferOptions/replace          = 81170000000000000001
 ClientHello/all-features         = 010300150000006c796e787264702d636c69656e742f636f727075733f00000080073804
 KeyEvent/press                   = 020dff000001
 KeyEvent/release                 = 024100000000

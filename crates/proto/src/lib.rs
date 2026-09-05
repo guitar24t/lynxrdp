@@ -21,6 +21,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod atomic_file;
+pub mod clipboard_batch;
 pub mod codec;
 pub mod frame;
 pub mod image;

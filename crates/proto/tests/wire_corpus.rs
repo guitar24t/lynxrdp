@@ -66,6 +66,13 @@ const REGENERATE: &str = "cargo test -p lynxrdp-proto --test wire_corpus -- --ig
 /// literals in `wire_constants_have_not_been_renumbered` are what pin those.
 fn samples() -> Vec<(&'static str, Message)> {
     vec![
+        (
+            "TransferOptions/replace",
+            Message::TransferOptions {
+                id: 23,
+                replace: true,
+            },
+        ),
         // ---- client to server ----
         (
             "ClientHello/all-features",

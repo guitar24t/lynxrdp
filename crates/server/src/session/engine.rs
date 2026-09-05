@@ -53,6 +53,7 @@ use crate::x11::input::InputInjector;
 use crate::x11::resize::resize_screen;
 use crate::x11::XDisplay;
 use crate::SERVER_NAME;
+use lynxrdp_proto::clipboard_batch::ClipBatch;
 
 /// How long a client may take to send its hello.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -89,7 +90,8 @@ const SUPPORTED_FEATURES: u32 = features::LOCAL_CURSOR
     | features::RESIZE
     | features::CLIPBOARD_IMAGE
     | features::FILE_TRANSFER
-    | features::CLIPBOARD_FILES;
+    | features::CLIPBOARD_FILES
+    | features::ATOMIC_FILES;
 
 struct Client {
     generation: u64,
@@ -157,6 +159,7 @@ impl Client {
 /// the spot, out of memory. Only the filesystem work itself is handed to the
 /// worker, so a wedged mount can cost a transfer but never a frame.
 struct SessionTransferPolicy {
+    replace: bool,
     upload_dir: PathBuf,
     /// Downloads the session asked the client for, while staging a clipboard
     /// file copy. Anything else in that direction is refused.
@@ -182,7 +185,11 @@ impl TransferPolicy for SessionTransferPolicy {
                 // The directory and the file are created on the worker, so a
                 // refusal to write is reported when the transfer finishes
                 // rather than when it is offered. The peer is told either way.
-                Ok(Sink::Stream(Box::new(self.fileio.create(dest))))
+                Ok(Sink::Stream(Box::new(self.fileio.create(
+                    self.upload_dir.clone(),
+                    rel,
+                    self.replace,
+                ))))
             }
             TransferPurpose::FileDownload => {
                 // Only files we asked for while staging a clipboard copy.
@@ -191,7 +198,11 @@ impl TransferPolicy for SessionTransferPolicy {
                     .get(&id)
                     .cloned()
                     .ok_or_else(|| "unsolicited download offer".to_string())?;
-                Ok(Sink::Stream(Box::new(self.fileio.create(dest))))
+                Ok(Sink::Stream(Box::new(self.fileio.create(
+                    dest.parent().unwrap().to_path_buf(),
+                    dest.file_name().unwrap().to_string_lossy().into_owned(),
+                    false,
+                ))))
             }
         }
     }
@@ -227,11 +238,12 @@ pub struct Core {
     client_formats: u32,
     /// Where the client's clipboard files are staged before being offered
     /// to the session.
-    staging_dir: PathBuf,
+    staging_dir: tempfile::TempDir,
     /// Downloads in flight while staging: transfer id to destination.
     staging_downloads: std::collections::HashMap<u64, PathBuf>,
     /// Files staged so far in the current batch.
-    staging_batch: Vec<PathBuf>,
+    staging_batch: Option<ClipBatch>,
+    upload_options: Option<(u64, bool)>,
     /// Every file the session opens or writes goes through here, on a thread
     /// of its own.
     fileio: FileIo,
@@ -321,8 +333,12 @@ impl Core {
         let upload_dir = opts.upload_dir.clone();
         // Clipboard files from the client are staged here so the session can
         // paste them as ordinary local files.
-        let staging_dir = std::env::temp_dir().join(format!("lynxrdp-clip-{}", std::process::id()));
-        let fileio = FileIo::spawn().context("starting the session file worker")?;
+        let staging_dir = tempfile::Builder::new()
+            .prefix("lynxrdp-clip-")
+            .tempdir()
+            .context("creating private clipboard staging")?;
+        let fileio =
+            FileIo::spawn(events_tx.clone()).context("starting the session file worker")?;
         log::info!(
             "session core ready: {w}x{h}, shm={}, cursor={}, clipboard={}, max_fps={}, \
              in_flight={}{}",
@@ -361,7 +377,8 @@ impl Core {
             client_formats: 0,
             staging_dir,
             staging_downloads: std::collections::HashMap::new(),
-            staging_batch: Vec::new(),
+            staging_batch: None,
+            upload_options: None,
             fileio,
             pending_downloads: std::collections::HashMap::new(),
             served: (w, h),
@@ -482,6 +499,11 @@ impl Core {
             CoreEvent::Shutdown(reason) => {
                 self.drop_client(Some("The server is shutting down."))?;
                 Ok(Some(Exit::Shutdown(reason)))
+            }
+            CoreEvent::FileReady => {
+                let out = self.transfers.poll();
+                self.apply_transfer_outcome(out);
+                Ok(None)
             }
             CoreEvent::FileOpened(opened) => {
                 self.on_file_opened(*opened);
@@ -630,35 +652,58 @@ impl Core {
         if self.clipboard.is_none() || files.is_empty() {
             return;
         }
-        // A new copy supersedes any half-staged one.
+        if let Some(old) = self.staging_batch.take() {
+            for id in old.live_ids() {
+                if let Some(msg) = self.transfers.cancel(id, "clipboard replaced") {
+                    self.send_to_client(vec![msg]);
+                }
+            }
+        }
         self.staging_downloads.clear();
-        self.staging_batch.clear();
-        // The directory is not created here: each staged file is written
-        // through the file worker, which makes its parents. One `mkdir` is
-        // cheap on a local disk and is not cheap on a mount that has stopped
-        // answering, and this runs on the frame thread.
         let dir = self
             .staging_dir
-            .join(format!("{}", self.transfers.next_id()));
-        let mut requests = Vec::new();
-        for f in &files {
-            let Some(rel) = safe_relative_path(&f.path) else {
-                continue;
-            };
-            let name = rel.rsplit('/').next().unwrap_or("file").to_string();
+            .path()
+            .join(self.transfers.next_id().to_string());
+        self.staging_batch = Some(ClipBatch::new(dir, &files));
+        self.pump_clipboard_batch();
+    }
+
+    fn pump_clipboard_batch(&mut self) {
+        while let Some((remote, dest, slot)) = self
+            .staging_batch
+            .as_mut()
+            .and_then(ClipBatch::next_request)
+        {
             let id = self.transfers.next_id();
             self.transfers.expect(id);
-            self.staging_downloads.insert(id, dir.join(&name));
-            requests.push(Message::FileRequest {
-                id,
-                path: f.path.clone(),
-            });
+            self.staging_downloads.insert(id, dest);
+            self.staging_batch.as_mut().unwrap().requested(slot, id);
+            self.send_to_client(vec![Message::FileRequest { id, path: remote }]);
         }
-        log::debug!(
-            "clipboard: staging {} file(s) from the client",
-            requests.len()
-        );
-        self.send_to_client(requests);
+        if self.staging_batch.as_ref().is_some_and(ClipBatch::done) {
+            let batch = self.staging_batch.take().unwrap();
+            let total = batch.total();
+            let files = batch.into_files();
+            if files.len() != total {
+                self.send_to_client(vec![Message::Notice {
+                    text: format!("Clipboard: {} of {total} files received", files.len()),
+                }]);
+            }
+            if !files.is_empty() {
+                if let Some(cb) = self.clipboard.as_mut() {
+                    if let Err(e) = cb.set_files(files) {
+                        log::warn!("clipboard: {e:#}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn settle_clipboard_file(&mut self, id: u64, success: bool) {
+        let path = self.staging_downloads.remove(&id);
+        if let Some(batch) = self.staging_batch.as_mut() {
+            batch.resolve(id, path.filter(|_| success));
+        }
     }
 
     /// Answer a client's request to download a file from the session.
@@ -679,7 +724,11 @@ impl Core {
         // and length. Refusing costs a client nothing -- it chooses these ids
         // and has no reason to collide with itself -- and it is the only way
         // the reply can be matched to the request that produced it.
-        if self.pending_downloads.contains_key(&id) {
+        if self.pending_downloads.contains_key(&id)
+            || self.pending_downloads.len() >= 64
+            || self.transfers.active_ids().contains(&id)
+            || self.transfers.active_ids().len() >= 64
+        {
             log::warn!("transfer id {id} is already opening; refusing {path}");
             self.send_to_client(vec![Message::TransferEnd {
                 id,
@@ -698,14 +747,19 @@ impl Core {
 
     /// The worker has opened (or failed to open) a file a client asked for.
     fn on_file_opened(&mut self, opened: FileOpened) {
+        if self.client.as_ref().map(|c| c.generation) != Some(opened.generation) {
+            return;
+        }
+        if !self
+            .pending_downloads
+            .get(&opened.id)
+            .is_some_and(|reader| reader.handle() == opened.handle)
+        {
+            return;
+        }
         let Some(reader) = self.pending_downloads.remove(&opened.id) else {
             return;
         };
-        if self.client.as_ref().map(|c| c.generation) != Some(opened.generation) {
-            // The client that asked is gone. Offering the file to whoever
-            // replaced it would be handing one client another's request.
-            return;
-        }
         let reply = match opened.result {
             Ok(size) => {
                 log::info!("sending {} ({size} bytes) to the client", opened.path);
@@ -765,7 +819,29 @@ impl Core {
 
     /// Feed a message to the transfer manager. Returns true if it was one.
     fn handle_transfer_message(&mut self, msg: &Message) -> bool {
+        if let Message::TransferEnd { id, ok: false, .. } = msg {
+            self.pending_downloads.remove(id);
+        }
+
+        if let Message::TransferOptions { id, replace } = msg {
+            if self
+                .client
+                .as_ref()
+                .is_some_and(|c| c.features & features::ATOMIC_FILES != 0)
+            {
+                self.upload_options = Some((*id, *replace));
+            }
+            return true;
+        }
+        let replace = if let Message::TransferOffer { id, .. } = msg {
+            self.upload_options
+                .take()
+                .is_some_and(|(offered, replace)| offered == *id && replace)
+        } else {
+            false
+        };
         let mut policy = SessionTransferPolicy {
+            replace,
             upload_dir: self.upload_dir.clone(),
             staging: self.staging_downloads.clone(),
             fileio: self.fileio.clone(),
@@ -773,16 +849,32 @@ impl Core {
         let Some(outcome) = self.transfers.handle(msg, &mut policy) else {
             return false;
         };
+        self.apply_transfer_outcome(outcome);
+        true
+    }
+
+    fn apply_transfer_outcome(&mut self, outcome: lynxrdp_proto::transfer::Outcome) {
+        for reply in &outcome.replies {
+            if let Message::TransferAccept {
+                id,
+                accepted: false,
+                ..
+            } = reply
+            {
+                self.settle_clipboard_file(*id, false);
+            }
+        }
         self.send_to_client(outcome.replies);
         for (id, reason) in outcome.failed {
             log::warn!("transfer {id} failed: {reason}");
+            self.settle_clipboard_file(id, false);
         }
         for done in outcome.completed {
             if let Err(e) = self.on_transfer_complete(done) {
-                log::warn!("handling a completed transfer failed: {e:#}");
+                log::warn!("completed transfer: {e:#}");
             }
         }
-        true
+        self.pump_clipboard_batch();
     }
 
     fn on_transfer_complete(&mut self, done: Completed) -> Result<()> {
@@ -803,21 +895,7 @@ impl Core {
                 }]);
             }
             TransferPurpose::FileDownload => {
-                if let Some(path) = self.staging_downloads.remove(&done.id) {
-                    self.staging_batch.push(path);
-                }
-                if self.staging_downloads.is_empty() && !self.staging_batch.is_empty() {
-                    let files = std::mem::take(&mut self.staging_batch);
-                    log::debug!(
-                        "clipboard: offering {} staged file(s) to the session",
-                        files.len()
-                    );
-                    if let Some(cb) = self.clipboard.as_mut() {
-                        if let Err(e) = cb.set_files(files) {
-                            log::warn!("clipboard: offering staged files failed: {e:#}");
-                        }
-                    }
-                }
+                self.settle_clipboard_file(done.id, true);
             }
         }
         Ok(())
@@ -962,6 +1040,10 @@ impl Core {
         // Files opened for a download this client never collected. Dropping
         // the readers closes them.
         self.pending_downloads.clear();
+        self.transfers.clear();
+        self.upload_options = None;
+        self.staging_downloads.clear();
+        self.staging_batch = None;
         self.last_client_seen = Instant::now();
         Ok(())
     }
@@ -1429,6 +1511,23 @@ impl Core {
     }
 
     fn housekeeping(&mut self) -> Result<Option<Exit>> {
+        let expired: Vec<_> = self
+            .pending_downloads
+            .iter()
+            .filter(|(_, reader)| reader.open_expired())
+            .map(|(&id, _)| id)
+            .collect();
+        for id in expired {
+            self.pending_downloads.remove(&id);
+            self.send_to_client(vec![Message::TransferEnd {
+                id,
+                ok: false,
+                message: "file open timed out".into(),
+            }]);
+        }
+
+        let outcome = self.transfers.poll();
+        self.apply_transfer_outcome(outcome);
         let now = Instant::now();
         let mut drop_reason: Option<String> = None;
         if let Some(c) = self.client.as_mut() {

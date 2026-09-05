@@ -24,7 +24,7 @@ use lynxrdp_client::tunnel::{parse_destination, Endpoint, RemoteTarget, Tunnel, 
 // Part of the binary rather than the library: it is an entry point, reached
 // only through this file's argument handling, and nothing that links the
 // client as a library has any use for it.
-mod askpass;
+use lynxrdp_client::askpass;
 
 /// Connect to a LynxRDP session over SSH.
 #[derive(Parser, Debug)]
@@ -86,6 +86,17 @@ struct Args {
 /// client uses and talks to the user's existing session.
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// List your running desktops without connecting to one.
+    Sessions { destination: String },
+    /// End a desktop listed by sessions; closes its applications.
+    Terminate {
+        destination: String,
+        pid: u32,
+        #[arg(long)]
+        started: u64,
+        #[arg(long, required = true)]
+        yes: bool,
+    },
     /// Copy local files into the session.
     Send {
         /// SSH destination: [user@]host[:port].
@@ -96,6 +107,9 @@ enum Command {
         /// Destination directory relative to the session's upload directory.
         #[arg(long)]
         into: Option<String>,
+        /// Replace existing files only after complete receipt.
+        #[arg(long)]
+        overwrite: bool,
     },
     /// Copy a file out of the session.
     Get {
@@ -105,6 +119,9 @@ enum Command {
         remote: String,
         /// Where to write it locally (default: the file's name here).
         local: Option<PathBuf>,
+        /// Replace an existing local file only after complete receipt.
+        #[arg(long)]
+        overwrite: bool,
     },
 }
 
@@ -272,11 +289,42 @@ fn connect_headless(args: &Args, destination: &str) -> Result<(Client, Option<Tu
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(3600);
 
 fn run_transfer_command(args: &Args, command: &Command) -> Result<()> {
+    if matches!(command, Command::Send { .. } | Command::Get { .. }) {
+        ctrlc::set_handler(|| CANCEL_TRANSFER.store(true, std::sync::atomic::Ordering::Relaxed))?;
+    }
     match command {
+        Command::Sessions { destination } => {
+            for record in
+                lynxrdp_client::remote_sessions::run(&tunnel_config(args, destination)?, None)?
+            {
+                println!(
+                    "PID {}  started {}  session {}  {}",
+                    record.pid,
+                    record.started,
+                    record.session_id,
+                    record.listen.as_deref().unwrap_or("daemon")
+                );
+            }
+            Ok(())
+        }
+        Command::Terminate {
+            destination,
+            pid,
+            started,
+            yes: _,
+        } => {
+            lynxrdp_client::remote_sessions::run(
+                &tunnel_config(args, destination)?,
+                Some((*pid, *started)),
+            )?;
+            println!("Termination requested for desktop {pid}");
+            Ok(())
+        }
         Command::Send {
             destination,
             files,
             into,
+            overwrite,
         } => {
             for f in files {
                 if !f.is_file() {
@@ -294,8 +342,8 @@ fn run_transfer_command(args: &Args, command: &Command) -> Result<()> {
                     None => name.clone(),
                 };
                 let size = std::fs::metadata(local)?.len();
-                let id = client.send_file(local, &dest)?;
-                client.run_transfer(id, TRANSFER_TIMEOUT)?;
+                let id = client.send_file_with_overwrite(local, &dest, *overwrite)?;
+                wait_for_transfer(&mut client, id)?;
                 println!("sent {} ({size} bytes) as {dest}", local.display());
             }
             client.disconnect("transfer complete");
@@ -305,6 +353,7 @@ fn run_transfer_command(args: &Args, command: &Command) -> Result<()> {
             destination,
             remote,
             local,
+            overwrite,
         } => {
             let dest = match local {
                 Some(p) if p.is_dir() => {
@@ -315,12 +364,48 @@ fn run_transfer_command(args: &Args, command: &Command) -> Result<()> {
                 None => PathBuf::from(remote.rsplit('/').next().unwrap_or("download")),
             };
             let (mut client, _tunnel) = connect_headless(args, destination)?;
-            let id = client.request_file(remote, dest.clone())?;
-            client.run_transfer(id, TRANSFER_TIMEOUT)?;
+            let id = client.request_file_with_overwrite(remote, dest.clone(), *overwrite)?;
+            wait_for_transfer(&mut client, id)?;
             let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
             println!("received {remote} ({size} bytes) into {}", dest.display());
             client.disconnect("transfer complete");
             Ok(())
+        }
+    }
+}
+
+static CANCEL_TRANSFER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn wait_for_transfer(client: &mut Client, id: u64) -> Result<()> {
+    use lynxrdp_client::connection::ClientEvent;
+    let deadline = std::time::Instant::now() + TRANSFER_TIMEOUT;
+    let mut printed = std::time::Instant::now();
+    loop {
+        if CANCEL_TRANSFER.load(std::sync::atomic::Ordering::Relaxed)
+            || std::time::Instant::now() >= deadline
+        {
+            client.cancel_transfer(id);
+            bail!("transfer cancelled or timed out");
+        }
+        match client.poll_event(Duration::from_millis(200))? {
+            Some(
+                ClientEvent::FileUploaded { id: done, .. }
+                | ClientEvent::FileDownloaded { id: done, .. },
+            ) if done == id => return Ok(()),
+            Some(ClientEvent::TransferFailed { id: failed, reason }) if failed == id => {
+                bail!("{reason}")
+            }
+            Some(ClientEvent::Disconnected(reason)) => bail!("{reason}"),
+            _ => {}
+        }
+        if printed.elapsed() >= Duration::from_secs(1) {
+            if let Some((_, text)) = client
+                .transfer_rows()
+                .into_iter()
+                .find(|(active, _)| *active == id)
+            {
+                eprintln!("{text} (Ctrl+C to cancel)");
+            }
+            printed = std::time::Instant::now();
         }
     }
 }

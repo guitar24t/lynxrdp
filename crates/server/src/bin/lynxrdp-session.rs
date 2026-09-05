@@ -35,6 +35,15 @@ use lynxrdp_server::x11::XDisplay;
 #[derive(Parser, Debug)]
 #[command(name = "lynxrdp-session", version, about)]
 struct Args {
+    /// List your running desktop sessions as JSON without connecting to them.
+    #[arg(long)]
+    list_sessions: bool,
+    /// End one of your desktop sessions (PID from --list-sessions).
+    #[arg(long, requires = "started")]
+    terminate: Option<u32>,
+    /// Process start token from --list-sessions; protects against PID reuse.
+    #[arg(long)]
+    started: Option<u64>,
     /// Loopback address to accept clients on directly (user mode).
     #[arg(long)]
     listen: Option<String>,
@@ -146,6 +155,20 @@ fn run() -> Result<i32> {
         .format_timestamp_millis()
         .init();
     let args = Args::parse();
+    if args.list_sessions {
+        println!(
+            "{}",
+            serde_json::to_string(&lynxrdp_server::session::admin::list()?)?
+        );
+        return Ok(0);
+    }
+    if let Some(pid) = args.terminate {
+        lynxrdp_server::session::admin::terminate(
+            pid,
+            args.started.context("missing start token")?,
+        )?;
+        return Ok(0);
+    }
     install_signal_handlers();
 
     if args.listen.is_none() && args.control_fd.is_none() {

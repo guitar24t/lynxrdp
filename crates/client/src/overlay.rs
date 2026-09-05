@@ -243,6 +243,8 @@ impl Status {
 /// What a bar button does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    /// Open local file transfer controls.
+    Transfers,
     /// Toggle the window's fullscreen state.
     Fullscreen,
     /// Send Ctrl+Alt+Del into the session.
@@ -253,7 +255,8 @@ pub enum Action {
 
 /// The buttons, left to right; `Disconnect` is laid out hard against the
 /// right edge and the others fill leftwards from it.
-const BUTTONS: [(Action, &str, &str, u32); 3] = [
+const BUTTONS: [(Action, &str, &str, u32); 4] = [
+    (Action::Transfers, "Transfers", "C-A-T", colour::TEXT),
     (Action::Fullscreen, "Fullscreen", "C-A-Enter", colour::TEXT),
     (
         Action::SecureAttention,
@@ -406,7 +409,7 @@ pub fn bar_layout(width: u32, s: u32, st: &Status) -> Layout {
     let mut wanted = st.fields();
     let mut with_shortcut = true;
     let mut first = 0usize;
-    for step in 0..=6 {
+    for step in 0..(4 + BUTTONS.len()) {
         let btns = buttons_width(first, with_shortcut);
         let need = text_x + block(&wanted) + pad + if btns == 0 { 0 } else { btns + pad };
         if need <= width {
@@ -1168,10 +1171,10 @@ mod tests {
     #[test]
     fn accelerators_are_printed_when_there_is_room_for_them() {
         let l = bar_layout(1920, 2, &status());
-        assert_eq!(l.buttons.len(), 3);
+        assert_eq!(l.buttons.len(), 4);
         assert!(l.buttons.iter().all(|b| b.shortcut_shown));
-        assert_eq!(l.buttons[2].action, Action::Disconnect);
-        assert_eq!(l.buttons[2].colour, colour::DANGER);
+        assert_eq!(l.buttons[3].action, Action::Disconnect);
+        assert_eq!(l.buttons[3].colour, colour::DANGER);
     }
 
     #[test]
