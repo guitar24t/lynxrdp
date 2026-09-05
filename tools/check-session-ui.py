@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Check graphical session input on isolated Xvfb displays.
 
 Build the workspace first. Requires Xvfb, xterm, xdpyinfo, and xdotool.
@@ -31,7 +31,7 @@ def run(args, env):
 
 
 def find_window(class_name, env):
-    args = ["xdotool", "search", "--class", class_name]
+    args = ["xdotool", "search", "--onlyvisible", "--class", class_name]
     wait_for(
         lambda: subprocess.run(
             args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
