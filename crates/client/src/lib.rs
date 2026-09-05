@@ -36,5 +36,7 @@ pub const CLIENT_NAME: &str = concat!("LynxRDP client/", env!("CARGO_PKG_VERSION
 /// Inspect and manage desktops over SSH.
 pub mod remote_sessions;
 
+/// Software compositing of graphical widgets over the remote desktop.
+pub mod gui_paint;
 /// In-session file transfer controls.
 pub mod transfer_panel;

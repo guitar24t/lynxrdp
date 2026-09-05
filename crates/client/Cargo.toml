@@ -39,6 +39,7 @@ tempfile = "3"
 # why the launcher spawns sessions as child processes rather than opening
 # one in-process: a second winit event loop is not allowed on macOS.
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui-winit = { version = "0.31", default-features = false, features = ["clipboard", "wayland", "x11"] }
 # The updater. ureq's defaults are rustls with the bundled Mozilla roots, so
 # there is no system TLS library to find at build time or at run time and the
 # same binary works on a host with no CA bundle laid out where OpenSSL wants

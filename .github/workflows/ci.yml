@@ -64,6 +64,8 @@ jobs:
         run: cargo test -p lynxrdp-server --test tunnel_e2e -- --test-threads=1
       - name: Doc tests
         run: cargo test --workspace --doc
+      - name: Graphical session input (Xvfb)
+        run: python3 tools/check-session-ui.py
 
   build-client:
     name: Client (${{ matrix.name }})

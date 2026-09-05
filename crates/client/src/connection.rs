@@ -670,6 +670,25 @@ impl Client {
         }
     }
 
+    /// Structured progress for graphical transfer controls.
+    pub fn transfer_details(&self) -> Vec<crate::transfer_panel::Transfer> {
+        self.transfers
+            .active_ids()
+            .into_iter()
+            .map(|id| {
+                let description = self.transfers.describe(id);
+                crate::transfer_panel::Transfer {
+                    id,
+                    name: description
+                        .as_ref()
+                        .map(|(_, name, _, _)| name.to_string())
+                        .unwrap_or_else(|| "Preparing file".into()),
+                    progress: description.map(|(_, _, done, total)| (done, total)),
+                }
+            })
+            .collect()
+    }
+
     /// Active transfer descriptions for a local progress view.
     pub fn transfer_rows(&self) -> Vec<(u64, String)> {
         self.transfers

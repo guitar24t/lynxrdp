@@ -12,13 +12,13 @@
 //! on slow links.
 //!
 //! The window also outlives the connection. A link that drops leaves the last
-//! frame on screen, dimmed, with what happened written across the bottom,
+//! frame on screen, dimmed, with a graphical connection notice,
 //! while a worker thread tries to reconnect -- because the desktop those
 //! pixels came from is still running on the server, and closing the window is
 //! the one part of this that cannot be undone.
 //!
-//! There is no widget toolkit here: the window owns raw pixels. The connection
-//! bar in [`crate::overlay`] is composited into the *presented* buffer after
+//! Graphical controls use egui and software compositing. The connection
+//! bar and local widgets are composited into the *presented* buffer after
 //! the blit, never into the decoded framebuffer, because the server sends
 //! incremental frames that diff against the pixels it believes we hold.
 
@@ -299,15 +299,15 @@ fn classify(reason: &str) -> Fate {
 
 /// What the dimmed window says while the link is not up.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Notice {
+pub(crate) struct Notice {
     /// Two or three words, in the state's colour.
-    headline: String,
+    pub(crate) headline: String,
     /// The reason string the connection gave us, verbatim.
-    detail: String,
+    pub(crate) detail: String,
     /// What the user can do about it.
-    hint: &'static str,
+    pub(crate) hint: &'static str,
     /// Headline colour.
-    colour: u32,
+    pub(crate) colour: u32,
 }
 
 /// A reconnection running on a worker thread.
@@ -327,6 +327,7 @@ struct Attempt {
 pub struct Wake;
 
 struct Gfx {
+    gui: crate::transfer_panel::Gui,
     window: Arc<Window>,
     surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
 }
@@ -359,8 +360,12 @@ pub struct App {
     /// folders arrive as five separate events. See [`MAX_CONCURRENT_UPLOADS`].
     upload_queue: VecDeque<(PathBuf, String)>,
     transfer_panel: crate::transfer_panel::Panel,
-    uploads_confirmed: bool,
-    upload_replace: bool,
+    ui_pointer: bool,
+    ui_press: bool,
+    ui_keyboard: bool,
+    last_gui_visible: bool,
+    last_gui_rect: Option<Rect>,
+    last_gui_message: String,
     /// Uploads finished (or given up on) since the queue was last empty, so
     /// progress can be reported across a whole drop rather than per file.
     upload_done: usize,
@@ -496,8 +501,12 @@ impl App {
             uploads: Vec::new(),
             upload_queue: VecDeque::new(),
             transfer_panel: Default::default(),
-            uploads_confirmed: false,
-            upload_replace: false,
+            ui_pointer: false,
+            ui_press: false,
+            ui_keyboard: false,
+            last_gui_visible: false,
+            last_gui_rect: None,
+            last_gui_message: String::new(),
             upload_done: 0,
             clipboard_batch: None,
             clipboard_batches: 0,
@@ -647,7 +656,12 @@ impl App {
         let surface = softbuffer::Surface::new(&context, window.clone())
             .map_err(|e| anyhow::anyhow!("softbuffer surface: {e}"))?;
         window.set_cursor_visible(!self.uses_local_cursor());
-        self.gfx = Some(Gfx { window, surface });
+        let gui = crate::transfer_panel::Gui::new(&window);
+        self.gfx = Some(Gfx {
+            window,
+            surface,
+            gui,
+        });
         self.full_redraw = true;
         Ok(())
     }
@@ -717,7 +731,7 @@ impl App {
         let now = Instant::now();
         let win = Rect::new(0, 0, size.width, size.height);
         // Two different scales, and they are not the same thing. `bar_s` is
-        // the display's, so the bar's 5x9 font is legible on a 2x screen;
+        // the display's, so graphical chrome follows the monitor's density;
         // `self.scale` is the remote screen's magnification. They agree by
         // default and part company the moment `--scale` is given.
         let bar_s = self.overlay_scale();
@@ -726,7 +740,7 @@ impl App {
         // While the pointer is on the bar it is the OS cursor the user is
         // steering, not the session's, so ours is neither drawn nor moved.
         let cursor_now = match (
-            self.draws_own_cursor() && !self.pointer_on_bar,
+            self.draws_own_cursor() && !self.pointer_on_bar && !self.ui_pointer && !self.ui_press,
             &self.cursor,
         ) {
             (true, Some(cur)) => self.pointer.map(|(px, py)| {
@@ -759,11 +773,25 @@ impl App {
         // is blended too. Repainting everything is cheap here precisely
         // because nothing is arriving to repaint -- these frames happen once a
         // second, when the wording changes.
-        let asked_full = self.full_redraw || notice.is_some() || self.transfer_panel.open;
-
+        let transfers = self.client.transfer_details();
+        let asked_full = self.full_redraw || notice.is_some();
         let Some(gfx) = self.gfx.as_mut() else {
             return Ok(());
         };
+        // Lay out widgets before the blit, so moving, closing, or dismissing a
+        // panel restores both its old and new bounds without repainting the desktop.
+        let gui_frame = gfx.gui.prepare(
+            &gfx.window,
+            &mut self.transfer_panel,
+            self.upload_queue.len(),
+            &transfers,
+            notice.as_ref(),
+        );
+        let gui_now = gui_frame.bounds;
+        if self.remote_buttons == 0 {
+            self.ui_pointer = gfx.gui.ctx.is_pointer_over_area();
+        }
+        let cursor_now = cursor_now.filter(|_| !self.ui_pointer && !self.ui_press);
         gfx.surface
             .resize(w, h)
             .map_err(|e| anyhow::anyhow!("surface resize: {e}"))?;
@@ -782,6 +810,8 @@ impl App {
             // What the bar covered last frame but does not now: the blit
             // restores those pixels, but nothing else would present them.
             self.last_bar.unwrap_or_default(),
+            gui_now.unwrap_or_default(),
+            self.last_gui_rect.unwrap_or_default(),
         ];
         // Two lists, not one: `regions` is painted and presented, `changed` is
         // what a later frame is told this one altered. See [`present_plan`] --
@@ -813,9 +843,6 @@ impl App {
                 );
             }
         }
-        if let Some(n) = &notice {
-            draw_notice(&mut buf, size.width, size.height, bar_s, n);
-        }
         // After the blit and before the cursor: the bar sits over the remote
         // screen and under the pointer, and it is drawn into this buffer
         // rather than into the framebuffer the next frame will diff against.
@@ -828,34 +855,8 @@ impl App {
              blit did not cover the pixels the scrim was blended onto"
         );
         debug_assert_eq!(bar_was, self.last_bar, "the bar's own history drifted");
-        if self.transfer_panel.open {
-            let rows = self.client.transfer_rows();
-            let lines = self.transfer_panel.lines(self.upload_queue.len(), &rows);
-            blend_rect(
-                &mut buf,
-                size.width,
-                size.height,
-                Rect::new(0, 0, size.width, size.height),
-                0x101820,
-                245,
-            );
-            for (i, line) in lines.iter().enumerate() {
-                let y = 40 + i as u32 * 18;
-                if y + 16 > size.height {
-                    break;
-                }
-                draw_text_line(
-                    &mut buf,
-                    size.width,
-                    size.height,
-                    2,
-                    (8, y),
-                    &fit_text(line, size.width.saturating_sub(16), 2),
-                    overlay::colour::TEXT,
-                );
-            }
-        }
-        if cursor_now.is_some() && !self.transfer_panel.open {
+        let actions = gfx.gui.paint(gui_frame, &mut buf, size.width, size.height);
+        if cursor_now.is_some() {
             if let (Some(cur), Some((px, py))) = (&self.cursor, self.pointer) {
                 draw_cursor_scaled(
                     &mut buf,
@@ -877,6 +878,9 @@ impl App {
         // or not this one reached the screen.
         self.last_cursor = cursor_now;
         self.last_bar = bar;
+        self.last_gui_visible = gui_now.is_some();
+        self.last_gui_rect = gui_now;
+        self.last_gui_message = self.transfer_panel.message.clone();
         self.dirty = None;
         self.presented_size = Some((size.width, size.height));
         if presented.is_err() {
@@ -899,6 +903,13 @@ impl App {
             self.full_redraw = false;
         }
         presented.map_err(|e| anyhow::anyhow!("present: {e}"))?;
+        for action in actions {
+            self.transfer_action(action);
+        }
+        if !self.transfer_panel.open && self.link_up() {
+            self.ui_keyboard = false;
+        }
+        self.restore_cursor();
         Ok(())
     }
 
@@ -938,7 +949,7 @@ impl App {
             Link::Lost { reason, .. } => notice(
                 "Connection lost",
                 reason.clone(),
-                "Ctrl+Alt+R or a click reconnects  -  Ctrl+Alt+Q closes this window",
+                "Your desktop is preserved. Reconnect to continue.",
                 overlay::colour::WARN,
             ),
             Link::Reconnecting {
@@ -963,14 +974,14 @@ impl App {
                 notice(
                     "Reconnecting",
                     detail,
-                    "Ctrl+Alt+R or a click tries now  -  Ctrl+Alt+Q closes this window",
+                    "We are restoring the connection. You can also try again now.",
                     overlay::colour::WARN,
                 )
             }
             Link::Gone { reason, .. } => notice(
                 "Session ended",
                 reason.clone(),
-                "Ctrl+Alt+Q closes this window  -  the desktop may still be on the server",
+                "You can close this window. The desktop may still be running on the server.",
                 overlay::colour::DANGER,
             ),
         }
@@ -1038,9 +1049,7 @@ impl App {
                     }
                     ClientEvent::Cursor(c) => {
                         self.cursor = Some(c);
-                        if let Some(g) = &self.gfx {
-                            g.window.set_cursor_visible(false);
-                        }
+                        self.restore_cursor();
                         self.request_redraw();
                     }
                     ClientEvent::CursorPosition(x, y) => {
@@ -1061,18 +1070,19 @@ impl App {
                     ClientEvent::ClipboardImage(png) => self.on_remote_image(png),
                     ClientEvent::ClipboardFiles(files) => self.on_remote_files(files),
                     ClientEvent::FileDownloaded { id, path, name } => {
-                        self.transfer_panel.message =
-                            format!("Downloaded {name} to {}", path.display());
+                        self.transfer_panel
+                            .notify(format!("Downloaded {name} to {}", path.display()));
                         log::info!("downloaded {name} to {}", path.display());
                         self.on_clipboard_file(id, Some(path));
                     }
                     ClientEvent::FileUploaded { id, name } => {
-                        self.transfer_panel.message = format!("Uploaded {name}");
+                        self.transfer_panel.notify(format!("Uploaded {name}"));
                         log::info!("uploaded {name}");
                         self.finish_upload(id);
                     }
                     ClientEvent::TransferFailed { id, reason } => {
-                        self.transfer_panel.message = format!("Transfer failed: {reason}");
+                        self.transfer_panel
+                            .notify(format!("Transfer failed: {reason}"));
                         // Either direction, and the id says which: a failure
                         // has to reach the batch as well as the upload list,
                         // or a refused download leaves a paste waiting on a
@@ -1412,7 +1422,18 @@ impl App {
     }
 
     fn housekeeping(&mut self) {
-        if self.transfer_panel.open {
+        if self
+            .gfx
+            .as_ref()
+            .is_some_and(|g| g.gui.repaint_in().is_zero())
+        {
+            self.request_redraw();
+        }
+        if self.transfer_panel.visible()
+            || self.last_gui_visible
+            || !self.uploads.is_empty()
+            || self.transfer_panel.message != self.last_gui_message
+        {
             self.request_redraw();
         }
         let now = Instant::now();
@@ -1503,7 +1524,11 @@ impl App {
     fn restore_cursor(&self) {
         if let Some(g) = &self.gfx {
             g.window.set_cursor_visible(
-                self.transfer_panel.open || !self.draws_own_cursor() || self.cursor.is_none(),
+                self.ui_pointer
+                    || self.ui_press
+                    || self.pointer_on_bar
+                    || !self.draws_own_cursor()
+                    || self.cursor.is_none(),
             );
         }
     }
@@ -1526,6 +1551,7 @@ impl App {
         }
         self.remote_buttons = 0;
         self.transfer_panel.open = true;
+        self.ui_keyboard = true;
         self.full_redraw = true;
         if let Some(g) = &self.gfx {
             g.window.set_cursor_visible(true);
@@ -1536,7 +1562,7 @@ impl App {
     fn transfer_action(&mut self, action: crate::transfer_panel::Action) {
         use crate::transfer_panel::Action;
         match action {
-            Action::None => {}
+            Action::Reconnect => self.reconnect_now(),
             Action::Download => {
                 let result = self
                     .transfer_panel
@@ -1549,21 +1575,16 @@ impl App {
                             self.transfer_panel.replace,
                         )
                     });
-                self.transfer_panel.message = match result {
+                self.transfer_panel.notify(match result {
                     Ok(_) => "Download requested".into(),
                     Err(e) => format!("{e:#}"),
-                };
-            }
-            Action::Upload => {
-                self.upload_replace = self.transfer_panel.replace;
-                self.uploads_confirmed = true;
-                self.pump_uploads();
+                });
             }
             Action::Cancel(id) => {
                 self.client.cancel_transfer(id);
                 self.on_clipboard_file(id, None);
                 self.finish_upload(id);
-                self.transfer_panel.message = "Cancellation requested".into();
+                self.transfer_panel.notify("Cancellation requested".into());
             }
             Action::CancelAll => {
                 self.upload_queue.clear();
@@ -1572,7 +1593,7 @@ impl App {
                 for (id, _) in self.client.transfer_rows() {
                     self.client.cancel_transfer(id);
                 }
-                self.transfer_panel.message = "Transfers cancelled".into();
+                self.transfer_panel.notify("Transfers cancelled".into());
             }
         }
     }
@@ -1652,25 +1673,39 @@ impl App {
     fn on_dropped_file(&mut self, path: &std::path::Path) {
         if !self.link_up() {
             log::warn!("the link is down; ignoring dropped file");
+            self.transfer_panel
+                .notify("Reconnect before dropping files.".into());
+            self.request_redraw();
             return;
         }
         if self.client.info().features & features::FILE_TRANSFER == 0 {
             log::warn!("the server did not enable file transfer; ignoring dropped file");
+            self.transfer_panel
+                .notify("This server has file transfers disabled.".into());
+            self.request_redraw();
             return;
         }
         let files = match collect_dropped_files(path) {
             Ok(f) => f,
             Err(e) => {
                 log::warn!("cannot read {}: {e:#}", path.display());
+                self.transfer_panel
+                    .notify(format!("Could not read {}: {e:#}", path.display()));
+                self.request_redraw();
                 return;
             }
         };
         if files.is_empty() {
             log::warn!("nothing to upload from {}", path.display());
+            self.transfer_panel
+                .notify("No files found in the dropped folder.".into());
+            self.request_redraw();
             return;
         }
         let outstanding = self.uploads.len() + self.upload_queue.len();
         if outstanding + files.len() > MAX_PENDING_UPLOADS {
+            self.transfer_panel.notify("Too many files in progress. Please drop these files again after the current transfers finish.".into());
+            self.request_redraw();
             log::warn!(
                 "refusing {}: its {} file(s) on top of the {outstanding} already queued would \
                  pass the {MAX_PENDING_UPLOADS} file limit; drop it again once the current \
@@ -1682,23 +1717,21 @@ impl App {
         }
         log::info!("queued {} file(s) from {}", files.len(), path.display());
         self.upload_queue.extend(files);
-        self.uploads_confirmed = false;
-        self.open_transfer_panel();
+        self.transfer_panel.notify(format!(
+            "Sending files to {}",
+            self.client.info().server_name
+        ));
+        self.pump_uploads();
+        self.request_redraw();
     }
 
     /// Start as many queued uploads as the concurrency limit allows.
     fn pump_uploads(&mut self) {
-        while self.link_up()
-            && self.uploads_confirmed
-            && self.uploads.len() < MAX_CONCURRENT_UPLOADS
-        {
+        while self.link_up() && self.uploads.len() < MAX_CONCURRENT_UPLOADS {
             let Some((local, dest)) = self.upload_queue.pop_front() else {
                 break;
             };
-            match self
-                .client
-                .send_file_with_overwrite(&local, &dest, self.upload_replace)
-            {
+            match self.client.send_file_with_overwrite(&local, &dest, false) {
                 Ok(id) => {
                     log::debug!("uploading {} as {dest}", local.display());
                     self.uploads.push((id, dest));
@@ -1708,6 +1741,8 @@ impl App {
                     // counted as finished so the progress figure still reaches
                     // the end.
                     log::warn!("uploading {} failed: {e:#}", local.display());
+                    self.transfer_panel
+                        .notify(format!("Could not send {}: {e:#}", local.display()));
                     self.upload_done += 1;
                 }
             }
@@ -1962,6 +1997,9 @@ impl App {
 
     fn next_wake(&self) -> Duration {
         let mut d = Duration::from_millis(250);
+        if let Some(gfx) = &self.gfx {
+            d = d.min(gfx.gui.repaint_in());
+        }
         if self.pending_size.is_some() {
             d = d.min(RESIZE_DEBOUNCE / 2);
         }
@@ -1977,11 +2015,8 @@ impl App {
 
     /// The accelerators this window keeps for itself.
     ///
-    /// A closed list, deliberately: a raw framebuffer has no focus model, so
-    /// the bar cannot own keys the way a widget would, and every key not named
-    /// here -- Esc, Tab, the function keys, everything -- belongs to the
-    /// session. The bar prints these next to the matching button, which is the
-    /// whole of its keyboard story.
+    /// These global actions are available while the remote desktop has focus.
+    /// Local text fields use the graphical toolkit's normal editing shortcuts.
     fn accelerator(&self, logical: &Key, physical: PhysicalKey) -> Option<Accelerator> {
         let acc = accelerator_for(self.modifiers, logical, physical)?;
         // Ctrl+Alt+R is ours only while there is nothing to send it to. Taking
@@ -1996,24 +2031,6 @@ impl App {
     }
 
     fn on_key(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
-        if self.transfer_panel.open {
-            if event.state == ElementState::Pressed {
-                if (self.modifiers.control_key() || self.modifiers.super_key())
-                    && matches!(&event.logical_key,Key::Character(c) if c.eq_ignore_ascii_case("v"))
-                {
-                    if let Some(text) = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
-                        self.transfer_panel.paste(&text);
-                    }
-                } else {
-                    let action = self.transfer_panel.key(&event.logical_key);
-                    self.transfer_action(action);
-                }
-                self.restore_cursor();
-                self.full_redraw = true;
-                self.request_redraw();
-            }
-            return;
-        }
         let Some(ks) = keymap::keysym_for(&event.logical_key, event.location) else {
             return;
         };
@@ -2067,6 +2084,9 @@ impl App {
                 self.pressed_keys.push(ks);
             }
         } else {
+            // A shifted press may have an unshifted logical release (notably
+            // synthetic X11 typing). Forward it even if its spelling is not
+            // in pressed_keys; otherwise the remote physical key stays held.
             self.pressed_keys.retain(|&k| k != ks);
         }
         self.send_key(ks, down);
@@ -2092,10 +2112,6 @@ impl App {
     }
 
     fn on_pointer_moved(&mut self, pos: PhysicalPosition<f64>) {
-        if self.transfer_panel.open {
-            self.transfer_panel.pointer_y = pos.y;
-            return;
-        }
         // A drag that started on the remote screen keeps the pointer even when
         // it crosses the top edge, and the bar does not come up under it --
         // not by claiming the pointer, and not by completing a dwell either.
@@ -2515,115 +2531,6 @@ pub fn blend_rect(dst: &mut [u32], dst_w: u32, dst_h: u32, r: Rect, colour: u32,
     }
 }
 
-/// How many glyphs of the bar's font fit in `w` pixels at scale `s`.
-///
-/// The font is fixed width: five columns and a one-column gap, all at `s`,
-/// with no gap after the last glyph. Arithmetic rather than a decision, which
-/// is why it is repeated here instead of exported from [`overlay`] -- and
-/// `the_text_metric_matches_the_font_that_paints_it` checks it against real
-/// painted pixels, so the two cannot drift apart quietly.
-fn chars_fitting(w: u32, s: u32) -> usize {
-    ((w + s) / (6 * s)) as usize
-}
-
-/// Height of the strip the link notice is drawn in.
-fn notice_height(s: u32) -> u32 {
-    44 * s
-}
-
-/// Draw one line of text with the bar's font, at `(x, y)` in window pixels.
-///
-/// [`overlay`] owns the only bitmap font in this window and exports no text
-/// call of its own -- but `paint` becomes one when it is handed a layout with
-/// no bar, no state square and no buttons: every rectangle it fills is then
-/// empty and clips away, and the spans are all that reach the buffer.
-/// Borrowing it keeps one font in the window; a second copy of a 96-entry
-/// glyph table here would be a second thing to keep in step for no gain.
-fn draw_text_line(
-    dst: &mut [u32],
-    w: u32,
-    h: u32,
-    s: u32,
-    at: (u32, u32),
-    text: &str,
-    colour: u32,
-) {
-    let layout = overlay::Layout {
-        bar: Rect::default(),
-        dot: Rect::default(),
-        dot_colour: 0,
-        spans: vec![overlay::Span {
-            x: at.0,
-            text: text.to_string(),
-            colour,
-        }],
-        buttons: Vec::new(),
-        s,
-        text_y: at.1,
-    };
-    overlay::paint(dst, w, h, &layout, None, None);
-}
-
-/// Shorten `text` to what will fit in `w` pixels, marking it if it was cut.
-///
-/// Marked because a silently clipped reason is a different reason: "no route
-/// to host" and "no route" are not the same sentence, and the second one looks
-/// deliberate.
-fn fit_text(text: &str, w: u32, s: u32) -> String {
-    let room = chars_fitting(w, s);
-    if text.chars().count() <= room {
-        return text.to_string();
-    }
-    if room < 3 {
-        return String::new();
-    }
-    let mut out: String = text.chars().take(room - 2).collect();
-    out.push_str("..");
-    out
-}
-
-/// Draw the strip that says what happened to the link.
-///
-/// Along the bottom edge, which is not decoration: the bar lives along the top
-/// and the two must never fight over the same pixels, and the bottom is also
-/// where a full-screen session's own panel usually is not.
-fn draw_notice(dst: &mut [u32], w: u32, h: u32, s: u32, n: &Notice) -> Rect {
-    let height = notice_height(s).min(h);
-    let panel = Rect::new(0, h.saturating_sub(height), w, height);
-    blend_rect(
-        dst,
-        w,
-        h,
-        panel,
-        overlay::colour::SCRIM,
-        overlay::colour::SCRIM_ALPHA,
-    );
-    // A hairline along the top edge, the way the bar has one along its bottom:
-    // over a pale desktop the scrim alone does not read as an edge.
-    blend_rect(
-        dst,
-        w,
-        h,
-        Rect::new(panel.x, panel.y, panel.width, s),
-        overlay::colour::HAIRLINE,
-        overlay::colour::HAIRLINE_ALPHA,
-    );
-    let pad = 4 * s;
-    let avail = w.saturating_sub(2 * pad);
-    for (i, (text, colour)) in [
-        (n.headline.as_str(), n.colour),
-        (n.detail.as_str(), overlay::colour::TEXT),
-        (n.hint, overlay::colour::DIM),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let y = panel.y + 6 * s + i as u32 * 12 * s;
-        draw_text_line(dst, w, h, s, (pad, y), &fit_text(text, avail, s), *colour);
-    }
-    panel
-}
-
 impl ApplicationHandler<Wake> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gfx.is_none() {
@@ -2646,6 +2553,76 @@ impl ApplicationHandler<Wake> for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let remote_drag = self.remote_drag();
+        let mut repaint_ui = false;
+        if let Some(gfx) = &mut self.gfx {
+            let keyboard = matches!(
+                &event,
+                WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+            );
+            if keyboard && !self.ui_keyboard {
+                // Remote keystrokes must not also enter egui's Tab focus ring.
+            } else {
+                let response = gfx.gui.event(&gfx.window, &event);
+                repaint_ui = response.repaint;
+            }
+            if let WindowEvent::CursorMoved { position, .. } = &event {
+                let scale = gfx.window.scale_factor() as f32;
+                let pos = eframe::egui::pos2(position.x as f32 / scale, position.y as f32 / scale);
+                self.ui_pointer = !remote_drag
+                    && !self.bar_press
+                    && gfx
+                        .gui
+                        .ctx
+                        .layer_id_at(pos)
+                        .is_some_and(|layer| layer.order != eframe::egui::Order::Background);
+            }
+            let pointer = matches!(
+                &event,
+                WindowEvent::CursorMoved { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+            );
+            let claimed = (keyboard && self.ui_keyboard)
+                || (pointer
+                    && !remote_drag
+                    && !self.bar_press
+                    && (self.ui_pointer || self.ui_press));
+            if claimed {
+                if let WindowEvent::MouseInput { state, .. } = &event {
+                    self.ui_press = *state == ElementState::Pressed;
+                    if self.ui_press {
+                        self.ui_keyboard = true;
+                        self.release_all_keys();
+                    }
+                }
+                self.overlay.pointer_left();
+                self.pointer_on_bar = false;
+                self.restore_cursor();
+                self.request_redraw();
+                return;
+            }
+        }
+        if repaint_ui && (self.last_gui_visible || self.transfer_panel.visible() || !self.link_up())
+        {
+            self.request_redraw();
+        }
+        if matches!(
+            &event,
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            }
+        ) {
+            self.ui_keyboard = false;
+            if let Some(gfx) = &self.gfx {
+                gfx.gui.ctx.memory_mut(|memory| {
+                    if let Some(id) = memory.focused() {
+                        memory.surrender_focus(id);
+                    }
+                });
+            }
+        }
         match event {
             WindowEvent::DroppedFile(path) => self.on_dropped_file(&path),
             WindowEvent::CloseRequested => self.close(event_loop, "window closed"),
@@ -2716,6 +2693,8 @@ impl ApplicationHandler<Wake> for App {
                     // recorded as held would keep the bar down for the rest
                     // of the session.
                     self.remote_buttons = 0;
+                    self.ui_press = false;
+                    self.ui_keyboard = false;
                 }
             }
             WindowEvent::ModifiersChanged(m) => {
@@ -2726,6 +2705,7 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::CursorLeft { .. } => {
                 self.overlay.pointer_left();
                 self.pointer_on_bar = false;
+                self.ui_pointer = false;
                 if let Some(g) = &self.gfx {
                     g.window.set_cursor_visible(true);
                 }
@@ -2735,16 +2715,6 @@ impl ApplicationHandler<Wake> for App {
                 state, button: b, ..
             } => {
                 let down = state == ElementState::Pressed;
-                if self.transfer_panel.open {
-                    if down && b == MouseButton::Left && self.transfer_panel.pointer_y >= 40.0 {
-                        let row = ((self.transfer_panel.pointer_y - 40.0) / 18.0) as usize;
-                        let action = self.transfer_panel.click(row);
-                        self.transfer_action(action);
-                        self.full_redraw = true;
-                        self.request_redraw();
-                    }
-                    return;
-                }
                 // A press that started on the bar owns its release wherever
                 // that lands, or the session would see a release it never saw
                 // a press for.
@@ -2765,7 +2735,7 @@ impl ApplicationHandler<Wake> for App {
                 }
                 // A click on a dimmed window is not input for a session that
                 // cannot hear it; it is the most obvious way there is to ask
-                // for the connection back, and the notice says so.
+                // for the connection back.
                 if !self.link_up() {
                     if down && b == MouseButton::Left {
                         self.reconnect_now();
@@ -2787,14 +2757,7 @@ impl ApplicationHandler<Wake> for App {
                 self.send(&Message::PointerButton { button: btn, down });
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.transfer_panel.open {
-                    let (_, dy) = scroll_units(delta);
-                    self.transfer_panel
-                        .scroll(dy, self.client.transfer_rows().len());
-                    self.request_redraw();
-                    return;
-                }
-                if self.transfer_panel.open || self.pointer_on_bar || !self.link_up() {
+                if self.pointer_on_bar || !self.link_up() {
                     return;
                 }
                 let (dx, dy) = scroll_units(delta);
@@ -4203,6 +4166,12 @@ mod tests {
     /// end's point of view, and it is what the real server does: the second
     /// one replaces the first on a session that never stopped running.
     fn fake_session(connections: usize) -> (SocketAddr, Arc<std::sync::Mutex<Vec<Message>>>) {
+        fake_session_with_features(connections, features::LOCAL_CURSOR)
+    }
+    fn fake_session_with_features(
+        connections: usize,
+        enabled: u32,
+    ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<Message>>>) {
         use lynxrdp_proto::frame::{read_message, write_message};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4218,7 +4187,7 @@ mod tests {
                 let hello = Message::ServerHello {
                     version: lynxrdp_proto::PROTOCOL_VERSION,
                     server_name: "fake".into(),
-                    features: features::LOCAL_CURSOR,
+                    features: enabled,
                     session_id: 7,
                     username: "bob".into(),
                     width: 64,
@@ -4310,6 +4279,41 @@ mod tests {
         let addr = l.local_addr().unwrap();
         drop(l);
         addr
+    }
+
+    #[test]
+    fn dropping_files_starts_safe_uploads_without_opening_or_focusing_a_menu() {
+        let (addr, seen) =
+            fake_session_with_features(1, features::FILE_TRANSFER | features::ATOMIC_FILES);
+        let mut app = test_app(addr, None);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("report.txt");
+        std::fs::write(&file, b"report").unwrap();
+        app.on_dropped_file(&file);
+        assert_eq!(
+            app.uploads.len(),
+            1,
+            "the upload must start without a confirmation"
+        );
+        assert!(app.upload_queue.is_empty());
+        assert!(!app.transfer_panel.open);
+        assert!(!app.ui_keyboard);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, Message::TransferOptions { replace: false, .. }))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the safe transfer options never reached the server"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -4493,7 +4497,7 @@ mod tests {
         assert!(app.attempt.is_none());
         let notice = app.link_notice(now).expect("a notice");
         assert_eq!(notice.headline, "Connection lost");
-        assert!(notice.hint.contains("Ctrl+Alt+R"), "{}", notice.hint);
+        assert!(notice.hint.contains("Reconnect"), "{}", notice.hint);
         // Asking by hand puts the budget back: the user may have just plugged
         // the network in.
         app.reconnect_now();
@@ -4644,77 +4648,6 @@ mod tests {
     }
 
     // ------------------------------------------------------ the notice
-
-    #[test]
-    fn the_text_metric_matches_the_font_that_paints_it() {
-        // `chars_fitting` is the bar's arithmetic written out a second time,
-        // so it is checked against pixels the font actually painted rather
-        // than against itself.
-        for s in 1..=3u32 {
-            for n in 1..=6u32 {
-                let (w, h) = (6 * s * n, 16 * s);
-                let mut buf = vec![0u32; (w * h) as usize];
-                let text = "M".repeat(n as usize);
-                draw_text_line(&mut buf, w, h, s, (0, 0), &text, 0x00FF_FFFF);
-                let right = (0..w)
-                    .rev()
-                    .find(|&x| (0..h).any(|y| buf[(y * w + x) as usize] != 0))
-                    .expect("the font drew nothing");
-                // The advance the metric assumes: six columns per glyph, with
-                // no gap after the last one.
-                assert!(right < 6 * s * n - s, "{n} glyphs at scale {s} ran over");
-                assert_eq!(chars_fitting(w, s), n as usize);
-                assert_eq!(chars_fitting(6 * s * n - s, s), n as usize);
-            }
-        }
-    }
-
-    #[test]
-    fn a_shortened_reason_says_that_it_was_shortened() {
-        // A silently clipped reason is a different reason, and reads as if it
-        // were the whole of what happened.
-        let long = "no route to host after the network changed";
-        let cut = fit_text(long, 6 * 10, 1);
-        assert!(cut.ends_with(".."), "{cut}");
-        assert!(cut.chars().count() <= 10, "{cut}");
-        // What fits is left exactly alone.
-        assert_eq!(fit_text("short", 6 * 20, 1), "short");
-        // And a space too small for anything readable draws nothing rather
-        // than two dots on their own.
-        assert_eq!(fit_text(long, 6, 1), "");
-    }
-
-    #[test]
-    fn the_notice_stays_in_its_own_strip() {
-        // It is drawn over the last frame, and the bar owns the top edge: a
-        // notice that wandered would either cover the remote screen or fight
-        // the bar for the same pixels.
-        let (w, h) = (300u32, 200u32);
-        let mut buf = vec![0u32; (w * h) as usize];
-        let n = Notice {
-            headline: "Connection lost".into(),
-            detail: "connection closed".into(),
-            hint: "Ctrl+Alt+R",
-            colour: overlay::colour::WARN,
-        };
-        let panel = draw_notice(&mut buf, w, h, 2, &n);
-        assert_eq!(panel.bottom(), h, "the strip sits on the bottom edge");
-        assert!(panel.height <= h);
-        for y in 0..h {
-            for x in 0..w {
-                if buf[(y * w + x) as usize] != 0 {
-                    assert!(
-                        panel.contains(&Rect::new(x, y, 1, 1)),
-                        "({x},{y}) is outside {panel}"
-                    );
-                }
-            }
-        }
-        // A window shorter than the strip is covered rather than overrun.
-        let mut small = vec![0u32; (w * 10) as usize];
-        let panel = draw_notice(&mut small, w, 10, 2, &n);
-        assert_eq!(panel, Rect::new(0, 0, w, 10));
-    }
 
     #[test]
     fn dimming_leaves_the_last_frame_recognisable() {

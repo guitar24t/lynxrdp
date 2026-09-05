@@ -1680,6 +1680,7 @@ dependencies = [
  "crossbeam-channel",
  "ctrlc",
  "eframe",
+ "egui-winit",
  "env_logger",
  "flate2",
  "log",

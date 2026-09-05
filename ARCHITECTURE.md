@@ -267,3 +267,22 @@ scheme need not be a flag day.
   exercise fully: they are compiled for their targets under
   `clippy -D warnings`, and the CF_HDROP block builder is pure and unit
   tested, but pasting into a real Explorer or Finder is a manual check.
+
+### Session controls
+
+The session presents graphical controls without requiring a GPU context. The
+connection bar uses vector icons and proportional fonts. Transfer details and
+connection notices use the same egui widgets and theme as the launcher, with
+`egui-winit` handling text editing, selection, clipboard shortcuts, and IME input.
+`gui_paint` composites egui's antialiased meshes into the softbuffer presentation
+buffer; it never writes into the decoded remote framebuffer. Widget bounds,
+including shadows and antialiasing, enter the damage history before the remote
+pixels are restored, so closing or moving a panel leaves no stale pixels.
+
+Local controls capture only their own pointer gestures and keyboard focus.
+Clicking the remote desktop returns keyboard focus to it; a remote drag retains
+its release even when crossing local controls. Drops start safe uploads
+immediately. A dismissible notification replaces the former full-window transfer
+menu, and the optional details window includes progress, cancellation, download
+fields, and recent activity. Failed transfers remain visible in recent activity
+when later files in a batch finish successfully.

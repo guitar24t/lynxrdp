@@ -263,24 +263,29 @@ For a directly served session, Reconnect uses its reported listening port.
 
 ## Transfer controls
 
-Choose **Transfers** on the connection bar, or press **Ctrl+Alt+T**.
-Drop files or folders onto the window to queue uploads, review the
-existing-file choice, then choose **Start queued uploads**. To download, enter
-the remote file's full path and its local destination, then choose **Download
-file**. Fields support typing, Backspace, and pasting with Ctrl+V (Command+V on
-macOS). Tab switches fields.
+Drop files or folders onto the remote desktop to start uploading immediately.
+Clipboard text, images, and file copies synchronize automatically when enabled.
+A small, dismissible progress card shows activity without taking over the view.
+You can keep typing, clicking, and dragging in the remote desktop while files copy.
 
-The panel shows bytes transferred in both directions. Click a transfer's
-**Cancel** row to cancel it, or choose **Cancel all transfers**. Scroll to see
-additional transfers. F2/F3 select the path fields, F4 changes the overwrite
-choice, F5 starts queued uploads, F6 cancels all, and Escape closes the panel.
-Closing the panel lets transfers continue.
+Choose **Transfers** on the connection bar, or press **Ctrl+Alt+T**, for a movable,
+non-modal graphical window with per-file progress bars and **Cancel** buttons.
+**Cancel all** also clears files waiting to upload. Closing this window does not
+stop transfers. Under **Download a remote file**, enter the remote path and local
+destination using normal text fields, then click **Download**. Standard text
+selection, editing, clipboard shortcuts, and Tab navigation work in these fields.
+Click the remote desktop to return keyboard focus to it.
 
 Files are received into temporary files beside their destinations and published
-only after complete receipt. Existing files are **kept by default**: a conflicting
-transfer fails. Select **Replace after receipt** to replace them explicitly.
-Cancellation or a failed transfer preserves an existing destination; a transfer
+only after complete receipt. Automatic drops **never overwrite existing files**;
+conflicts appear as a notification. Manual downloads can explicitly **Replace an
+existing destination file**. The CLI's `--overwrite` option remains available for
+uploads and downloads. Cancellation or failure preserves existing files; a file
 already published before cancellation cannot be rolled back.
+
+The connection bar uses antialiased text, vector icons, and rounded buttons.
+Narrow windows retain icon buttons for every action. Connection loss and reconnect
+prompts use graphical dialogs with a **Reconnect now** button.
 
 ```sh
 lynxrdp send user@host report.pdf

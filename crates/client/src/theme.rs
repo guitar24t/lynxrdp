@@ -1,8 +1,8 @@
 //! Colour, type and spacing tokens for the client's windows.
 //!
 //! One module so the two windows cannot drift apart. The launcher is egui and
-//! takes [`Tokens`]; the session window owns raw `softbuffer` pixels and has no
-//! widget toolkit at all, so every colour is also published as three sRGB bytes
+//! takes [`Tokens`]; the session window composites egui into `softbuffer` pixels,
+//! so every colour is also published as three sRGB bytes
 //! ([`Palette`]) and as the `0x00RRGGBB` word a framebuffer wants ([`packed`]).
 //! Both forms are the same numbers -- a second hand-typed copy of the palette
 //! next to `blit` is exactly how the two ends of a product stop matching.
