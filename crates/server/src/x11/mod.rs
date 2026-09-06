@@ -3,6 +3,7 @@
 pub mod capture;
 pub mod clipboard;
 pub mod cursor;
+pub(crate) mod drop;
 pub mod input;
 pub mod resize;
 

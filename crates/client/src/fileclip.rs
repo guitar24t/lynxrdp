@@ -1,8 +1,7 @@
 //! Putting files on the *local* clipboard, so a file copied inside the
 //! session can be pasted into the local file manager.
 //!
-//! The opposite direction — local files into the session — is covered by
-//! dropping them onto the window, which needs no clipboard support at all.
+//! Explorer and Finder file copies are also readable for pasting into the session.
 //!
 //! `arboard` has no file-list API, so this is per-platform. Every backend
 //! offers the same thing: a list of local paths, already downloaded, that the
@@ -30,12 +29,11 @@ use anyhow::{bail, Context, Result};
 /// Whether this build can put files on the local clipboard.
 pub const SUPPORTED: bool = cfg!(any(unix, windows));
 
-/// Read an Explorer copy without changing the clipboard or deleting cut files.
-/// Other platforms continue to use drag and drop for local file uploads.
+/// Read an Explorer or Finder copy without changing the clipboard or deleting cut files.
 pub fn read_files() -> Result<Option<Vec<PathBuf>>> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     return imp::read_files();
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     Ok(None)
 }
 
@@ -447,6 +445,30 @@ mod imp {
     use objc2::runtime::ProtocolObject;
     use objc2_app_kit::{NSPasteboard, NSPasteboardWriting};
     use objc2_foundation::{NSArray, NSString, NSURL};
+
+    pub fn read_files() -> Result<Option<Vec<PathBuf>>> {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let Some(items) = pasteboard.pasteboardItems() else {
+            return Ok(None);
+        };
+        let file_url = NSString::from_str("public.file-url");
+        let mut paths = Vec::new();
+        for index in 0..items.count() {
+            let item = items.objectAtIndex(index);
+            if let Some(value) = item.stringForType(&file_url) {
+                let url = NSURL::URLWithString(&value)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid clipboard file URL"))?;
+                if !url.isFileURL() {
+                    bail!("Clipboard item is not a local file");
+                }
+                let path = url
+                    .path()
+                    .ok_or_else(|| anyhow::anyhow!("Clipboard file URL has no path"))?;
+                paths.push(PathBuf::from(path.to_string()));
+            }
+        }
+        Ok((!paths.is_empty()).then_some(paths))
+    }
 
     pub fn write_files(paths: &[PathBuf]) -> Result<()> {
         // Finder pastes file URLs, so that is what goes on the pasteboard.

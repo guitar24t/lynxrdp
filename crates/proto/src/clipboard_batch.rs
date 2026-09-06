@@ -150,6 +150,21 @@ impl ClipBatch {
         }
     }
 
+    /// Build a batch with caller-validated destinations, preserving directory trees.
+    pub fn with_paths(dir: PathBuf, files: Vec<(String, PathBuf)>) -> Self {
+        let count = files.len();
+        Self {
+            dir,
+            queued: files
+                .into_iter()
+                .enumerate()
+                .map(|(slot, (remote, dest))| (remote, dest, slot))
+                .collect(),
+            live: HashMap::new(),
+            slots: vec![None; count],
+        }
+    }
+
     /// Where this batch is staged.
     pub fn dir(&self) -> &Path {
         &self.dir

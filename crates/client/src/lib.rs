@@ -18,6 +18,7 @@ pub mod clipchange;
 pub mod connection;
 pub mod console;
 pub mod fileclip;
+mod filedrop;
 pub mod icon;
 pub mod imageclip;
 pub mod keymap;

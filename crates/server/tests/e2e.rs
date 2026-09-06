@@ -1375,3 +1375,173 @@ fn session_management_lists_without_takeover_and_checks_the_start_token() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// A native file receiver decides the final folder. Exercise the complete
+/// network pull, staging, XDND negotiation and URI selection conversion.
+#[test]
+fn targeted_drops_reach_the_receiver_under_the_pointer() {
+    require_xvfb!();
+    use x11rb::{
+        connection::Connection,
+        protocol::{
+            xproto::{
+                self, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode,
+                WindowClass,
+            },
+            Event,
+        },
+        wrapper::ConnectionExt as _,
+    };
+    let session = Session::start(320, 240, "none", &[]);
+    let mut client = session.connect(None);
+    let sink = KeySink::open(&session);
+    let conn = &sink.conn;
+    let root = conn.setup().roots[0].root;
+    let other = conn.generate_id().unwrap();
+    conn.create_window(
+        x11rb::COPY_DEPTH_FROM_PARENT,
+        other,
+        root,
+        200,
+        0,
+        120,
+        100,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        0,
+        &CreateWindowAux::new(),
+    )
+    .unwrap();
+    conn.map_window(other).unwrap();
+    let atom = |name: &str| {
+        conn.intern_atom(false, name.as_bytes())
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom
+    };
+    let aware = atom("XdndAware");
+    let position = atom("XdndPosition");
+    let status = atom("XdndStatus");
+    let drop_atom = atom("XdndDrop");
+    let finished = atom("XdndFinished");
+    let selection = atom("XdndSelection");
+    let uri = atom("text/uri-list");
+    let copy = atom("XdndActionCopy");
+    let property = atom("TEST_DROP_FILES");
+    for window in [sink.window, other] {
+        conn.change_property32(PropMode::REPLACE, window, aware, AtomEnum::ATOM, &[5])
+            .unwrap();
+    }
+    conn.get_input_focus().unwrap().reply().unwrap(); // server processed window setup
+    let sources = tempfile::tempdir().unwrap();
+    let source = sources.path().join("source.txt");
+    std::fs::write(&source, b"targeted contents").unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    for (index, x, target, accept) in [
+        (0, 250, other, true),
+        (1, 40, sink.window, true),
+        (2, 250, other, false),
+    ] {
+        let folder = destination.path().join(format!("destination-{index}"));
+        std::fs::create_dir(&folder).unwrap();
+        let id = client
+            .drop_files(&[(source.clone(), "Folder/nested.txt".into())], x, 40)
+            .unwrap();
+        let mut source_window = 0;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(ClientEvent::FileDropResult {
+                id: received,
+                ok,
+                reason,
+            }) = client.poll_event(Duration::from_millis(5)).unwrap()
+            {
+                assert_eq!(received, id);
+                assert_eq!(ok, accept, "{reason}");
+                break;
+            }
+            while let Some(event) = conn.poll_for_event().unwrap() {
+                match event {
+                    Event::ClientMessage(e) if e.type_ == position => {
+                        assert_eq!(e.window, target, "drop reached the wrong folder window");
+                        let data = e.data.as_data32();
+                        assert_eq!(data[2], (u32::from(x) << 16) | 40);
+                        assert_eq!(data[4], copy);
+                        source_window = data[0];
+                        conn.send_event(
+                            false,
+                            source_window,
+                            EventMask::NO_EVENT,
+                            xproto::ClientMessageEvent::new(
+                                32,
+                                source_window,
+                                status,
+                                [
+                                    target,
+                                    u32::from(accept),
+                                    0,
+                                    0,
+                                    if accept { copy } else { 0 },
+                                ],
+                            ),
+                        )
+                        .unwrap();
+                    }
+                    Event::ClientMessage(e) if e.type_ == drop_atom => {
+                        assert!(accept);
+                        assert_eq!(e.window, target);
+                        conn.convert_selection(
+                            target,
+                            selection,
+                            uri,
+                            property,
+                            e.data.as_data32()[2],
+                        )
+                        .unwrap();
+                    }
+                    Event::SelectionNotify(e) if e.selection == selection => {
+                        assert_ne!(e.property, 0);
+                        let data = conn
+                            .get_property(true, target, property, uri, 0, 100_000)
+                            .unwrap()
+                            .reply()
+                            .unwrap();
+                        let paths = lynxrdp_proto::urilist::parse(
+                            std::str::from_utf8(&data.value).unwrap(),
+                        );
+                        assert_eq!(paths.len(), 1);
+                        assert!(paths[0].ends_with("Folder"));
+                        let file = paths[0].join("nested.txt");
+                        assert_eq!(std::fs::read(&file).unwrap(), b"targeted contents");
+                        std::fs::copy(file, folder.join("nested.txt")).unwrap();
+                        conn.send_event(
+                            false,
+                            source_window,
+                            EventMask::NO_EVENT,
+                            xproto::ClientMessageEvent::new(
+                                32,
+                                source_window,
+                                finished,
+                                [target, 1, copy, 0, 0],
+                            ),
+                        )
+                        .unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            conn.flush().unwrap();
+            assert!(Instant::now() < deadline, "native drop never completed");
+        }
+        assert_eq!(folder.join("nested.txt").exists(), accept);
+    }
+    assert!(
+        std::fs::read_dir(session.upload_dir.path())
+            .unwrap()
+            .next()
+            .is_none(),
+        "targeted drops must never fall back to Downloads"
+    );
+    assert_eq!(std::fs::read(source).unwrap(), b"targeted contents");
+}

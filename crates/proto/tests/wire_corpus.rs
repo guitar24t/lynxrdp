@@ -416,6 +416,26 @@ fn samples() -> Vec<(&'static str, Message)> {
             },
         ),
         (
+            "FileDrop/nested",
+            Message::FileDrop {
+                id: 42,
+                x: 123,
+                y: 234,
+                files: vec![FileEntry {
+                    path: "42/folder/file.txt".into(),
+                    size: 456,
+                }],
+            },
+        ),
+        (
+            "FileDropResult/rejected",
+            Message::FileDropResult {
+                id: 42,
+                ok: false,
+                reason: "Target rejected drop".into(),
+            },
+        ),
+        (
             "ClipboardOffer/all-formats",
             Message::ClipboardOffer {
                 formats: clipboard_format::TEXT | clipboard_format::PNG | clipboard_format::FILES,

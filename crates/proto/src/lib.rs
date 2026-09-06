@@ -38,7 +38,7 @@ pub mod wire;
 /// the one that moves only for a change an older peer cannot survive, and the
 /// two are not the same event: adding an optional message raises this constant
 /// alone, which costs nobody a session.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Oldest peer version this build will still hold a session with.
 ///

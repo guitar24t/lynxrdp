@@ -339,6 +339,9 @@ pub struct App {
     gfx: Option<Gfx>,
     cursor: Option<CursorImage>,
     pointer: Option<(u32, u32)>,
+    pending_drop: Vec<(PathBuf, String)>,
+    drop_target: Option<(u16, u16)>,
+    drop_deadline: Option<Instant>,
     modifiers: ModifiersState,
     focused: bool,
     last_resize_event: Option<Instant>,
@@ -499,6 +502,9 @@ impl App {
             gfx: None,
             cursor,
             pointer: None,
+            pending_drop: Vec::new(),
+            drop_target: None,
+            drop_deadline: None,
             modifiers: ModifiersState::empty(),
             focused: false,
             last_resize_event: None,
@@ -1112,6 +1118,10 @@ impl App {
                         self.finish_upload(id);
                         self.on_clipboard_file(id, None);
                     }
+                    ClientEvent::FileDropResult { reason, .. } => {
+                        self.transfer_panel.notify(reason);
+                        self.request_redraw();
+                    }
                     ClientEvent::Notice(text) => {
                         log::info!("server: {text}");
                         self.transfer_panel.notify(text);
@@ -1201,6 +1211,9 @@ impl App {
         }
         self.uploads.clear();
         self.upload_queue.clear();
+        self.pending_drop.clear();
+        self.drop_target = None;
+        self.drop_deadline = None;
         self.upload_done = 0;
         if self.clipboard_batch.take().is_some() {
             log::warn!("a clipboard file copy was abandoned with the link");
@@ -1449,6 +1462,9 @@ impl App {
     }
 
     fn housekeeping(&mut self) {
+        if self.drop_deadline.is_some_and(|d| Instant::now() >= d) {
+            self.flush_drop();
+        }
         if self
             .gfx
             .as_ref()
@@ -1615,7 +1631,11 @@ impl App {
                 self.transfer_panel.notify("Cancellation requested".into());
             }
             Action::CancelAll => {
+                self.client.clear_drop_files();
                 self.upload_queue.clear();
+                self.pending_drop.clear();
+                self.drop_target = None;
+                self.drop_deadline = None;
                 self.uploads.clear();
                 self.clipboard_batch = None;
                 for (id, _) in self.client.transfer_rows() {
@@ -1708,14 +1728,9 @@ impl App {
 
     /// Upload a file or directory dropped onto the window.
     ///
-    /// The drop is queued, not started. `MAX_DROPPED_FILES` bounds the walk of
-    /// one dropped *path*, and a drop of five folders arrives as five separate
-    /// `DroppedFile` events -- so the bound that mattered was never applied to
-    /// what the user actually dropped. The budget below is checked against
-    /// everything already outstanding, and a path that does not fit is refused
-    /// whole: uploading the first two hundred files of a folder and silently
-    /// dropping the rest produces a directory in the session that looks
-    /// complete and is not.
+    /// Snapshot the native pointer before walking the source tree. Coalesce
+    /// per-file OS events into a bounded selection, then offer a native drop.
+    /// Refuse a folder whole if it exceeds the remaining selection budget.
     fn on_dropped_file(&mut self, path: &std::path::Path) {
         if !self.link_up() {
             log::warn!("the link is down; ignoring dropped file");
@@ -1730,6 +1745,38 @@ impl App {
                 .notify("This server has file transfers disabled.".into());
             self.request_redraw();
             return;
+        }
+        if self.client.info().features & features::TARGETED_DROPS == 0 {
+            self.transfer_panel.notify("Update the server to drop files into a selected folder. You can also copy files and paste them into the remote folder.".into());
+            self.request_redraw();
+            return;
+        }
+        let drop_position = self
+            .gfx
+            .as_ref()
+            .and_then(|g| crate::filedrop::position(&g.window))
+            .and_then(|p| {
+                let (w, h) = self.client.size();
+                let x = p.x / f64::from(self.scale);
+                let y = p.y / f64::from(self.scale);
+                (x >= 0.0 && y >= 0.0 && x < f64::from(w) && y < f64::from(h))
+                    .then_some((x as u32, y as u32))
+            });
+        #[cfg(test)]
+        let drop_position = if self.gfx.is_none() {
+            self.pointer
+        } else {
+            drop_position
+        };
+        let Some((x, y)) = drop_position else {
+            self.transfer_panel
+                .notify("Move the pointer over the destination folder and drop again.".into());
+            self.request_redraw();
+            return;
+        };
+        let target = (x.min(u16::MAX as u32) as u16, y.min(u16::MAX as u32) as u16);
+        if self.drop_target.is_some_and(|old| old != target) {
+            self.flush_drop();
         }
         let files = match collect_dropped_files(path) {
             Ok(f) => f,
@@ -1748,7 +1795,7 @@ impl App {
             self.request_redraw();
             return;
         }
-        let outstanding = self.uploads.len() + self.upload_queue.len();
+        let outstanding = self.pending_drop.len();
         if outstanding + files.len() > MAX_PENDING_UPLOADS {
             self.transfer_panel.notify("Too many files in progress. Please drop these files again after the current transfers finish.".into());
             self.request_redraw();
@@ -1761,13 +1808,41 @@ impl App {
             );
             return;
         }
-        log::info!("queued {} file(s) from {}", files.len(), path.display());
-        self.upload_queue.extend(files);
-        self.transfer_panel.notify(format!(
-            "Sending files to {}",
-            self.client.info().server_name
-        ));
-        self.pump_uploads();
+        let mut taken = self
+            .pending_drop
+            .iter()
+            .map(|(_, name)| name.split('/').next().unwrap().to_lowercase())
+            .collect();
+        let root = files[0].1.split('/').next().unwrap();
+        let unique = lynxrdp_proto::clipboard_batch::unique_name(&mut taken, root);
+        let root_len = root.len();
+        self.pending_drop.extend(
+            files
+                .into_iter()
+                .map(|(local, name)| (local, format!("{unique}{}", &name[root_len..]))),
+        );
+        self.drop_target = Some(target);
+        self.drop_deadline = Some(Instant::now() + Duration::from_millis(75));
+        self.request_redraw();
+    }
+
+    fn flush_drop(&mut self) {
+        self.drop_deadline = None;
+        let files = std::mem::take(&mut self.pending_drop);
+        let Some((x, y)) = self.drop_target.take() else {
+            return;
+        };
+        if files.is_empty() || !self.link_up() {
+            return;
+        }
+        match self.client.drop_files(&files, x, y) {
+            Ok(_) => self
+                .transfer_panel
+                .notify("Preparing files for the selected location...".into()),
+            Err(e) => self
+                .transfer_panel
+                .notify(format!("Could not drop files: {e:#}")),
+        }
         self.request_redraw();
     }
 
@@ -4470,18 +4545,26 @@ mod tests {
     }
 
     #[test]
-    fn dropping_files_starts_safe_uploads_without_opening_or_focusing_a_menu() {
-        let (addr, seen) =
-            fake_session_with_features(1, features::FILE_TRANSFER | features::ATOMIC_FILES);
+    fn dropping_files_targets_the_pointer_without_opening_or_focusing_a_menu() {
+        let (addr, seen) = fake_session_with_features(
+            1,
+            features::FILE_TRANSFER | features::ATOMIC_FILES | features::TARGETED_DROPS,
+        );
         let mut app = test_app(addr, None);
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("report.txt");
         std::fs::write(&file, b"report").unwrap();
+        app.pointer = Some((23, 31));
         app.on_dropped_file(&file);
-        assert_eq!(
-            app.uploads.len(),
-            1,
-            "the upload must start without a confirmation"
+        let second_dir = tempfile::tempdir().unwrap();
+        let second = second_dir.path().join("report.txt");
+        std::fs::write(&second, b"second report").unwrap();
+        app.on_dropped_file(&second);
+        assert_eq!(app.pending_drop.len(), 2);
+        app.flush_drop();
+        assert!(
+            app.uploads.is_empty(),
+            "native drops must not become Downloads uploads"
         );
         assert!(app.upload_queue.is_empty());
         assert!(!app.transfer_panel.open);
@@ -4492,16 +4575,29 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|m| matches!(m, Message::TransferOptions { replace: false, .. }))
+                .any(|m| matches!(m, Message::FileDrop { x: 23, y: 31, files, .. } if files.len() == 2 && files[0].path.ends_with("/report.txt") && files[1].path.ends_with("/report (2).txt")))
             {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "the safe transfer options never reached the server"
+                "the targeted drop never reached the server"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn old_servers_do_not_silently_redirect_drops_to_downloads() {
+        let (addr, _) = fake_session_with_features(1, features::FILE_TRANSFER);
+        let mut app = test_app(addr, None);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("report.txt");
+        std::fs::write(&file, b"report").unwrap();
+        app.pointer = Some((23, 31));
+        app.on_dropped_file(&file);
+        assert!(app.pending_drop.is_empty());
+        assert!(app.uploads.is_empty() && app.upload_queue.is_empty());
     }
 
     #[test]

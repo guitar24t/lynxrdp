@@ -268,7 +268,7 @@ For a directly served session, Reconnect uses its reported listening port.
 
 ## Transfer controls
 
-Drop files or folders onto the remote desktop to start uploading immediately.
+Drop files or folders onto the intended remote folder or desktop to copy them there.
 Clipboard text, images, and file copies synchronize automatically when enabled.
 A small, dismissible progress card shows activity without taking over the view.
 You can keep typing, clicking, and dragging in the remote desktop while files copy.
@@ -283,7 +283,8 @@ clipboard copy takes priority over a remote download that is still finishing.
 
 File clipboard transfers copy the originals; they do not move or delete them.
 Folder clipboard copies are not supported yet: drag folders into the session
-to upload them. On macOS and Linux clients, use drag and drop for local files too.
+to copy them. Finder file copies on macOS are supported too; paste in the remote
+file manager after the ready notification. Linux clients can drag local files.
 Unreadable files and unsupported selections show a notification instead of
 silently omitting part of a copy.
 
@@ -296,9 +297,14 @@ selection, editing, clipboard shortcuts, and Tab navigation work in these fields
 Click the remote desktop to return keyboard focus to it.
 
 Files are received into temporary files beside their destinations and published
-only after complete receipt. Automatic drops **never overwrite existing files**;
-conflicts appear as a notification. Manual downloads can explicitly **Replace an
-existing destination file**. The CLI's `--overwrite` option remains available for
+only after complete receipt. With an updated client and server, drop files onto
+a remote file manager folder, folder icon, or desktop to copy them there. The
+receiving application chooses the destination and handles name conflicts using
+its normal graphical controls. Unsupported targets show a notification; files
+are never silently redirected to Downloads. Keep the destination open while the
+files transfer. Older servers require an update for targeted drops.
+
+Manual downloads can explicitly **Replace an existing destination file**. The CLI's `--overwrite` option remains available for
 uploads and downloads. Cancellation or failure preserves existing files; a file
 already published before cancellation cannot be rolled back.
 

@@ -58,7 +58,8 @@ impl Default for ConnectOptions {
                 | features::CLIPBOARD_IMAGE
                 | features::FILE_TRANSFER
                 | features::CLIPBOARD_FILES
-                | features::ATOMIC_FILES,
+                | features::ATOMIC_FILES
+                | features::TARGETED_DROPS,
             timeout: Duration::from_secs(15),
             client_name: crate::CLIENT_NAME.to_string(),
         }
@@ -140,6 +141,11 @@ pub enum ClientEvent {
     Rtt(Duration),
     /// The connection ended.
     Disconnected(String),
+    FileDropResult {
+        id: u64,
+        ok: bool,
+        reason: String,
+    },
 }
 
 /// What every rejection string says, and the only place it is written down.
@@ -287,6 +293,7 @@ pub struct Client {
     /// Files this client offered on the clipboard, by the path it advertised.
     /// The session may only read files that appear here.
     offered_files: HashMap<String, PathBuf>,
+    offered_drops: HashMap<u64, HashMap<String, PathBuf>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -441,6 +448,7 @@ impl Client {
             replacements: Default::default(),
             pending_image: None,
             offered_files: HashMap::new(),
+            offered_drops: HashMap::new(),
         })
     }
 
@@ -588,6 +596,52 @@ impl Client {
         self.send(&Message::ClipboardOffer {
             formats: clipboard_format::FILES,
         })
+    }
+
+    /// Revoke sources from pending drops (used by Cancel all).
+    pub fn clear_drop_files(&mut self) {
+        self.offered_drops.clear();
+    }
+
+    /// Offer a complete native drop. Only explicitly selected sources are readable.
+    pub fn drop_files(&mut self, files: &[(PathBuf, String)], x: u16, y: u16) -> Result<u64> {
+        anyhow::ensure!(
+            self.info.features & features::TARGETED_DROPS != 0,
+            "update the server to drop files into a chosen folder"
+        );
+        anyhow::ensure!(
+            self.offered_drops.len() < 4,
+            "four drops are already in progress; wait for one to finish"
+        );
+        anyhow::ensure!(
+            !files.is_empty() && files.len() <= lynxrdp_proto::transfer::MAX_FILE_LIST,
+            "invalid drop size"
+        );
+        let id = self.transfers.next_id();
+        let mut offered = HashMap::new();
+        let mut entries = Vec::new();
+        for (local, name) in files {
+            let meta =
+                std::fs::metadata(local).with_context(|| format!("reading {}", local.display()))?;
+            anyhow::ensure!(meta.is_file(), "{} is not a regular file", local.display());
+            let key = format!("{id}/{name}");
+            anyhow::ensure!(
+                offered.insert(key.clone(), local.clone()).is_none(),
+                "duplicate drop destination {name}"
+            );
+            entries.push(lynxrdp_proto::FileEntry {
+                path: key,
+                size: meta.len(),
+            });
+        }
+        self.send(&Message::FileDrop {
+            id,
+            x,
+            y,
+            files: entries,
+        })?;
+        self.offered_drops.insert(id, offered);
+        Ok(id)
     }
 
     /// Revoke access to files from a clipboard selection that was replaced.
@@ -926,10 +980,23 @@ impl Client {
             Message::CursorPosition { x, y } => Some(ClientEvent::CursorPosition(x, y)),
             Message::ClipboardText { text } => Some(ClientEvent::Clipboard(text)),
             Message::FileList { files, .. } => Some(ClientEvent::ClipboardFiles(files)),
+            Message::FileDropResult { id, ok, reason } => self
+                .offered_drops
+                .remove(&id)
+                .map(|_| ClientEvent::FileDropResult { id, ok, reason }),
             Message::FileRequest { id, path } => {
                 // Serve only what this client put on the clipboard: the
                 // session must not be able to read arbitrary local files.
-                match self.offered_files.get(&path).cloned() {
+                match self
+                    .offered_files
+                    .get(&path)
+                    .or_else(|| {
+                        self.offered_drops
+                            .values()
+                            .find_map(|files| files.get(&path))
+                    })
+                    .cloned()
+                {
                     Some(local) => match std::fs::File::open(&local)
                         .and_then(|f| f.metadata().map(|m| (f, m.len())))
                     {

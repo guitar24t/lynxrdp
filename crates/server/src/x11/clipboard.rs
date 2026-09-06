@@ -490,7 +490,7 @@ impl Clipboard {
             format,
             incr: false,
             buf: Vec::new(),
-            tried_string: target == AtomEnum::STRING.into(),
+            tried_string: target == u32::from(AtomEnum::STRING),
             deadline: Instant::now() + FETCH_TIMEOUT,
         });
         Ok(())
@@ -838,7 +838,7 @@ impl Clipboard {
             )?;
             return Ok(true);
         }
-        if e.target == AtomEnum::STRING.into() {
+        if e.target == u32::from(AtomEnum::STRING) {
             let latin1: Vec<u8> = text
                 .chars()
                 .map(|c| if (c as u32) < 256 { c as u8 } else { b'?' })

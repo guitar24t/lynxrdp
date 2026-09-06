@@ -101,6 +101,8 @@ pub mod features {
     pub const CLIPBOARD_FILES: u32 = 1 << 5;
     /// Atomic uploads with an explicit per-transfer replacement choice.
     pub const ATOMIC_FILES: u32 = 1 << 6;
+    /// Native file drops onto the remote application under the pointer.
+    pub const TARGETED_DROPS: u32 = 1 << 7;
 }
 
 /// Clipboard content types, as a bitmask in [`super::Message::ClipboardOffer`].
@@ -204,6 +206,10 @@ pub enum Kind {
     ClipboardRequest = 72,
     /// [`Message::TransferOptions`] (negotiated extension).
     TransferOptions = 129,
+    /// [`Message::FileDrop`] (negotiated extension).
+    FileDrop = 130,
+    /// [`Message::FileDropResult`] (negotiated extension).
+    FileDropResult = 131,
 }
 
 impl Kind {
@@ -239,6 +245,8 @@ impl Kind {
             71 => Kind::ClipboardOffer,
             72 => Kind::ClipboardRequest,
             129 => Kind::TransferOptions,
+            130 => Kind::FileDrop,
+            131 => Kind::FileDropResult,
             // Unknown extensions are skipped by framing; known ones reach
             // this decoder so malformed payloads are still rejected.
             other => return Err(DecodeError::InvalidTag(u32::from(other))),
@@ -481,6 +489,27 @@ pub enum Message {
         /// The files.
         files: Vec<FileEntry>,
     },
+    /// Stage files and deliver a native copy drop to the application at (x,y).
+    /// Paths are batch-scoped relative names, not arbitrary local source paths.
+    FileDrop {
+        /// Batch identifier, independent of individual transfer identifiers.
+        id: u64,
+        /// Drop position in remote desktop pixels.
+        x: u16,
+        /// Drop position in remote desktop pixels.
+        y: u16,
+        /// Sources identified by batch-prefixed relative paths.
+        files: Vec<FileEntry>,
+    },
+    /// The receiving application accepted the drop, or an actionable failure.
+    FileDropResult {
+        /// Batch being completed or rejected.
+        id: u64,
+        /// Whether the native target accepted the copy.
+        ok: bool,
+        /// Human-readable result.
+        reason: String,
+    },
     /// Announce which clipboard formats are now available. Large formats
     /// are not sent until the peer asks with [`Message::ClipboardRequest`].
     ClipboardOffer {
@@ -544,6 +573,8 @@ impl Message {
             Message::FileRequest { .. } => Kind::FileRequest,
             Message::TransferOptions { .. } => Kind::TransferOptions,
             Message::FileList { .. } => Kind::FileList,
+            Message::FileDrop { .. } => Kind::FileDrop,
+            Message::FileDropResult { .. } => Kind::FileDropResult,
             Message::ClipboardOffer { .. } => Kind::ClipboardOffer,
             Message::ClipboardRequest { .. } => Kind::ClipboardRequest,
         }
@@ -725,6 +756,21 @@ impl Message {
                     w.string(&f.path);
                     w.u64(f.size);
                 }
+            }
+            Message::FileDrop { id, x, y, files } => {
+                w.u64(*id);
+                w.u16(*x);
+                w.u16(*y);
+                w.u32(files.len() as u32);
+                for f in files {
+                    w.string(&f.path);
+                    w.u64(f.size);
+                }
+            }
+            Message::FileDropResult { id, ok, reason } => {
+                w.u64(*id);
+                w.bool(*ok);
+                w.string(reason);
             }
             Message::ClipboardOffer { formats } => w.u32(*formats),
             Message::ClipboardRequest { format } => w.u32(*format),
@@ -972,6 +1018,34 @@ impl Message {
                 }
                 Message::FileList { id, files }
             }
+            Kind::FileDrop => {
+                let id = r.u64()?;
+                let x = r.u16()?;
+                let y = r.u16()?;
+                let n = r.u32()? as usize;
+                if n > MAX_FILE_LIST {
+                    return Err(DecodeError::LengthTooLarge(n));
+                }
+                if n.saturating_mul(12) > r.remaining() {
+                    return Err(DecodeError::UnexpectedEof {
+                        needed: n * 12,
+                        remaining: r.remaining(),
+                    });
+                }
+                let mut files = Vec::with_capacity(n);
+                for _ in 0..n {
+                    files.push(FileEntry {
+                        path: r.string()?,
+                        size: r.u64()?,
+                    });
+                }
+                Message::FileDrop { id, x, y, files }
+            }
+            Kind::FileDropResult => Message::FileDropResult {
+                id: r.u64()?,
+                ok: r.bool()?,
+                reason: r.string()?,
+            },
             Kind::ClipboardOffer => Message::ClipboardOffer { formats: r.u32()? },
             Kind::ClipboardRequest => Message::ClipboardRequest { format: r.u32()? },
         };
@@ -1118,6 +1192,20 @@ mod tests {
                         size: u64::MAX / 2,
                     },
                 ],
+            },
+            Message::FileDrop {
+                id: 42,
+                x: 120,
+                y: 240,
+                files: vec![FileEntry {
+                    path: "42/folder/file.txt".into(),
+                    size: 19,
+                }],
+            },
+            Message::FileDropResult {
+                id: 42,
+                ok: true,
+                reason: "Copied".into(),
             },
             Message::ClipboardOffer {
                 formats: clipboard_format::TEXT | clipboard_format::PNG,

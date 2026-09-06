@@ -91,7 +91,8 @@ const SUPPORTED_FEATURES: u32 = features::LOCAL_CURSOR
     | features::CLIPBOARD_IMAGE
     | features::FILE_TRANSFER
     | features::CLIPBOARD_FILES
-    | features::ATOMIC_FILES;
+    | features::ATOMIC_FILES
+    | features::TARGETED_DROPS;
 
 struct Client {
     generation: u64,
@@ -239,6 +240,7 @@ pub struct Core {
     /// Where the client's clipboard files are staged before being offered
     /// to the session.
     staging_dir: tempfile::TempDir,
+    drops: Option<super::drop::Drops>,
     /// Downloads in flight while staging: transfer id to destination.
     staging_downloads: std::collections::HashMap<u64, PathBuf>,
     /// Files staged so far in the current batch.
@@ -337,6 +339,9 @@ impl Core {
             .prefix("lynxrdp-clip-")
             .tempdir()
             .context("creating private clipboard staging")?;
+        let drops = super::drop::Drops::new(display.clone(), staging_dir.path().join("drops"))
+            .map_err(|e| log::warn!("native drops unavailable: {e:#}"))
+            .ok();
         let fileio =
             FileIo::spawn(events_tx.clone()).context("starting the session file worker")?;
         log::info!(
@@ -376,6 +381,7 @@ impl Core {
             upload_dir,
             client_formats: 0,
             staging_dir,
+            drops,
             staging_downloads: std::collections::HashMap::new(),
             staging_batch: None,
             upload_options: None,
@@ -513,6 +519,10 @@ impl Core {
     }
 
     fn handle_x_event(&mut self, ev: Event) -> Result<()> {
+        if let Some(drops) = &mut self.drops {
+            let replies = drops.event(&ev);
+            self.send_to_client(replies);
+        }
         match &ev {
             Event::DamageNotify(_) => {
                 self.damage.mark_dirty();
@@ -712,6 +722,9 @@ impl Core {
     }
 
     fn settle_clipboard_file(&mut self, id: u64, success: bool) {
+        if let Some(drops) = &mut self.drops {
+            drops.settle(id, success);
+        }
         let path = self.staging_downloads.remove(&id);
         if let Some(batch) = self.staging_batch.as_mut() {
             batch.resolve(id, path.filter(|_| success));
@@ -855,7 +868,12 @@ impl Core {
         let mut policy = SessionTransferPolicy {
             replace,
             upload_dir: self.upload_dir.clone(),
-            staging: self.staging_downloads.clone(),
+            staging: self
+                .staging_downloads
+                .clone()
+                .into_iter()
+                .chain(self.drops.iter().flat_map(|d| d.staging.clone()))
+                .collect(),
             fileio: self.fileio.clone(),
         };
         let Some(outcome) = self.transfers.handle(msg, &mut policy) else {
@@ -887,6 +905,10 @@ impl Core {
             }
         }
         self.pump_clipboard_batch();
+        if let Some(drops) = &mut self.drops {
+            let replies = drops.pump(&mut self.transfers);
+            self.send_to_client(replies);
+        }
     }
 
     fn on_transfer_complete(&mut self, done: Completed) -> Result<()> {
@@ -1055,6 +1077,9 @@ impl Core {
         self.transfers.clear();
         self.upload_options = None;
         self.staging_downloads.clear();
+        if let Some(drops) = &mut self.drops {
+            drops.reset();
+        }
         self.staging_batch = None;
         self.last_client_seen = Instant::now();
         Ok(())
@@ -1218,6 +1243,23 @@ impl Core {
             }
             Message::FileRequest { id, path } => self.on_file_request(id, &path),
             Message::FileList { files, .. } => self.stage_client_files(files),
+            Message::FileDrop { id, x, y, files } => {
+                if self
+                    .client
+                    .as_ref()
+                    .is_some_and(|c| c.features & features::TARGETED_DROPS != 0)
+                {
+                    if let Some(drops) = &mut self.drops {
+                        if let Err(e) = drops.begin(id, x, y, files) {
+                            self.send_to_client(vec![Message::FileDropResult {
+                                id,
+                                ok: false,
+                                reason: e.to_string(),
+                            }]);
+                        }
+                    }
+                }
+            }
             Message::RefreshRequest => self.force_full_refresh(),
             Message::Disconnect { reason } => {
                 log::info!("client requested disconnect: {reason}");
@@ -1263,7 +1305,13 @@ impl Core {
             );
         }
         let agreed = agreed_version(version);
-        let features = want & SUPPORTED_FEATURES;
+        let features = want
+            & SUPPORTED_FEATURES
+            & if self.drops.is_some() {
+                u32::MAX
+            } else {
+                !features::TARGETED_DROPS
+            };
         // Apply the requested size (or the default) before the first frame.
         // Compared against the real root, not the size we serve: when the two
         // differ the root is oversized and a client asking for something we

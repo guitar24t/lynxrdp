@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod desktop;
+mod drop;
 pub mod engine;
 pub mod fileio;
 pub mod listener;
