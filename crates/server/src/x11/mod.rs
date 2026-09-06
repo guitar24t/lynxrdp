@@ -4,6 +4,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod cursor;
 pub(crate) mod drop;
+mod empty_drop;
 pub mod input;
 pub mod resize;
 

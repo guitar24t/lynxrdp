@@ -640,12 +640,9 @@ impl Core {
                 }
                 log::debug!("clipboard: offering {} file(s) to the client", files.len());
                 let id = self.transfers.next_id();
-                self.send_to_client(vec![
-                    Message::FileList { id, files },
-                    Message::ClipboardOffer {
-                        formats: clipboard_format::FILES,
-                    },
-                ]);
+                // This answers ClipboardRequest. Advertising FILES again here
+                // would trigger another request and restart the client's batch.
+                self.send_to_client(vec![Message::FileList { id, files }]);
             }
             ClipboardEvent::Unavailable(format) => {
                 log::debug!("clipboard format {format:#x} turned out to be unavailable");

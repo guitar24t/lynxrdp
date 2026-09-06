@@ -145,6 +145,7 @@ pub struct Clipboard {
     queue: VecDeque<u32>,
     /// Formats the current session-side owner advertised.
     available: u32,
+    file_target: Option<xproto::Atom>,
     /// Last text reported upwards, to suppress echoes.
     last_text: Option<String>,
     /// Timestamp of the selection we are reading from.
@@ -206,6 +207,7 @@ impl Clipboard {
             fetch: None,
             queue: VecDeque::new(),
             available: 0,
+            file_target: None,
             last_text: None,
             owner_time: x11rb::CURRENT_TIME,
         })
@@ -253,6 +255,11 @@ impl Clipboard {
     }
 
     fn acquire(&mut self) -> Result<()> {
+        // Conversions addressed to the previous owner must not read back our
+        // newly staged clipboard and echo it to the client.
+        self.cancel_all();
+        self.available = 0;
+        self.file_target = None;
         let conn = self.display.conn();
         conn.set_selection_owner(self.window, self.atoms.clipboard, x11rb::CURRENT_TIME)?
             .check()?;
@@ -291,7 +298,7 @@ impl Clipboard {
     /// arrive in the same drain of its message channel, and the second used to
     /// be discarded with a debug line and no reply at all.
     pub fn request_format(&mut self, format: u32) -> Result<()> {
-        if self.available & format == 0 {
+        if self.owns_selection() || self.available & format == 0 {
             return Ok(());
         }
         let Some(target) = self.target_for(format) else {
@@ -320,7 +327,7 @@ impl Clipboard {
     fn target_for(&self, format: u32) -> Option<xproto::Atom> {
         match format {
             f if f == clipboard_format::PNG => Some(self.atoms.png),
-            f if f == clipboard_format::FILES => Some(self.atoms.uri_list),
+            f if f == clipboard_format::FILES => self.file_target,
             f if f == clipboard_format::TEXT => Some(self.atoms.utf8_string),
             _ => None,
         }
@@ -431,7 +438,9 @@ impl Clipboard {
                 }
                 self.owned_text = None;
                 self.owned_png = None;
+                self.owned_files = None;
                 self.available = 0;
+                self.file_target = None;
                 // Anything in flight or queued was addressed to the previous
                 // owner and its format list. That owner has gone and will never
                 // answer, and the formats were indexes into a list that no
@@ -577,13 +586,22 @@ impl Clipboard {
         if has(self.atoms.png) {
             formats |= clipboard_format::PNG;
         }
-        if has(self.atoms.uri_list) || has(self.atoms.gnome_copied) {
+        self.file_target = if has(self.atoms.uri_list) {
+            Some(self.atoms.uri_list)
+        } else if has(self.atoms.gnome_copied) {
+            Some(self.atoms.gnome_copied)
+        } else {
+            None
+        };
+        if self.file_target.is_some() {
             formats |= clipboard_format::FILES;
         }
         self.available = formats;
         let mut events = vec![ClipboardEvent::Formats(formats)];
         // Text is small enough to be worth having before the user pastes.
-        if formats & clipboard_format::TEXT != 0 {
+        // File managers also advertise the names as text. Sending that text
+        // separately replaces the native file clipboard during staging.
+        if formats & clipboard_format::TEXT != 0 && formats & clipboard_format::FILES == 0 {
             self.request(self.atoms.utf8_string, clipboard_format::TEXT, time)?;
         } else if formats == 0 {
             events.clear();

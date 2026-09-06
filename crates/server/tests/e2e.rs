@@ -42,10 +42,20 @@ struct Session {
 
 impl Session {
     fn start(width: u32, height: u32, startwm: &str, extra: &[&str]) -> Self {
+        Self::start_with_env(width, height, startwm, extra, &[])
+    }
+    fn start_with_env(
+        width: u32,
+        height: u32,
+        startwm: &str,
+        extra: &[&str],
+        env: &[(&str, &std::path::Path)],
+    ) -> Self {
         let port = free_port();
         let runtime_dir = tempfile::tempdir().unwrap();
         let upload_dir = tempfile::tempdir().unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_lynxrdp-session"));
+        cmd.envs(env.iter().copied());
         cmd.arg("--listen")
             .arg(format!("127.0.0.1:{port}"))
             .arg("--width")
@@ -1036,6 +1046,15 @@ fn clipboard_files_from_the_client_are_staged_for_the_session() {
 
 #[test]
 fn clipboard_files_copied_in_the_session_are_offered_to_the_client() {
+    clipboard_files_round_trip("text/uri-list");
+}
+
+#[test]
+fn clipboard_gnome_files_round_trip_without_echoing() {
+    clipboard_files_round_trip("x-special/gnome-copied-files");
+}
+
+fn clipboard_files_round_trip(target: &str) {
     require_xvfb!();
     if skip_unless(have("xclip"), "xclip not installed") {
         return;
@@ -1044,13 +1063,18 @@ fn clipboard_files_copied_in_the_session_are_offered_to_the_client() {
     let f = dir.path().join("shared.txt");
     std::fs::write(&f, b"from the session").unwrap();
     let list = lynxrdp_proto::urilist::build(std::slice::from_ref(&f));
+    let list = if target == "x-special/gnome-copied-files" {
+        format!("copy\n{list}")
+    } else {
+        list
+    };
 
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
 
     // xclip owns the selection, offering a uri-list, for as long as it runs.
     let mut owner = Command::new("xclip")
-        .args(["-selection", "clipboard", "-t", "text/uri-list", "-i"])
+        .args(["-selection", "clipboard", "-t", target, "-i"])
         .env("DISPLAY", &s.display)
         .env("XAUTHORITY", s.xauth())
         .stdin(Stdio::piped())
@@ -1073,13 +1097,56 @@ fn clipboard_files_copied_in_the_session_are_offered_to_the_client() {
             got = Some(files);
         }
     }
-    let _ = owner.kill();
-    let _ = owner.wait();
-
     let files = got.expect("client never received the file list");
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, f.to_string_lossy());
     assert_eq!(files[0].size, b"from the session".len() as u64);
+    let destination = dir.path().join("downloaded.txt");
+    let id = c.request_file(&files[0].path, destination.clone()).unwrap();
+    let mut downloaded = false;
+    // Keep polling after completion: the old offer/request feedback loop
+    // repeatedly delivered the same list, resetting a viewer's staging batch.
+    let settle = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < settle || !downloaded {
+        match c.poll_event(Duration::from_millis(100)).unwrap() {
+            Some(ClientEvent::ClipboardFiles(_)) => panic!("one copy was offered repeatedly"),
+            Some(ClientEvent::FileDownloaded { id: done, .. }) if done == id => downloaded = true,
+            Some(ClientEvent::TransferFailed { reason, .. }) => panic!("{reason}"),
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "clipboard download never completed"
+        );
+    }
+    assert_eq!(std::fs::read(&destination).unwrap(), b"from the session");
+
+    // Reverse direction on the same connection after a remote copy. A late
+    // request for the old owner must not fetch our own staged files back.
+    c.offer_clipboard_files(&[destination]).unwrap();
+    let mut ready = false;
+    let settle = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < settle || !ready {
+        match c.poll_event(Duration::from_millis(100)).unwrap() {
+            Some(ClientEvent::ClipboardFiles(_)) => panic!("local files echoed back to the client"),
+            Some(ClientEvent::Notice(text)) => ready |= text.contains("copied file(s) ready"),
+            Some(ClientEvent::TransferFailed { reason, .. }) => panic!("{reason}"),
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reverse clipboard copy never completed"
+        );
+    }
+    let out = s.x(
+        "xclip",
+        &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
+    );
+    let paths = lynxrdp_proto::urilist::parse(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(paths.len(), 1);
+    assert_eq!(std::fs::read(&paths[0]).unwrap(), b"from the session");
+    let _ = owner.kill();
+    let _ = owner.wait();
 }
 
 #[test]
@@ -1544,4 +1611,200 @@ fn targeted_drops_reach_the_receiver_under_the_pointer() {
         "targeted drops must never fall back to Downloads"
     );
     assert_eq!(std::fs::read(source).unwrap(), b"targeted contents");
+}
+
+#[test]
+fn targeted_drop_waits_for_gtk_file_inspection() {
+    require_xvfb!();
+    let gtk = Command::new("python3")
+        .args([
+            "-c",
+            "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk",
+        ])
+        .status()
+        .is_ok_and(|s| s.success());
+    if skip_unless(gtk, "Python GTK 3 introspection not installed") {
+        return;
+    }
+    let session = Session::start(320, 240, "none", &[]);
+    let mut client = session.connect(None);
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let file = source.path().join("gtk-copy.txt");
+    std::fs::write(&file, b"asynchronous native copy").unwrap();
+    let mut receiver = Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/gtk_drop_receiver.py"
+        ))
+        .arg(destination.path())
+        .env("DISPLAY", &session.display)
+        .env("XAUTHORITY", session.xauth())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    struct Stop(Child);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut output = BufReader::new(receiver.stdout.take().unwrap());
+    let _receiver = Stop(receiver);
+    let mut ready = String::new();
+    output.read_line(&mut ready).unwrap();
+    assert_eq!(ready.trim(), "READY");
+    let id = client
+        .drop_files(&[(file, "gtk-copy.txt".into())], 100, 100)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(ClientEvent::FileDropResult {
+            id: got,
+            ok,
+            reason,
+        }) = client.poll_event(Duration::from_millis(10)).unwrap()
+        {
+            assert_eq!(got, id);
+            assert!(ok, "{reason}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "GTK drop did not complete");
+    }
+    assert_eq!(
+        std::fs::read(destination.path().join("gtk-copy.txt")).unwrap(),
+        b"asynchronous native copy"
+    );
+    assert!(std::fs::read_dir(session.upload_dir.path())
+        .unwrap()
+        .next()
+        .is_none());
+}
+
+#[test]
+fn targeted_drop_to_bare_desktop_uses_xdg_folder_and_excludes_windows_and_panel() {
+    require_xvfb!();
+    if skip_unless(have("xdg-user-dir"), "xdg-user-dir not installed") {
+        return;
+    }
+    use x11rb::{
+        connection::Connection,
+        protocol::xproto::{
+            AtomEnum, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux, PropMode, StackMode,
+            WindowClass,
+        },
+        wrapper::ConnectionExt as _,
+    };
+    let home = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let desktop = home.path().join("CustomDesktop");
+    std::fs::write(
+        config.path().join("user-dirs.dirs"),
+        format!("XDG_DESKTOP_DIR=\"{}\"\n", desktop.display()),
+    )
+    .unwrap();
+    let session = Session::start_with_env(
+        320,
+        240,
+        "none",
+        &[],
+        &[("HOME", home.path()), ("XDG_CONFIG_HOME", config.path())],
+    );
+    let mut client = session.connect(None);
+    let sink = KeySink::open(&session);
+    let conn = &sink.conn;
+    let root = conn.setup().roots[0].root;
+    let atom = |s: &str| {
+        conn.intern_atom(false, s.as_bytes())
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom
+    };
+    let guard = conn.generate_id().unwrap();
+    conn.create_window(
+        0,
+        guard,
+        root,
+        0,
+        0,
+        320,
+        240,
+        0,
+        WindowClass::INPUT_ONLY,
+        0,
+        &CreateWindowAux::new(),
+    )
+    .unwrap();
+    conn.change_property8(
+        PropMode::REPLACE,
+        guard,
+        AtomEnum::WM_NAME,
+        AtomEnum::STRING,
+        b"mutter guard window",
+    )
+    .unwrap();
+    conn.change_property8(
+        PropMode::REPLACE,
+        sink.window,
+        atom("_NET_WM_NAME"),
+        atom("UTF8_STRING"),
+        b"GNOME Shell",
+    )
+    .unwrap();
+    conn.change_property32(
+        PropMode::REPLACE,
+        root,
+        atom("_NET_SUPPORTING_WM_CHECK"),
+        AtomEnum::WINDOW,
+        &[sink.window],
+    )
+    .unwrap();
+    conn.change_property32(
+        PropMode::REPLACE,
+        root,
+        atom("_NET_WORKAREA"),
+        AtomEnum::CARDINAL,
+        &[0, 24, 320, 216],
+    )
+    .unwrap();
+    conn.map_window(guard).unwrap();
+    conn.configure_window(
+        guard,
+        &ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
+    )
+    .unwrap();
+    conn.get_input_focus().unwrap().reply().unwrap();
+    let source = home.path().join("source.txt");
+    std::fs::write(&source, b"desktop copy").unwrap();
+    for (x, y, accepted) in [(250, 180, true), (250, 5, false), (50, 50, false)] {
+        let id = client
+            .drop_files(&[(source.clone(), format!("file-{x}-{y}.txt"))], x, y)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(ClientEvent::FileDropResult {
+                id: got,
+                ok,
+                reason,
+            }) = client.poll_event(Duration::from_millis(10)).unwrap()
+            {
+                assert_eq!(got, id);
+                assert_eq!(ok, accepted, "{reason}");
+                break;
+            }
+            assert!(Instant::now() < deadline);
+        }
+        assert_eq!(desktop.join(format!("file-{x}-{y}.txt")).exists(), accepted);
+    }
+    assert_eq!(
+        std::fs::read(desktop.join("file-250-180.txt")).unwrap(),
+        b"desktop copy"
+    );
+    assert!(std::fs::read_dir(session.upload_dir.path())
+        .unwrap()
+        .next()
+        .is_none());
 }

@@ -17,6 +17,7 @@ pub struct Panel {
     seen_message: String,
     toast_until: Option<Instant>,
     dismissed: bool,
+    had_active: bool,
     history: std::collections::VecDeque<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,12 +34,30 @@ pub struct Transfer {
     pub progress: Option<(u64, u64)>,
 }
 impl Panel {
-    pub fn notify(&mut self, message: String) {
-        self.message = message.clone();
+    /// Keep routine activity in the manually opened details, without a toast.
+    pub fn record(&mut self, message: String) {
         self.history.push_front(message);
         self.history.truncate(20);
+    }
+
+    pub fn server_notice(&mut self, message: String) {
+        // Existing servers send readiness as an untyped Notice. Keep this
+        // compatibility check narrow so partial failures still reach the user.
+        if message
+            .strip_suffix(" copied file(s) ready. Paste into a folder in the remote session.")
+            .is_some_and(|count| count.parse::<usize>().is_ok())
+        {
+            self.record(message);
+        } else {
+            self.notify(message);
+        }
+    }
+
+    pub fn notify(&mut self, message: String) {
+        self.message = message.clone();
+        self.record(message);
         self.dismissed = false;
-        self.toast_until = Some(Instant::now() + Duration::from_secs(8));
+        self.toast_until = Some(Instant::now() + Duration::from_secs(4));
     }
 
     pub fn destination(&self) -> Result<PathBuf, String> {
@@ -52,10 +71,22 @@ impl Panel {
     }
     pub fn show(&mut self, ctx: &egui::Context, queued: usize, active: &[Transfer]) -> Vec<Action> {
         let mut actions = Vec::new();
-        if self.message != self.seen_message {
+        let active_now = !active.is_empty() || queued != 0;
+        let changed_message = self.message != self.seen_message;
+        if self.had_active && !active_now && !changed_message {
+            // Clear a preparation message as soon as its transfer finishes.
+            self.toast_until = None;
+        }
+        self.had_active = active_now;
+        if changed_message {
             self.seen_message = self.message.clone();
-            self.toast_until = Some(Instant::now() + Duration::from_secs(8));
+            self.toast_until = Some(Instant::now() + Duration::from_secs(4));
             self.dismissed = false;
+        }
+        if let Some(until) = self.toast_until.filter(|_| !self.dismissed) {
+            if until > Instant::now() {
+                ctx.request_repaint_after(until.saturating_duration_since(Instant::now()));
+            }
         }
         let available = ctx.screen_rect().size();
         let width = 410.0f32.min((available.x - 40.0).max(160.0));
@@ -182,46 +213,47 @@ impl Panel {
             egui::Area::new(egui::Id::new("transfer_notification"))
                 .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0])
                 .order(egui::Order::Foreground)
+                .interactable(false)
                 .show(ctx, |ui| {
-                    egui::Frame::window(ui.style()).show(ui, |ui| {
-                        ui.set_width(width.min(320.0));
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(if active.is_empty() && queued == 0 {
-                                    "File transfers".to_owned()
-                                } else {
-                                    format!("Copying {} files", active.len() + queued)
-                                })
-                                .strong(),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.small_button("Dismiss").clicked() {
-                                        self.dismissed = true;
-                                    }
-                                },
-                            );
-                        });
-                        if let Some(item) = active.first() {
-                            ui.add(egui::Label::new(&item.name).truncate());
-                            if let Some((done, total)) = item.progress {
+                    egui::Frame::group(ui.style())
+                        .fill(ui.visuals().panel_fill)
+                        .corner_radius(10.0)
+                        .inner_margin(12.0)
+                        .show(ui, |ui| {
+                            ui.set_width(width.min(300.0));
+                            if !active.is_empty() || queued != 0 {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(format!("Copying {} file(s)", active.len() + queued));
+                                });
+                                if let Some(item) = active.first() {
+                                    ui.add(egui::Label::new(&item.name).truncate());
+                                }
+                                let (done, total) = active.iter().filter_map(|t| t.progress).fold(
+                                    (0u64, 0u64),
+                                    |(d, t), (next_d, next_t)| {
+                                        (d.saturating_add(next_d), t.saturating_add(next_t))
+                                    },
+                                );
+                                let preparing = active.iter().any(|t| t.progress.is_none());
                                 ui.add(
                                     egui::ProgressBar::new(if total == 0 {
                                         0.0
                                     } else {
-                                        done as f32 / total as f32
+                                        (done as f32 / total as f32).clamp(0.0, 1.0)
                                     })
-                                    .show_percentage(),
+                                    .animate(preparing)
+                                    .text(if preparing {
+                                        "Preparing files...".into()
+                                    } else {
+                                        format!("{} of {}", bytes(done), bytes(total))
+                                    }),
                                 );
+                                ctx.request_repaint_after(Duration::from_millis(100));
+                            } else if !self.message.is_empty() {
+                                ui.add(egui::Label::new(&self.message).wrap());
                             }
-                        } else if !self.message.is_empty() {
-                            ui.add(egui::Label::new(&self.message).wrap());
-                        }
-                        if ui.button("View transfers").clicked() {
-                            self.open = true;
-                        }
-                    });
+                        });
                 });
         }
         actions
@@ -380,6 +412,57 @@ mod tests {
         assert!(!panel.replace);
         assert!(panel.visible());
         assert!(panel.destination().is_err());
+    }
+    #[test]
+    fn automatic_progress_and_errors_disappear_without_opening_details() {
+        let ctx = egui::Context::default();
+        let mut panel = Panel::default();
+        panel.notify("Preparing copied files".into());
+        let active = [Transfer {
+            id: 1,
+            name: "report.pdf".into(),
+            progress: Some((10, 100)),
+        }];
+        frame(&ctx, &mut panel, vec![], &active);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &active);
+        text_position(&output, "report.pdf");
+        assert!(!panel.open);
+        frame(&ctx, &mut panel, vec![], &[]);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &[]);
+        assert!(output.shapes.is_empty());
+        panel.notify("Transfer failed: disk full".into());
+        frame(&ctx, &mut panel, vec![], &[]);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &[]);
+        text_position(&output, "Transfer failed: disk full");
+        assert!(!panel.open);
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT].repaint_delay <= Duration::from_secs(4)
+        );
+        panel.toast_until = Some(Instant::now() - Duration::from_secs(1));
+        frame(&ctx, &mut panel, vec![], &[]);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &[]);
+        assert!(output.shapes.is_empty());
+    }
+    #[test]
+    fn clipboard_success_is_silent_but_partial_failures_are_visible() {
+        let ctx = egui::Context::default();
+        let mut panel = Panel::default();
+        panel.record("Files copied".into());
+        panel.server_notice(
+            "2 copied file(s) ready. Paste into a folder in the remote session.".into(),
+        );
+        frame(&ctx, &mut panel, vec![], &[]);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &[]);
+        assert!(output.shapes.is_empty());
+        assert!(!panel.visible());
+        assert_eq!(panel.history.len(), 2);
+        panel.server_notice(
+            "Only 1 of 2 copied files are ready to paste. Copy the missing files again to retry."
+                .into(),
+        );
+        frame(&ctx, &mut panel, vec![], &[]);
+        assert!(panel.visible());
+        assert!(!panel.open);
     }
     fn frame(
         ctx: &egui::Context,

@@ -39,7 +39,7 @@ jobs:
         # is the only test that exercises the transport the product ships over.
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q xvfb xterm xfonts-base xdotool xclip x11-utils x11-xserver-utils libxkbcommon-x11-0 libxkbcommon0 openssh-server openssh-client
+          sudo apt-get install -y -q xvfb xterm xfonts-base xdotool xclip python3-gi gir1.2-gtk-3.0 xdg-user-dirs x11-utils x11-xserver-utils libxkbcommon-x11-0 libxkbcommon0 openssh-server openssh-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets

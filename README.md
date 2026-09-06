@@ -270,21 +270,22 @@ For a directly served session, Reconnect uses its reported listening port.
 
 Drop files or folders onto the intended remote folder or desktop to copy them there.
 Clipboard text, images, and file copies synchronize automatically when enabled.
-A small, dismissible progress card shows activity without taking over the view.
+A compact progress bar appears while files copy and disappears afterward.
+Successful copies are silent; error messages disappear automatically after four seconds.
+The detailed transfer window opens only when you choose **Transfers**.
 You can keep typing, clicking, and dragging in the remote desktop while files copy.
 
 On Windows, select files in Explorer and press **Ctrl+C**, then switch to the
 remote session. LynxRDP prepares the files automatically; paste them into the
 remote file manager with **Ctrl+V**. There is no transfer menu to open. For larger
-copies, wait for the **ready to paste** notification before pasting (the remote
-readiness notification requires an updated server). Copying files in the remote
+copies, wait for the progress bar to disappear before pasting. Copying files in the remote
 file manager similarly prepares them for pasting into Explorer. A newer local
 clipboard copy takes priority over a remote download that is still finishing.
 
 File clipboard transfers copy the originals; they do not move or delete them.
 Folder clipboard copies are not supported yet: drag folders into the session
 to copy them. Finder file copies on macOS are supported too; paste in the remote
-file manager after the ready notification. Linux clients can drag local files.
+file manager after the transfer finishes. Linux clients can drag local files.
 Unreadable files and unsupported selections show a notification instead of
 silently omitting part of a copy.
 
@@ -303,6 +304,13 @@ receiving application chooses the destination and handles name conflicts using
 its normal graphical controls. Unsupported targets show a notification; files
 are never silently redirected to Downloads. Keep the destination open while the
 files transfer. Older servers require an update for targeted drops.
+On GNOME desktops without an icon handler, dropping on the background copies to
+the configured Desktop folder. Existing names receive a numbered suffix. Panels
+and unrelated application windows are excluded. Nautilus and other GTK file
+managers may inspect the file list before accepting the drop; LynxRDP waits for
+that negotiation. On affected Nautilus versions, an accessibility-assisted retry
+avoids the non-droppable empty-folder illustration while remaining inside the
+same empty file pane. It never redirects drops from the sidebar or toolbar.
 
 Manual downloads can explicitly **Replace an existing destination file**. The CLI's `--overwrite` option remains available for
 uploads and downloads. Cancellation or failure preserves existing files; a file

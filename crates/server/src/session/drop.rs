@@ -23,6 +23,7 @@ struct Job {
 }
 pub(super) struct Drops {
     source: DropSource,
+    desktop: Option<super::desktop_drop::Delivery>,
     jobs: VecDeque<Job>,
     pub staging: HashMap<u64, PathBuf>,
     root: PathBuf,
@@ -32,6 +33,7 @@ impl Drops {
     pub fn new(display: Arc<XDisplay>, root: PathBuf) -> Result<Self> {
         Ok(Self {
             source: DropSource::new(display)?,
+            desktop: None,
             jobs: VecDeque::new(),
             staging: HashMap::new(),
             root,
@@ -39,7 +41,9 @@ impl Drops {
         })
     }
     pub fn begin(&mut self, id: u64, x: u16, y: u16, files: Vec<FileEntry>) -> Result<()> {
-        if self.jobs.len() + usize::from(self.source.busy()) >= 4 {
+        if self.jobs.len() + usize::from(self.source.busy()) + usize::from(self.desktop.is_some())
+            >= 4
+        {
             bail!("Please wait for the current drops to finish.");
         }
         let target = self.source.target(x, y)?;
@@ -75,6 +79,28 @@ impl Drops {
     }
     pub fn pump(&mut self, transfers: &mut TransferManager) -> Vec<Message> {
         let mut out: Vec<_> = self.source.poll().into_iter().map(result_message).collect();
+        if let Some(delivery) = &self.desktop {
+            let result = match delivery.result.try_recv() {
+                Ok(result) => Some(result),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    Some(Err(anyhow::anyhow!("Desktop copy worker stopped")))
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                out.push(Message::FileDropResult {
+                    id: delivery.id,
+                    ok: result.is_ok(),
+                    reason: match result {
+                        Ok(()) => "Files copied to your Desktop folder.".into(),
+                        Err(e) => format!(
+                            "Desktop copy failed: {e:#}. Check the Desktop folder before retrying."
+                        ),
+                    },
+                });
+                self.desktop = None;
+            }
+        }
         // One batch at a time bounds disk/network work regardless of selection size.
         if let Some(job) = self.jobs.front_mut() {
             while let Some((path, dest, slot)) = job.batch.next_request() {
@@ -85,12 +111,22 @@ impl Drops {
                 out.push(Message::FileRequest { id, path });
             }
         }
-        if !self.source.busy() && self.jobs.front().is_some_and(|j| j.batch.done()) {
+        if !self.source.busy()
+            && self.desktop.is_none()
+            && self.jobs.front().is_some_and(|j| j.batch.done())
+        {
             let job = self.jobs.pop_front().unwrap();
             let total = job.batch.total();
             let complete = job.batch.into_files().len() == total;
             let result = if complete {
-                self.source.start(job.id, job.target, &job.roots)
+                if job.target.desktop {
+                    self.source.validate(job.target).and_then(|()| {
+                        self.desktop = Some(super::desktop_drop::start(job.id, job.roots)?);
+                        Ok(())
+                    })
+                } else {
+                    self.source.start(job.id, job.target, &job.roots)
+                }
             } else {
                 Err(anyhow::anyhow!(
                     "Some files could not be received. The drop was cancelled; please retry."
@@ -108,6 +144,7 @@ impl Drops {
         out
     }
     pub fn reset(&mut self) {
+        self.desktop = None;
         self.source.cancel();
         self.jobs.clear();
         self.staging.clear();

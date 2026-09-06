@@ -1098,12 +1098,12 @@ impl App {
                     ClientEvent::ClipboardFiles(files) => self.on_remote_files(files),
                     ClientEvent::FileDownloaded { id, path, name } => {
                         self.transfer_panel
-                            .notify(format!("Downloaded {name} to {}", path.display()));
+                            .record(format!("Downloaded {name} to {}", path.display()));
                         log::info!("downloaded {name} to {}", path.display());
                         self.on_clipboard_file(id, Some(path));
                     }
                     ClientEvent::FileUploaded { id, name } => {
-                        self.transfer_panel.notify(format!("Uploaded {name}"));
+                        self.transfer_panel.record(format!("Uploaded {name}"));
                         log::info!("uploaded {name}");
                         self.finish_upload(id);
                     }
@@ -1118,13 +1118,17 @@ impl App {
                         self.finish_upload(id);
                         self.on_clipboard_file(id, None);
                     }
-                    ClientEvent::FileDropResult { reason, .. } => {
-                        self.transfer_panel.notify(reason);
+                    ClientEvent::FileDropResult { ok, reason, .. } => {
+                        if ok {
+                            self.transfer_panel.record(reason);
+                        } else {
+                            self.transfer_panel.notify(reason);
+                        }
                         self.request_redraw();
                     }
                     ClientEvent::Notice(text) => {
                         log::info!("server: {text}");
-                        self.transfer_panel.notify(text);
+                        self.transfer_panel.server_notice(text);
                         self.request_redraw();
                     }
                     ClientEvent::Rtt(rtt) => self.rtt = Some(rtt),
@@ -1475,6 +1479,7 @@ impl App {
         if self.transfer_panel.visible()
             || self.last_gui_visible
             || !self.uploads.is_empty()
+            || !self.client.transfer_details().is_empty()
             || self.transfer_panel.message != self.last_gui_message
         {
             self.request_redraw();
@@ -1906,7 +1911,7 @@ impl App {
             dir.display()
         );
         self.clipboard_batch_revision = crate::clipchange::change_counter();
-        self.transfer_panel.notify(format!(
+        self.transfer_panel.record(format!(
             "Preparing {} file(s) to paste on this computer…",
             files.len()
         ));
@@ -1998,11 +2003,12 @@ impl App {
                 Ok(()) => {
                     self.last_file_revision = crate::clipchange::change_counter();
                     self.clipboard_has_files = true;
-                    self.transfer_panel.notify(if files.len() == asked {
-                        format!("{} file(s) ready. Paste into a folder on this computer.", files.len())
+                    if files.len() == asked {
+                        self.transfer_panel
+                            .record(format!("{} files copied to this computer", files.len()));
                     } else {
-                        format!("Only {} of {asked} files are ready to paste. Copy the missing files again to retry.", files.len())
-                    });
+                        self.transfer_panel.notify(format!("Only {} of {asked} files are ready to paste. Copy the missing files again to retry.", files.len()));
+                    }
                 }
                 Err(e) => {
                     // The files are still on disk, so say where rather than
@@ -2150,7 +2156,7 @@ impl App {
                 self.last_file_revision = revision;
                 self.clipboard_has_files = true;
                 match self.client.offer_clipboard_files(&paths) {
-                    Ok(()) => self.transfer_panel.notify(format!(
+                    Ok(()) => self.transfer_panel.record(format!(
                         "Preparing {} copied file(s) in the remote session…",
                         paths.len()
                     )),
