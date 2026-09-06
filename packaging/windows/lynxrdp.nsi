@@ -50,8 +50,10 @@ VIAddVersionKey "LegalCopyright" "MIT licensed"
 !define MUI_ABORTWARNING
 !define MUI_ICON "..\..\assets\lynxrdp.ico"
 !define MUI_UNICON "..\..\assets\lynxrdp.ico"
-!define MUI_FINISHPAGE_RUN "$INSTDIR\lynxrdp.exe"
-!define MUI_FINISHPAGE_RUN_TEXT "Open ${APPNAME}"
+; Launching from this elevated installer also elevates the launcher and its
+; session processes. Explorer cannot drop files into those windows. Let the
+; user's normal desktop launch the app instead of inheriting our admin token.
+!define MUI_FINISHPAGE_TEXT "${APPNAME} is installed.$\r$\n$\r$\nClose this installer, then open ${APPNAME} from the Start menu or its installation folder. Run the client normally so files can be dragged into your remote sessions."
 
 !insertmacro MUI_PAGE_LICENSE "..\..\LICENSE"
 !insertmacro MUI_PAGE_COMPONENTS

@@ -2199,6 +2199,11 @@ impl Launcher {
                                         )
                                         .wrap(),
                                     );
+                                    if found.asset.name.ends_with("-setup.exe") {
+                                        ui.add(egui::Label::new(
+                                            "Windows will request administrator permission for the installer only. Cancelling keeps LynxRDP open. After installation, reopen LynxRDP from Start."
+                                        ).wrap());
+                                    }
                                 }
                             }
                             if !found.notes_url.is_empty() {

@@ -493,18 +493,21 @@ pub fn keep_installer(archive: &Path, name: &str) -> Result<PathBuf> {
 
 /// Start the installer and leave it to the user.
 ///
-/// Not silent, on purpose. The installer's manifest asks for administrator,
-/// so Windows raises a UAC prompt naming an unknown publisher -- exactly what
-/// the README warns about -- and a user who is about to be asked that should
-/// be looking at a window that explains itself, not answering a prompt that
-/// appeared from nothing. Its finish page offers to start LynxRDP again,
-/// which is the restart.
+/// Only the installer is elevated; the client keeps its normal desktop token.
+/// A failed launch or cancelled UAC prompt leaves the client running.
 pub fn run_installer(path: &Path) -> Result<()> {
-    std::process::Command::new(path)
-        .spawn()
-        .with_context(|| format!("starting {}", path.display()))?;
-    Ok(())
+    #[cfg(windows)]
+    return installer_launch::run(path);
+    #[cfg(not(windows))]
+    bail!(
+        "Windows installers cannot be launched on this platform: {}",
+        path.display()
+    );
 }
+
+#[cfg(windows)]
+#[path = "installer_launch.rs"]
+mod installer_launch;
 
 #[cfg(test)]
 mod tests {

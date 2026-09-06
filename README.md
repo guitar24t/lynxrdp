@@ -159,9 +159,14 @@ What happens then depends on how the client was installed:
 | Installed as | Update |
 | --- | --- |
 | Archive, or Windows installer in a folder you can write | Replaced in place. Restart to use it. |
-| Windows installer in `Program Files` | Downloads `setup.exe` and runs it — Windows asks for administrator, and the installer's last page offers to reopen LynxRDP. |
+| Windows installer in `Program Files` | Downloads `setup.exe` and runs it — Windows asks for administrator. After installation, reopen LynxRDP normally from Start. |
 | macOS `LynxRDP.app` | The whole bundle is replaced. Because your machine did the download rather than a browser, Gatekeeper does not re-quarantine it and you are not asked to allow it a second time. |
 | `.deb` / `.rpm` | **Not** replaced. The package manager owns those files, so the window says so and points you at `apt` or `dnf`. |
+
+Run LynxRDP normally, including when checking for or downloading updates.
+On Windows, only installing into a protected folder requests administrator
+permission. Cancelling that prompt leaves the client open. After installation,
+open LynxRDP from Start so sessions can accept file drops from Explorer.
 
 Release candidates are offered to anyone already running one, and only to
 them; **Help → Include Prereleases** overrides that either way. A client
@@ -298,6 +303,19 @@ clients refuse uploads without overwrite consent to older servers that cannot
 guarantee safe file delivery; update the server to enable atomic uploads.
 Explicit `--overwrite` permits the older server's existing upload behavior.
 Downloads are staged atomically by the updated client regardless of server version.
+
+### A file drop shows a prohibited cursor on Windows
+
+Close all LynxRDP session windows and the launcher, then reopen the client normally
+from Start or its installation folder. Do not use **Run as administrator**.
+Versions through v0.1.0-rc.8 offer **Open LynxRDP** at the end of installation;
+that launches the client with the installer's administrator privileges, which
+can block file drops from a normal Explorer window. Restarting from Start avoids
+that inherited elevation. New installers finish without starting the client.
+
+Drag local files or folders from Explorer into the remote session to upload them.
+Dragging a remote file out of the session is not currently supported; copy it in
+the remote file manager and paste it locally, or use **Transfers** to download it.
 
 ## Running without the daemon ("user mode")
 

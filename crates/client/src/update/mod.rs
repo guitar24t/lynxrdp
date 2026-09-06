@@ -413,9 +413,9 @@ pub fn plan_for(exe: &Path, os: &str, tagged: bool, writable: bool) -> Result<Pl
         "windows" if writable => Ok(Plan::WindowsExe {
             target: exe.to_path_buf(),
         }),
-        // Program Files, which is where the installer puts it. We cannot
-        // elevate, but the installer's own manifest asks for administrator,
-        // so handing the job to it is the whole answer -- and it keeps the
+        // Program Files, which is where the installer puts it. Request
+        // elevation only for the installer through the Windows shell.
+        // Handing the job to it also keeps the
         // uninstall entry and the Start Menu shortcut correct, which a file
         // swap would not.
         "windows" => Ok(Plan::WindowsInstaller),
@@ -1244,6 +1244,27 @@ not a checksum line
             total: Some(2),
         });
         assert_eq!(*u.state(), State::Installed);
+    }
+
+    #[test]
+    fn installer_cancellation_keeps_the_updater_available_for_retry() {
+        let mut u = Updater {
+            state: State::Downloading {
+                done: 2,
+                total: Some(2),
+            },
+            ..Default::default()
+        };
+        u.apply(Event::Done(Err("Installation cancelled".into())));
+        assert_eq!(*u.state(), State::Failed("Installation cancelled".into()));
+        assert!(!u.busy());
+        u.apply(Event::Progress {
+            done: 2,
+            total: Some(2),
+        });
+        assert_eq!(*u.state(), State::Failed("Installation cancelled".into()));
+        u.apply(Event::Checked(Ok(None)));
+        assert_eq!(*u.state(), State::UpToDate);
     }
 
     #[test]
