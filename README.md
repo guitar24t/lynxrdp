@@ -305,6 +305,15 @@ already published before cancellation cannot be rolled back.
 The connection bar uses antialiased text, vector icons, and rounded buttons.
 Narrow windows retain icon buttons for every action. Connection loss and reconnect
 prompts use graphical dialogs with a **Reconnect now** button.
+Logging out of the remote desktop automatically closes its viewer window.
+Temporary connection failures keep the viewer open so it can reconnect.
+
+On macOS, the connection manager, session viewers, and SSH prompts belong to one
+application with one Dock icon. **Cmd+`** cycles windows; **Cmd+Shift+`** cycles
+backward. **Cmd+W** closes the current window and **Cmd+Q** quits the application.
+Closing the manager while viewers are open keeps those viewers running; cycling
+windows brings the manager back. Quitting disconnects viewers without logging
+out of the remote desktops. The manager shows live connecting and session counts.
 
 ```sh
 lynxrdp send user@host report.pdf

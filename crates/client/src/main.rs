@@ -2,7 +2,8 @@
 //!
 //! Started with no arguments it opens the connection manager; with a
 //! destination it opens a session directly. Both are the same binary, and the
-//! launcher starts sessions by re-invoking it.
+//! macOS owns manager and viewer windows in one process. Other platforms
+//! launch viewers by re-invoking this binary.
 
 // Built for the Windows GUI subsystem so that opening the launcher from
 // Explorer does not flash up a console. The command line keeps working:

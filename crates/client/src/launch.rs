@@ -1,6 +1,6 @@
 //! Starting a session from the launcher.
 //!
-//! The launcher runs its own winit event loop through eframe, and a session
+//! On Windows and Linux, the launcher runs a winit loop through eframe, and a session
 //! window needs one too. A process may only have one, so a session runs as a
 //! child process: this binary, invoked again with the profile's arguments.
 //!
@@ -8,6 +8,9 @@
 //! be open at once, a session that crashes cannot take the launcher with it,
 //! and the arguments a profile produces are exactly the ones a user could
 //! have typed, so the two entry points cannot drift apart.
+//!
+//! On macOS, Sessions queues profiles for the shared application host instead.
+//! The host reports pending and active window counts as connections settle.
 //!
 //! The price of the split is that everything a session has to say about a
 //! failed connection -- "Permission denied (publickey)", "Host key
@@ -103,6 +106,10 @@ impl SessionFailure {
 #[derive(Debug, Default)]
 pub struct Sessions {
     running: Vec<Session>,
+    /// The macOS application creates viewer windows in its own event loop.
+    shared: Option<Vec<Profile>>,
+    shared_active: usize,
+    shared_connecting: usize,
     /// Failures noticed by [`Self::reap`] and not yet shown.
     ///
     /// Buffered rather than returned because `reap` runs more than once per
@@ -128,6 +135,10 @@ impl std::fmt::Debug for Session {
 impl Sessions {
     /// Start `profile` by re-invoking this executable.
     pub fn start(&mut self, profile: &Profile) -> Result<()> {
+        if let Some(queue) = self.shared.as_mut() {
+            queue.push(profile.clone());
+            return Ok(());
+        }
         let program = std::env::current_exe().context("finding this executable")?;
         self.start_with(&program, profile)
     }
@@ -235,7 +246,21 @@ impl Sessions {
     /// How many sessions this launcher started are still running.
     pub fn count(&mut self) -> usize {
         self.reap();
-        self.running.len()
+        self.running.len() + self.shared_active
+    }
+
+    pub(crate) fn connecting(&self) -> usize {
+        self.shared_connecting + self.shared.as_ref().map_or(0, Vec::len)
+    }
+
+    pub(crate) fn use_shared_windows(&mut self) {
+        self.shared = Some(Vec::new());
+    }
+
+    pub(crate) fn take_connections(&mut self, active: usize, connecting: usize) -> Vec<Profile> {
+        self.shared_active = active;
+        self.shared_connecting = connecting;
+        self.shared.as_mut().map(std::mem::take).unwrap_or_default()
     }
 }
 
@@ -329,6 +354,26 @@ fn no_console_window(_command: &mut Command) {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_sessions_queue_profiles_without_spawning_children() {
+        let mut sessions = super::Sessions::default();
+        sessions.use_shared_windows();
+        let profile = profile();
+        sessions.start(&profile).unwrap();
+        sessions.start(&profile).unwrap();
+        assert!(sessions.running.is_empty());
+        assert_eq!(sessions.connecting(), 2);
+        assert_eq!(
+            sessions.take_connections(0, 2),
+            vec![profile.clone(), profile]
+        );
+        sessions.take_connections(2, 0);
+        assert_eq!(sessions.count(), 2);
+        assert_eq!(sessions.connecting(), 0);
+        sessions.take_connections(1, 0);
+        assert_eq!(sessions.count(), 1);
+    }
+
     use super::*;
 
     fn profile() -> Profile {

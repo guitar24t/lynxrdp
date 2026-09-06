@@ -95,6 +95,12 @@ pub fn classify(prompt: &str) -> Kind {
 /// launcher was started from instead.
 pub fn run_if_helper() -> Option<i32> {
     let prompt = helper_prompt(std::env::var_os(HELPER_MARKER), std::env::args_os())?;
+    #[cfg(unix)]
+    let answer = match std::env::var_os(broker::SOCKET_ENV) {
+        Some(path) => broker::request(std::path::Path::new(&path), &prompt),
+        None => ask(&prompt),
+    };
+    #[cfg(not(unix))]
     let answer = ask(&prompt);
     match answer {
         Some(mut answer) => {
@@ -257,6 +263,8 @@ fn ask(prompt: &str) -> Option<String> {
         secret: String::new(),
         focused: false,
         answer: answer.clone(),
+        embedded: false,
+        completed: false,
     };
     let result = eframe::run_native(
         "LynxRDP",
@@ -309,7 +317,12 @@ fn height_for(prompt: &str, kind: Kind) -> f32 {
     chrome + lines * 20.0
 }
 
+#[cfg(unix)]
+pub(crate) mod broker;
+
 struct Ask {
+    embedded: bool,
+    completed: bool,
     prompt: String,
     kind: Kind,
     secret: String,
@@ -337,7 +350,10 @@ impl Ask {
         if let Ok(mut slot) = self.answer.lock() {
             *slot = answer;
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        self.completed = true;
+        if !self.embedded {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 }
 

@@ -414,6 +414,7 @@ pub struct App {
     /// copies only the rectangles it is given.
     redraw_asked: bool,
     exit_reason: Option<String>,
+    shared_window: bool,
     fullscreen: bool,
     pressed_keys: Vec<u32>,
     /// Keysyms consumed as part of a bar accelerator. Their release is
@@ -467,6 +468,9 @@ pub struct App {
     frames: u64,
     last_title_update: Instant,
 }
+
+/// Shared application host used by macOS, also built on other platforms for tests.
+pub mod desktop;
 
 impl App {
     /// Wrap a connected client.
@@ -529,6 +533,7 @@ impl App {
             full_redraw: true,
             redraw_asked: false,
             exit_reason: None,
+            shared_window: false,
             pressed_keys: Vec::new(),
             swallowed: Vec::new(),
             overlay: Overlay::new(now),
@@ -554,6 +559,14 @@ impl App {
     /// `waker` is the slot returned by [`make_waker`]; it is filled with the
     /// event loop proxy so the network reader thread can wake the loop.
     pub fn run(client: Client, opts: AppOptions, session: Session) -> Result<Option<String>> {
+        #[cfg(target_os = "macos")]
+        return desktop::run(None, Some((client, opts, session)));
+        #[cfg(not(target_os = "macos"))]
+        Self::run_separate(client, opts, session)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn run_separate(client: Client, opts: AppOptions, session: Session) -> Result<Option<String>> {
         let event_loop = EventLoop::<Wake>::with_user_event()
             .build()
             .context("creating event loop")?;
@@ -1623,6 +1636,22 @@ impl App {
         }
     }
 
+    /// Only an explicit desktop-exit notification closes the viewer. Other
+    /// terminal failures keep their explanation visible, and transport losses
+    /// retain the reconnect flow. In particular, EOF alone is not a logout.
+    fn session_has_ended(&self) -> bool {
+        matches!(&self.link, Link::Gone { reason, .. }
+            if reason == "The desktop session has ended.")
+    }
+
+    fn close_ended_session(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        if !self.session_has_ended() {
+            return false;
+        }
+        self.close(event_loop, "The desktop session has ended.");
+        true
+    }
+
     /// End the window. The one exit, whatever asked for it.
     ///
     /// A link that failed keeps its own reason: it is what the command line
@@ -1635,7 +1664,9 @@ impl App {
             other => other.reason().to_string(),
         };
         self.exit_reason.get_or_insert(reason);
-        event_loop.exit();
+        if !self.shared_window {
+            event_loop.exit();
+        }
     }
 
     /// Send Ctrl+Alt+Del into the session.
@@ -2644,7 +2675,9 @@ impl ApplicationHandler<Wake> for App {
             if let Err(e) = self.init_window(event_loop) {
                 log::error!("{e:#}");
                 self.exit_reason = Some(format!("{e:#}"));
-                event_loop.exit();
+                if !self.shared_window {
+                    event_loop.exit();
+                }
             }
         }
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
@@ -2652,8 +2685,11 @@ impl ApplicationHandler<Wake> for App {
         ));
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: Wake) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, _event: Wake) {
         self.drain_network();
+        if self.close_ended_session(event_loop) {
+            return;
+        }
         // A wake also arrives when a reconnection worker has an answer, and
         // the answer is worth having before the next quarter-second tick.
         self.poll_reconnect(Instant::now());
@@ -2743,6 +2779,9 @@ impl ApplicationHandler<Wake> for App {
                     self.full_redraw = true;
                 }
                 self.drain_network();
+                if self.close_ended_session(event_loop) {
+                    return;
+                }
                 if let Err(e) = self.redraw() {
                     log::error!("redraw failed: {e:#}");
                 }
@@ -2881,6 +2920,9 @@ impl ApplicationHandler<Wake> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.drain_network();
+        if self.close_ended_session(event_loop) {
+            return;
+        }
         self.housekeeping();
         if self.dirty.is_some() || self.full_redraw {
             self.request_redraw();
@@ -4287,7 +4329,9 @@ mod tests {
     /// Two connections is the whole of the reconnection story from the far
     /// end's point of view, and it is what the real server does: the second
     /// one replaces the first on a session that never stopped running.
-    fn fake_session(connections: usize) -> (SocketAddr, Arc<std::sync::Mutex<Vec<Message>>>) {
+    pub(super) fn fake_session(
+        connections: usize,
+    ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<Message>>>) {
         fake_session_with_features(connections, features::LOCAL_CURSOR)
     }
     fn fake_session_with_features(
@@ -4371,7 +4415,7 @@ mod tests {
     /// A window's state without a window: `App::new` opens nothing, so every
     /// path below that touches `gfx` is a no-op and the state machine is what
     /// is left.
-    fn test_app(addr: SocketAddr, endpoint: Option<Endpoint>) -> App {
+    pub(super) fn test_app(addr: SocketAddr, endpoint: Option<Endpoint>) -> App {
         let connect = ConnectOptions::default();
         let client = Client::connect(addr, &connect, None).expect("handshake");
         App::new(
@@ -4391,6 +4435,28 @@ mod tests {
                 waker: make_waker().1,
             },
         )
+    }
+
+    #[test]
+    fn only_a_confirmed_desktop_logout_closes_the_viewer() {
+        for (reason, closes) in [
+            ("The desktop session has ended.", true),
+            ("connection closed", false),
+            ("reader stopped", false),
+            ("The server is shutting down.", false),
+            ("Another client connected to this session.", false),
+            ("protocol error: bad tile", false),
+        ] {
+            let (addr, _seen) = fake_session(1);
+            let mut app = test_app(addr, Some(Endpoint::direct(addr).unwrap()));
+            assert!(!app.session_has_ended());
+            app.on_link_lost(reason.into());
+            assert_eq!(app.session_has_ended(), closes, "{reason}");
+            if closes {
+                app.reconnect_now();
+                assert!(app.attempt.is_none(), "logout must not start a new desktop");
+            }
+        }
     }
 
     /// A loopback address with nothing behind it: every connection is refused

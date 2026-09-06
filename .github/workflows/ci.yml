@@ -66,6 +66,8 @@ jobs:
         run: cargo test --workspace --doc
       - name: Graphical session input (Xvfb)
         run: python3 tools/check-session-ui.py
+      - name: Shared application window lifecycle (Xvfb)
+        run: xvfb-run -a cargo test -p lynxrdp-client --lib shared_host_closes -- --ignored --test-threads=1
 
   build-client:
     name: Client (${{ matrix.name }})

@@ -2,7 +2,7 @@
 //!
 //! What `lynxrdp` shows when it is started with no arguments: a list of saved
 //! connections, and an editor for them. Connecting spawns a session as a
-//! child process (see [`crate::launch`]) and leaves this window open, so
+//! child process on Windows/Linux or a shared application window on macOS, so
 //! several sessions can run at once.
 //!
 //! The window owns no protocol logic at all. It edits [`Profile`] values,
@@ -41,6 +41,14 @@ const EXCHANGE_FILE: &str = "connections-export.toml";
 
 /// Open the launcher, returning when the window is closed.
 pub fn run(path: PathBuf) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return crate::app::desktop::run(Some(path), None).map(|_| ());
+    #[cfg(not(target_os = "macos"))]
+    run_separate(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_separate(path: PathBuf) -> Result<()> {
     // Before the window: an update installed last time may have left the
     // executable it replaced behind, because Windows will not delete the
     // image of a running process. This is the next start, so it will go now.
@@ -146,8 +154,12 @@ const UPDATE_PRERELEASE_HINT: &str = "Release candidates as well as finished rel
      the build you are running until you choose.";
 
 /// What "Installed" does and does not mean.
+#[cfg(not(target_os = "macos"))]
 const UPDATE_RESTART_HINT: &str = "This window is still the old build; restarting picks up the \
      new one. Running sessions are not affected.";
+
+#[cfg(target_os = "macos")]
+const UPDATE_RESTART_HINT: &str = "Restart closes this application's viewer windows and loads the update. Your remote desktops keep running; reconnect after restarting.";
 
 /// Id of the filter field.
 ///
@@ -369,7 +381,7 @@ fn matches_filter(profile: &Profile, needle: &str) -> bool {
 }
 
 /// The application state.
-struct Launcher {
+pub(crate) struct Launcher {
     path: PathBuf,
     settings_path: PathBuf,
     store: Profiles,
@@ -419,7 +431,20 @@ struct Launcher {
 }
 
 impl Launcher {
-    fn new(path: PathBuf) -> Self {
+    pub(crate) fn use_shared_windows(&mut self) {
+        self.sessions.use_shared_windows();
+    }
+
+    pub(crate) fn take_connections(&mut self, active: usize, connecting: usize) -> Vec<Profile> {
+        self.sessions.take_connections(active, connecting)
+    }
+
+    pub(crate) fn connection_failed(&mut self, message: String) {
+        self.status.clear();
+        self.error = Some(message);
+    }
+
+    pub(crate) fn new(path: PathBuf) -> Self {
         let (store, error, load_failed) = match Profiles::load(&path) {
             Ok(store) => (store, None, false),
             // A broken file must not leave a blank window with no
@@ -476,7 +501,7 @@ impl Launcher {
     ///
     /// Once, at startup. `apply` installs a style for *both* themes, so the
     /// theme preference can stay on `System` and still get our colours.
-    fn install(&self, ctx: &egui::Context) {
+    pub(crate) fn install(&self, ctx: &egui::Context) {
         theme::apply(ctx);
         ctx.set_theme(egui::ThemePreference::from(self.settings.theme));
         ctx.set_zoom_factor(self.settings.zoom);
@@ -603,7 +628,10 @@ impl Launcher {
         }
         match self.sessions.start(&profile) {
             Ok(()) => {
-                self.status = format!("Connecting to {}", profile.destination());
+                // A spawned process is not evidence of a live connection.
+                // The session count (and shared-host pending count) owns that
+                // lifecycle; do not leave a permanent "Connecting" message.
+                self.status.clear();
                 self.error = None;
             }
             Err(e) => self.error = Some(format!("Could not start the session: {e:#}")),
@@ -1917,9 +1945,17 @@ impl Launcher {
             let running = self.sessions.count();
             if running > 0 {
                 ui.label(
-                    egui::RichText::new(plural(running, "session"))
-                        .small()
-                        .color(t.text_dim),
+                    egui::RichText::new(if self.sessions.connecting() == 0 {
+                        plural(running, "session")
+                    } else {
+                        format!(
+                            "{} ? {} connecting",
+                            plural(running, "session"),
+                            self.sessions.connecting()
+                        )
+                    })
+                    .small()
+                    .color(t.text_dim),
                 );
                 // A dot as well as a number, so "something is running" is
                 // legible at a glance and not only on a reread. Allocated a
@@ -2377,7 +2413,7 @@ impl Launcher {
     /// a real window, and a bare `egui::Context` does not. This is what the
     /// layout tests below run, so what they measure is what ships rather than
     /// a reconstruction of it.
-    fn draw(&mut self, ctx: &egui::Context) {
+    pub(crate) fn draw(&mut self, ctx: &egui::Context) {
         if let Some(window) = self.remote_sessions.as_mut() {
             if let Some(profile) = window.show(ctx) {
                 if let Err(e) = self.sessions.start(&profile) {
@@ -2703,6 +2739,27 @@ pub fn default_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connecting_status_tracks_pending_windows_instead_of_a_stale_message() {
+        let (_dir, mut launcher) = launcher_on(None);
+        launcher.use_shared_windows();
+        launcher.store.upsert(named("work", "work.example"));
+        launcher.status = "Connecting to old.example".into();
+        launcher.connect(0);
+        assert!(launcher.status.is_empty());
+        assert_eq!(launcher.sessions.connecting(), 1);
+        let pending = launcher.take_connections(0, 1);
+        assert_eq!(pending.len(), 1);
+        launcher.take_connections(1, 0);
+        assert_eq!(launcher.sessions.connecting(), 0);
+        assert_eq!(launcher.sessions.count(), 1);
+        launcher.take_connections(0, 0);
+        assert_eq!(launcher.sessions.count(), 0);
+        assert!(launcher.status.is_empty());
+        launcher.connection_failed("Connection refused".into());
+        assert_eq!(launcher.error.as_deref(), Some("Connection refused"));
+    }
+
     use super::*;
 
     #[test]
