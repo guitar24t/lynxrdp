@@ -691,8 +691,20 @@ impl Core {
             }
             if !files.is_empty() {
                 if let Some(cb) = self.clipboard.as_mut() {
+                    let received = files.len();
                     if let Err(e) = cb.set_files(files) {
                         log::warn!("clipboard: {e:#}");
+                        self.send_to_client(vec![Message::Notice {
+                            text: format!("Could not prepare the remote clipboard: {e:#}"),
+                        }]);
+                    } else {
+                        self.send_to_client(vec![Message::Notice {
+                            text: if received == total {
+                                format!("{received} copied file(s) ready. Paste into a folder in the remote session.")
+                            } else {
+                                format!("Only {received} of {total} copied files are ready to paste. Copy the missing files again to retry.")
+                            },
+                        }]);
                     }
                 }
             }

@@ -345,6 +345,11 @@ pub struct App {
     pending_size: Option<(u32, u32)>,
     clipboard: Option<arboard::Clipboard>,
     last_clipboard: Option<String>,
+    /// File selections already offered, including files received from the host.
+    last_file_revision: Option<u64>,
+    clipboard_has_files: bool,
+    /// Local clipboard generation when a remote download started.
+    clipboard_batch_revision: Option<u64>,
     /// Hash of the last image seen on the local clipboard, so an image we
     /// received from the session is not immediately offered back to it.
     last_image: Option<u64>,
@@ -496,6 +501,9 @@ impl App {
             pending_size: None,
             clipboard,
             last_clipboard: None,
+            last_file_revision: None,
+            clipboard_has_files: false,
+            clipboard_batch_revision: None,
             last_image: None,
             clipwatch: ClipboardWatcher::new(now),
             uploads: Vec::new(),
@@ -1091,7 +1099,11 @@ impl App {
                         self.finish_upload(id);
                         self.on_clipboard_file(id, None);
                     }
-                    ClientEvent::Notice(text) => log::info!("server: {text}"),
+                    ClientEvent::Notice(text) => {
+                        log::info!("server: {text}");
+                        self.transfer_panel.notify(text);
+                        self.request_redraw();
+                    }
                     ClientEvent::Rtt(rtt) => self.rtt = Some(rtt),
                     ClientEvent::Disconnected(reason) => {
                         self.on_link_lost(reason);
@@ -1185,6 +1197,8 @@ impl App {
         // rather than having the change suppressed as one it already knows
         // about.
         self.last_clipboard = None;
+        self.last_file_revision = None;
+        self.clipboard_has_files = false;
         self.last_image = None;
     }
 
@@ -1466,10 +1480,11 @@ impl App {
             // is the one that copies a whole screenshot out of the window
             // system, is paced.
             let look = self.clipwatch.tick(now);
-            if look.text {
+            let files = self.poll_clipboard_files();
+            if look.text && !files {
                 self.poll_clipboard();
             }
-            if look.image {
+            if look.image && !files {
                 let found = self.poll_clipboard_image();
                 self.clipwatch.image_read(found, now);
             }
@@ -1773,6 +1788,9 @@ impl App {
             Ok(d) => d,
             Err(e) => {
                 log::warn!("cannot prepare the clipboard staging directory: {e:#}");
+                self.transfer_panel
+                    .notify(format!("Could not prepare copied files: {e:#}"));
+                self.request_redraw();
                 return;
             }
         };
@@ -1781,6 +1799,12 @@ impl App {
             files.len(),
             dir.display()
         );
+        self.clipboard_batch_revision = crate::clipchange::change_counter();
+        self.transfer_panel.notify(format!(
+            "Preparing {} file(s) to paste on this computer…",
+            files.len()
+        ));
+        self.request_redraw();
         self.clipboard_batch = Some(ClipBatch::new(dir, &files));
         self.pump_clipboard_batch();
     }
@@ -1837,10 +1861,24 @@ impl App {
     /// success. The user pressed Ctrl+V, got their old clipboard back, and the
     /// explanation went to a terminal a windowed client does not have.
     fn publish_clipboard_batch(&mut self, batch: ClipBatch) {
+        if clipboard_was_replaced(
+            self.clipboard_batch_revision,
+            crate::clipchange::change_counter(),
+        ) {
+            self.transfer_panel.notify("File copy finished, but a newer clipboard copy was kept. Copy the remote files again to paste them here.".into());
+            self.request_redraw();
+            if let Some(parent) = batch.dir().parent() {
+                prune_batches(parent, KEEP_STAGED_BATCHES);
+            }
+            return;
+        }
         let asked = batch.total();
         let dir = batch.dir().to_path_buf();
         let files = batch.into_files();
         if files.is_empty() {
+            self.transfer_panel.notify(format!(
+                "Could not prepare any of the {asked} copied files. Copy them again to retry."
+            ));
             log::warn!("none of the {asked} file(s) copied in the session could be staged");
         } else {
             if files.len() < asked {
@@ -1851,11 +1889,23 @@ impl App {
                 );
             }
             match crate::fileclip::write_files(&files) {
-                Ok(()) => log::info!("{} file(s) are on the clipboard", files.len()),
+                Ok(()) => {
+                    self.last_file_revision = crate::clipchange::change_counter();
+                    self.clipboard_has_files = true;
+                    self.transfer_panel.notify(if files.len() == asked {
+                        format!("{} file(s) ready. Paste into a folder on this computer.", files.len())
+                    } else {
+                        format!("Only {} of {asked} files are ready to paste. Copy the missing files again to retry.", files.len())
+                    });
+                }
                 Err(e) => {
                     // The files are still on disk, so say where rather than
                     // leaving the user with nothing.
                     log::warn!("could not put the files on the clipboard: {e:#}");
+                    self.transfer_panel.notify(format!(
+                        "Clipboard unavailable. Your files are saved in {}",
+                        dir.display()
+                    ));
                     for f in &files {
                         log::info!("downloaded to {}", f.display());
                     }
@@ -1873,6 +1923,7 @@ impl App {
         if let Some(parent) = dir.parent() {
             prune_batches(parent, KEEP_STAGED_BATCHES);
         }
+        self.request_redraw();
     }
 
     /// Forget an upload that finished or failed, and start the next.
@@ -1969,6 +2020,62 @@ impl App {
             Err(e) => log::warn!("encoding the clipboard image failed: {e:#}"),
         }
         true
+    }
+
+    /// Start staging Explorer copies as soon as the session receives focus.
+    /// A busy clipboard is retried on the next tick, even if its counter did
+    /// not change. Received file lists are marked seen to prevent echo loops.
+    fn poll_clipboard_files(&mut self) -> bool {
+        if self.clipboard.is_none()
+            || !self.link_up()
+            || self.client.info().features & features::CLIPBOARD_FILES == 0
+        {
+            return false;
+        }
+        let revision = crate::clipchange::change_counter();
+        if revision.is_none() {
+            return false;
+        }
+        if revision == self.last_file_revision {
+            return self.clipboard_has_files;
+        }
+        match crate::fileclip::read_files() {
+            Ok(Some(paths)) if !paths.is_empty() => {
+                self.last_file_revision = revision;
+                self.clipboard_has_files = true;
+                match self.client.offer_clipboard_files(&paths) {
+                    Ok(()) => self.transfer_panel.notify(format!(
+                        "Preparing {} copied file(s) in the remote session…",
+                        paths.len()
+                    )),
+                    Err(e) => self
+                        .transfer_panel
+                        .notify(format!("Could not copy files: {e:#}")),
+                }
+                self.request_redraw();
+                true
+            }
+            Ok(_) => {
+                self.client.clear_clipboard_files();
+                self.last_file_revision = revision;
+                self.clipboard_has_files = false;
+                false
+            }
+            Err(e) => {
+                log::debug!("reading clipboard files: {e:#}");
+                if !e
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+                {
+                    self.last_file_revision = revision;
+                    self.clipboard_has_files = true;
+                    self.transfer_panel
+                        .notify(format!("Could not read copied files: {e:#}"));
+                    self.request_redraw();
+                }
+                true
+            }
+        }
     }
 
     fn poll_clipboard(&mut self) {
@@ -2675,7 +2782,9 @@ impl ApplicationHandler<Wake> for App {
                     // there is a change counter this costs nothing: the
                     // counter already knows whether anything was copied.
                     self.clipwatch.wake(Instant::now());
-                    self.poll_clipboard();
+                    if !self.poll_clipboard_files() {
+                        self.poll_clipboard();
+                    }
                 } else {
                     // Only while there is a link to release them on. With one
                     // down, `pressed_keys` is the record of what the session
@@ -2805,6 +2914,11 @@ impl ApplicationHandler<Wake> for App {
         self.client
             .disconnect(self.exit_reason.as_deref().unwrap_or("client exiting"));
     }
+}
+
+/// Unknown counters preserve the existing behavior on platforms without one.
+fn clipboard_was_replaced(start: Option<u64>, current: Option<u64>) -> bool {
+    matches!((start, current), (Some(a), Some(b)) if a != b)
 }
 
 /// Where files copied in the session are downloaded before being offered on
@@ -3186,6 +3300,14 @@ pub fn draw_cursor_scaled(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_newer_clipboard_copy_wins_over_a_finishing_download() {
+        assert!(super::clipboard_was_replaced(Some(10), Some(11)));
+        assert!(!super::clipboard_was_replaced(Some(10), Some(10)));
+        assert!(!super::clipboard_was_replaced(None, None));
+        assert!(!super::clipboard_was_replaced(Some(10), None));
+    }
+
     use super::*;
     use std::net::SocketAddr;
 

@@ -18,6 +18,23 @@ use lynxrdp_proto::{
     can_speak, Framebuffer, Message, Rect, MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION,
 };
 
+fn clipboard_file_entries(paths: &[PathBuf]) -> Result<Vec<lynxrdp_proto::FileEntry>> {
+    if paths.is_empty() || paths.len() > lynxrdp_proto::transfer::MAX_FILE_LIST {
+        bail!(
+            "copy between 1 and {} files at a time",
+            lynxrdp_proto::transfer::MAX_FILE_LIST
+        );
+    }
+    paths.iter().map(|path| {
+        let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+        if !meta.is_file() {
+            bail!("folders cannot be pasted through the clipboard yet; drag {} into the session to upload it", path.display());
+        }
+        let name = path.to_str().context("the filename cannot be represented in the transfer protocol")?;
+        Ok(lynxrdp_proto::FileEntry { path: name.to_owned(), size: meta.len() })
+    }).collect()
+}
+
 /// Options for connecting.
 #[derive(Clone, Debug)]
 pub struct ConnectOptions {
@@ -553,38 +570,29 @@ impl Client {
     /// Only these paths become readable by the session, and only until the
     /// next clipboard copy replaces them.
     pub fn offer_clipboard_files(&mut self, paths: &[PathBuf]) -> Result<()> {
+        self.offered_files.clear();
         if self.info.features & features::CLIPBOARD_FILES == 0 {
             return Ok(());
         }
-        let mut files = Vec::new();
-        let mut offered = HashMap::new();
-        for p in paths {
-            let meta = match std::fs::metadata(p) {
-                Ok(m) if m.is_file() => m,
-                // Directories would need recursive listing; skip rather than
-                // offering something we cannot deliver.
-                Ok(_) => continue,
-                Err(e) => {
-                    log::debug!("skipping {}: {e}", p.display());
-                    continue;
-                }
-            };
-            let key = p.to_string_lossy().into_owned();
-            files.push(lynxrdp_proto::FileEntry {
-                path: key.clone(),
-                size: meta.len(),
-            });
-            offered.insert(key, p.clone());
-        }
-        if files.is_empty() {
-            return Ok(());
-        }
+        // Validate the entire selection before publishing any of it. A copy
+        // that silently omits folders or unreadable files looks successful.
+        let files = clipboard_file_entries(paths)?;
+        let offered = files
+            .iter()
+            .zip(paths)
+            .map(|(f, p)| (f.path.clone(), p.clone()))
+            .collect();
         self.offered_files = offered;
         let id = self.transfers.next_id();
         self.send(&Message::FileList { id, files })?;
         self.send(&Message::ClipboardOffer {
             formats: clipboard_format::FILES,
         })
+    }
+
+    /// Revoke access to files from a clipboard selection that was replaced.
+    pub fn clear_clipboard_files(&mut self) {
+        self.offered_files.clear();
     }
 
     /// Upload a local file into the session. `dest` is a path relative to the
@@ -1091,6 +1099,23 @@ impl Drop for Client {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clipboard_selection_is_validated_whole_before_it_is_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let entries = super::clipboard_file_entries(std::slice::from_ref(&file)).unwrap();
+        assert_eq!(entries[0].size, 5);
+        assert!(
+            super::clipboard_file_entries(&[file.clone(), dir.path().to_path_buf()])
+                .unwrap_err()
+                .to_string()
+                .contains("drag")
+        );
+        assert!(super::clipboard_file_entries(&[file, dir.path().join("missing")]).is_err());
+        assert!(super::clipboard_file_entries(&[]).is_err());
+    }
+
     use super::*;
     use lynxrdp_proto::codec::{TileEncoding, TileUpdate};
     use lynxrdp_proto::frame::write_message;

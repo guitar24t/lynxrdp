@@ -273,6 +273,20 @@ Clipboard text, images, and file copies synchronize automatically when enabled.
 A small, dismissible progress card shows activity without taking over the view.
 You can keep typing, clicking, and dragging in the remote desktop while files copy.
 
+On Windows, select files in Explorer and press **Ctrl+C**, then switch to the
+remote session. LynxRDP prepares the files automatically; paste them into the
+remote file manager with **Ctrl+V**. There is no transfer menu to open. For larger
+copies, wait for the **ready to paste** notification before pasting (the remote
+readiness notification requires an updated server). Copying files in the remote
+file manager similarly prepares them for pasting into Explorer. A newer local
+clipboard copy takes priority over a remote download that is still finishing.
+
+File clipboard transfers copy the originals; they do not move or delete them.
+Folder clipboard copies are not supported yet: drag folders into the session
+to upload them. On macOS and Linux clients, use drag and drop for local files too.
+Unreadable files and unsupported selections show a notification instead of
+silently omitting part of a copy.
+
 Choose **Transfers** on the connection bar, or press **Ctrl+Alt+T**, for a movable,
 non-modal graphical window with per-file progress bars and **Cancel** buttons.
 **Cancel all** also clears files waiting to upload. Closing this window does not

@@ -988,8 +988,11 @@ fn clipboard_files_from_the_client_are_staged_for_the_session() {
 
     // The session should end up with a uri-list naming two staged files.
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut ready = false;
     let staged = loop {
-        let _ = c.poll_event(Duration::from_millis(100));
+        if let Some(ClientEvent::Notice(text)) = c.poll_event(Duration::from_millis(100)).unwrap() {
+            ready |= text.contains("copied file(s) ready");
+        }
         let out = s.x(
             "xclip",
             &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
@@ -1004,6 +1007,15 @@ fn clipboard_files_from_the_client_are_staged_for_the_session() {
             "session never saw the file list: {list:?}"
         );
     };
+
+    while !ready && Instant::now() < deadline {
+        if let Some(ClientEvent::Notice(text)) = c.poll_event(Duration::from_millis(100)).unwrap() {
+            ready |= text.contains("copied file(s) ready");
+        }
+    }
+    assert!(ready, "the client never received the ready-to-paste notice");
+    assert_eq!(std::fs::read(&a).unwrap(), b"alpha contents");
+    assert_eq!(std::fs::read(&b).unwrap(), vec![7u8; 5000]);
 
     // The staged files must be real, complete copies the session can open.
     let mut names: Vec<String> = staged

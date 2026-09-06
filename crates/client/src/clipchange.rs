@@ -173,7 +173,7 @@ impl ClipboardWatcher {
 /// The value is opaque: only "differs from last time" is ever asked of it, so
 /// wrapping, a reboot or a different width between platforms cost nothing.
 #[cfg(windows)]
-fn change_counter() -> Option<u64> {
+pub(crate) fn change_counter() -> Option<u64> {
     use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
     // SAFETY: no arguments, no pointers, and it is documented as callable from
     // any thread without opening the clipboard -- which is the whole point,
@@ -193,7 +193,7 @@ fn change_counter() -> Option<u64> {
 /// does not fault the pasteboard's data in, which is what makes it worth
 /// calling in preference to `get_image`.
 #[cfg(target_os = "macos")]
-fn change_counter() -> Option<u64> {
+pub(crate) fn change_counter() -> Option<u64> {
     use objc2_app_kit::NSPasteboard;
     // The count only ever increases, so the cast is a formality; it is done
     // with `as` on the two's-complement value rather than a fallible
@@ -205,7 +205,7 @@ fn change_counter() -> Option<u64> {
 /// X11 and Wayland: see the module comment for why there is nothing to return
 /// here rather than an XFIXES watcher.
 #[cfg(not(any(windows, target_os = "macos")))]
-fn change_counter() -> Option<u64> {
+pub(crate) fn change_counter() -> Option<u64> {
     None
 }
 

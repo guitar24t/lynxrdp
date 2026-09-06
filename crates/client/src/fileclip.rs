@@ -30,6 +30,15 @@ use anyhow::{bail, Context, Result};
 /// Whether this build can put files on the local clipboard.
 pub const SUPPORTED: bool = cfg!(any(unix, windows));
 
+/// Read an Explorer copy without changing the clipboard or deleting cut files.
+/// Other platforms continue to use drag and drop for local file uploads.
+pub fn read_files() -> Result<Option<Vec<PathBuf>>> {
+    #[cfg(windows)]
+    return imp::read_files();
+    #[cfg(not(windows))]
+    Ok(None)
+}
+
 /// Put `paths` on the local clipboard as a file list.
 ///
 /// The paths must already exist: a file manager pasting them will read them
@@ -466,18 +475,67 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::PathBuf;
 
     use anyhow::{bail, Result};
     use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HANDLE, HGLOBAL};
     use windows_sys::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+        CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
+        OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
     use windows_sys::Win32::System::Memory::{
         GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
     };
     use windows_sys::Win32::System::Ole::CF_HDROP;
+    use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+    pub fn read_files() -> Result<Option<Vec<PathBuf>>> {
+        // A missing file format is normal for text/image copies. Do not block
+        // the desktop retrying a clipboard owned by another application.
+        unsafe {
+            if IsClipboardFormatAvailable(CF_HDROP as u32) == 0 {
+                return Ok(None);
+            }
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "the clipboard is busy",
+                )
+                .into());
+            }
+            let _close = CloseGuard;
+            let drop = GetClipboardData(CF_HDROP as u32);
+            if drop.is_null() {
+                bail!("reading clipboard files failed (error {})", GetLastError());
+            }
+            // The clipboard owns this handle; never DragFinish or free it.
+            read_drop(drop).map(Some)
+        }
+    }
+
+    /// The caller must keep the HDROP alive throughout this call.
+    unsafe fn read_drop(drop: HDROP) -> Result<Vec<PathBuf>> {
+        let count = unsafe { DragQueryFileW(drop, u32::MAX, std::ptr::null_mut(), 0) };
+        if count as usize > lynxrdp_proto::transfer::MAX_FILE_LIST {
+            bail!("too many files copied; copy a smaller selection");
+        }
+        let mut paths = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let len = unsafe { DragQueryFileW(drop, index, std::ptr::null_mut(), 0) };
+            if len == 0 || len > 32767 {
+                bail!("invalid clipboard filename");
+            }
+            let mut name = vec![0; len as usize + 1];
+            if unsafe { DragQueryFileW(drop, index, name.as_mut_ptr(), len + 1) } != len {
+                bail!("could not read the complete clipboard filename");
+            }
+            paths.push(PathBuf::from(std::ffi::OsString::from_wide(
+                &name[..len as usize],
+            )));
+        }
+        Ok(paths)
+    }
 
     /// `DROPEFFECT_COPY`. Without it Explorer may treat the paste as a move
     /// and delete the staged file it just read.
@@ -593,6 +651,25 @@ mod imp {
     /// A NUL terminated UTF-16 string for the `...W` entry points.
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    #[cfg(test)]
+    mod read_tests {
+        use super::*;
+
+        #[test]
+        fn explorer_file_list_preserves_multiple_unicode_paths_without_clipboard_access() {
+            let paths = vec![
+                PathBuf::from("C:\\Ren\u{e9} Smith\\a.txt"),
+                PathBuf::from(r"C:\other\b.txt"),
+            ];
+            let blob = hdrop_blob(&paths).unwrap();
+            unsafe {
+                let memory = global_from(&blob).unwrap();
+                let result = read_drop(memory);
+                GlobalFree(memory);
+                assert_eq!(result.unwrap(), paths);
+            }
+        }
     }
 }
 
