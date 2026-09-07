@@ -2095,12 +2095,8 @@ impl App {
         }
         match crate::fileclip::read_files() {
             Ok(Some(paths)) if !paths.is_empty() => {
-                #[cfg(not(windows))]
-                if self
-                    .clipboard_batch
-                    .as_ref()
-                    .is_some_and(|files| files.paths == paths)
-                {
+                if crate::connection::received_clipboard_files(&paths) {
+                    self.client.clear_clipboard_files();
                     self.last_file_revision = revision;
                     self.clipboard_has_files = true;
                     return true;

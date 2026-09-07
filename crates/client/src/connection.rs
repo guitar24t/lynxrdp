@@ -18,6 +18,52 @@ use lynxrdp_proto::{
     can_speak, Framebuffer, Message, Rect, MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION,
 };
 
+/// Native file URLs outlive their viewer and can survive an app restart.
+/// Never offer our download/mount references back as local clipboard sources.
+/// Keep this lexical: stat/canonicalize can fail or block on an expired mount.
+pub(crate) fn received_clipboard_files(paths: &[PathBuf]) -> bool {
+    let root = std::env::temp_dir();
+    paths
+        .iter()
+        .any(|path| clipboard_reference_under(path, &root))
+}
+
+fn clipboard_reference_under(path: &Path, root: &Path) -> bool {
+    fn mac_alias(path: &Path) -> &Path {
+        if path.starts_with("/private/var") {
+            path.to_str()
+                .and_then(|s| s.strip_prefix("/private"))
+                .map(Path::new)
+                .unwrap_or(path)
+        } else {
+            path
+        }
+    }
+    let Ok(relative) = mac_alias(path).strip_prefix(mac_alias(root)) else {
+        return false;
+    };
+    let mut parts = relative.components();
+    let Some(std::path::Component::Normal(directory)) = parts.next() else {
+        return false;
+    };
+    let Some(pid) = directory
+        .to_str()
+        .and_then(|s| s.strip_prefix("lynxrdp-clipboard-"))
+    else {
+        return false;
+    };
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    // Everything beneath this private per-process root belongs to LynxRDP,
+    // including both legacy batch directories and current deferred mounts.
+    let tail: Vec<_> = parts.collect();
+    !tail.is_empty()
+        && tail
+            .iter()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
 fn clipboard_file_entries(paths: &[PathBuf]) -> Result<Vec<lynxrdp_proto::FileEntry>> {
     if paths.is_empty() || paths.len() > lynxrdp_proto::transfer::MAX_FILE_LIST {
         bail!(
@@ -582,6 +628,9 @@ impl Client {
     pub fn offer_clipboard_files(&mut self, paths: &[PathBuf]) -> Result<()> {
         self.offered_files.clear();
         if self.info.features & features::CLIPBOARD_FILES == 0 {
+            return Ok(());
+        }
+        if received_clipboard_files(paths) {
             return Ok(());
         }
         // Validate the entire selection before publishing any of it. A copy
@@ -1234,6 +1283,62 @@ mod tests {
             username: "bob".into(),
             width: w,
             height: h,
+        }
+    }
+
+    #[test]
+    fn reconnect_does_not_offer_expired_clipboard_references() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut greeting = hello(4, 4);
+        if let Message::ServerHello {
+            features: enabled, ..
+        } = &mut greeting
+        {
+            *enabled |= features::CLIPBOARD_FILES;
+        }
+        let server = fake_server(listener, vec![greeting]);
+        let mut client = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        let stale =
+            std::env::temp_dir().join("lynxrdp-clipboard-99999999/paste-expired/files/missing.txt");
+        client.offer_clipboard_files(&[stale]).unwrap();
+        assert!(client.offered_files.is_empty());
+        // A subsequent real local copy must still be offered normally.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("real.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        client
+            .offer_clipboard_files(std::slice::from_ref(&file))
+            .unwrap();
+        client.disconnect("done");
+        let messages = server.join().unwrap();
+        let lists: Vec<_> = messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::FileList { files, .. } => Some(files),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0][0].path, file.to_string_lossy());
+    }
+
+    #[test]
+    fn clipboard_reference_detection_is_scoped_and_handles_macos_aliases() {
+        let root = Path::new("/var/folders/user/T");
+        for path in [
+            "/var/folders/user/T/lynxrdp-clipboard-123/paste-old/files/a.txt",
+            "/private/var/folders/user/T/lynxrdp-clipboard-456/batch-0/a.txt",
+        ] {
+            assert!(clipboard_reference_under(Path::new(path), root));
+        }
+        for path in [
+            "/Users/person/Documents/lynxrdp-clipboard-123/a.txt",
+            "/var/folders/user/T/lynxrdp-clipboard-notours/a.txt",
+            "/var/folders/user/T/lynxrdp-clipboard-123/../real.txt",
+            "/var/folders/user/T/real.txt",
+        ] {
+            assert!(!clipboard_reference_under(Path::new(path), root));
         }
     }
 
