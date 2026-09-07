@@ -24,6 +24,7 @@ pub mod imageclip;
 pub mod keymap;
 pub mod launch;
 pub mod launcher;
+mod outbound;
 pub mod overlay;
 pub mod profiles;
 pub mod settings;

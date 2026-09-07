@@ -81,6 +81,20 @@ fn clipboard_file_entries(paths: &[PathBuf]) -> Result<Vec<lynxrdp_proto::FileEn
     }).collect()
 }
 
+/// Distinguish a rejected local selection from a failed wire offer. A viewer
+/// discovering an old Finder/Explorer copy on startup need not show a toast
+/// for the former, but connection failures must still be reported.
+#[derive(Debug)]
+pub(crate) struct InvalidClipboardSelection;
+
+impl std::fmt::Display for InvalidClipboardSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cannot share this clipboard selection")
+    }
+}
+
+impl std::error::Error for InvalidClipboardSelection {}
+
 /// Options for connecting.
 #[derive(Clone, Debug)]
 pub struct ConnectOptions {
@@ -300,7 +314,7 @@ const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_SLICE: Duration = Duration::from_millis(250);
 
 pub struct Client {
-    writer: Arc<Mutex<TcpStream>>,
+    writer: crate::outbound::Outbound,
     events: Receiver<Message>,
     reader: Option<JoinHandle<()>>,
     decoder: Decoder,
@@ -358,8 +372,9 @@ impl Client {
     /// Connect to a LynxRDP server at `addr` (normally the local end of an
     /// SSH tunnel) and perform the handshake.
     ///
-    /// `wake` is invoked from the reader thread whenever a message is
-    /// queued, so a UI event loop can be nudged to call [`Client::poll_event`].
+    /// `wake` nudges the event loop when messages arrive. Bursts are coalesced;
+    /// after a budgeted poll, use [`Self::has_pending_events`] to schedule any
+    /// remaining work without waiting for another network notification.
     pub fn connect(
         addr: SocketAddr,
         opts: &ConnectOptions,
@@ -378,10 +393,8 @@ impl Client {
     ) -> Result<Self> {
         stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(opts.timeout))?;
-        // Without this a send into a stalled tunnel blocks forever, and
-        // `Client::send` is called from the winit thread -- including on the
-        // way out, where `exiting()` sends a Disconnect before the shutdown
-        // that would have unblocked it, so the window could not even close.
+        // Bound the handshake and background writer even on a stalled tunnel.
+        // Post-handshake sends only enqueue; the UI never waits on this timeout.
         stream.set_write_timeout(Some(opts.timeout))?;
         let (w, h) = opts.size.unwrap_or((0, 0));
         let hello = Message::ClientHello {
@@ -440,6 +453,7 @@ impl Client {
         let (tx, rx) = crossbeam_channel::unbounded::<Message>();
         let bytes_received = Arc::new(Mutex::new(0u64));
         let counter = bytes_received.clone();
+        let writer = crate::outbound::Outbound::new(stream)?;
         let reader_thread = std::thread::Builder::new()
             .name("lynxrdp-reader".into())
             .spawn(move || {
@@ -467,8 +481,13 @@ impl Client {
                             break;
                         }
                     }
-                    if let Some(w) = &wake {
-                        w();
+                    // One wake is enough for a queued burst. Posting one event
+                    // per chunk can itself starve input when a fast transfer
+                    // produces thousands of events while the UI is painting.
+                    if tx.len() <= 1 {
+                        if let Some(w) = &wake {
+                            w();
+                        }
                     }
                 }
                 if let Some(w) = &wake {
@@ -478,7 +497,7 @@ impl Client {
             .context("spawn reader")?;
 
         Ok(Self {
-            writer: Arc::new(Mutex::new(stream)),
+            writer,
             events: rx,
             reader: Some(reader_thread),
             decoder: Decoder::new(width, height),
@@ -551,13 +570,12 @@ impl Client {
         self.last_message_at.elapsed()
     }
 
-    /// Send a message to the server.
+    /// Queue a message to the server, preserving wire order without blocking on
+    /// socket I/O. A writer failure closes the link and is reported when polled.
     pub fn send(&self, msg: &Message) -> Result<()> {
         let mut buf = Vec::new();
         frame_message(msg, &mut buf);
-        let mut w = self.writer.lock().unwrap();
-        w.write_all(&buf).context("sending message")?;
-        Ok(())
+        self.writer.send(buf)
     }
 
     /// Send a key event.
@@ -635,7 +653,7 @@ impl Client {
         }
         // Validate the entire selection before publishing any of it. A copy
         // that silently omits folders or unreadable files looks successful.
-        let files = clipboard_file_entries(paths)?;
+        let files = clipboard_file_entries(paths).context(InvalidClipboardSelection)?;
         let offered = files
             .iter()
             .zip(paths)
@@ -875,6 +893,9 @@ impl Client {
         if let Some(ev) = self.queued.pop_front() {
             return Ok(Some(ev));
         }
+        if self.closed.is_none() {
+            self.closed = self.writer.error();
+        }
         if let Some(reason) = &self.closed {
             return Ok(Some(ClientEvent::Disconnected(reason.clone())));
         }
@@ -906,12 +927,24 @@ impl Client {
             if let Some(ev) = self.handle(msg)? {
                 return Ok(Some(ev));
             }
+            // Transfer chunks, acknowledgements and pings need not produce a
+            // ClientEvent. A continuous stream of them used to make even a
+            // zero-timeout poll run indefinitely on the UI thread.
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
         }
     }
 
-    /// Non-blocking variant of [`Client::poll_event`].
+    /// Non-blocking variant of [`Client::poll_event`]. Processes at most one
+    /// wire message. `None` can mean internal transfer work was performed;
+    /// [`Self::has_pending_events`] tells an event loop whether to poll again.
     pub fn try_event(&mut self) -> Result<Option<ClientEvent>> {
         self.poll_event(Duration::ZERO)
+    }
+
+    pub fn has_pending_events(&self) -> bool {
+        !self.queued.is_empty() || !self.events.is_empty()
     }
 
     /// Feed a message to the transfer manager, sending any replies.
@@ -1185,19 +1218,14 @@ impl Client {
         let _ = self.send(&Message::Disconnect {
             reason: reason.to_string(),
         });
+        self.writer.close(true);
         self.close_socket("closed by client");
     }
 
     /// Let go of a connection that has already failed, without saying goodbye.
     ///
-    /// [`Client::disconnect`] writes a `Disconnect` first, which is right for
-    /// a link that is still there and wrong for one that is not: against a
-    /// half-open socket -- a sleeping laptop, a forward whose far end has gone
-    /// -- that write ends only when the kernel's send buffer fills and the
-    /// write timeout expires, fifteen seconds of it, on whatever thread called
-    /// in. The session window calls in on the winit thread, and a reconnection
-    /// that freezes the window for fifteen seconds before it starts is not a
-    /// reconnection anyone would keep.
+    /// Unlike [`Client::disconnect`], skips both the goodbye and the short grace
+    /// period for queued writes. Shutdown interrupts the writer immediately.
     ///
     /// The shutdown alone is what actually has to happen: it wakes the reader
     /// thread out of its blocking read so the thread and the descriptor are
@@ -1207,11 +1235,9 @@ impl Client {
         self.close_socket(reason);
     }
 
-    /// Take the socket down and collect the reader thread.
+    /// Take the socket down and collect both I/O threads.
     fn close_socket(&mut self, reason: &str) {
-        if let Ok(w) = self.writer.lock() {
-            let _ = w.shutdown(std::net::Shutdown::Both);
-        }
+        self.writer.close(false);
         if let Some(t) = self.reader.take() {
             let _ = t.join();
         }
@@ -1223,6 +1249,8 @@ impl Drop for Client {
     fn drop(&mut self) {
         if self.closed.is_none() {
             self.disconnect("client exiting");
+        } else {
+            self.close_socket("client exiting");
         }
     }
 }
@@ -1284,6 +1312,50 @@ mod tests {
             width: w,
             height: h,
         }
+    }
+
+    #[test]
+    fn rejected_clipboard_selection_revokes_previous_sources_without_publishing_a_subset() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut greeting = hello(4, 4);
+        if let Message::ServerHello {
+            features: enabled, ..
+        } = &mut greeting
+        {
+            *enabled |= features::CLIPBOARD_FILES;
+        }
+        let server = fake_server(listener, vec![greeting]);
+        let mut client = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        client
+            .offer_clipboard_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(client.offered_files.len(), 1);
+        let bundle = dir.path().join("LynxRDP.app");
+        std::fs::create_dir(&bundle).unwrap();
+        let error = client.offer_clipboard_files(&[file, bundle]).unwrap_err();
+        assert!(error.is::<InvalidClipboardSelection>());
+        assert!(client.offered_files.is_empty());
+        client.disconnect("done");
+        let messages = server.join().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, Message::FileList { .. }))
+                .count(),
+            1,
+            "only the original valid selection may be published"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, Message::ClipboardOffer { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1672,5 +1744,147 @@ mod tests {
             c.poll_event(Duration::from_secs(5)).unwrap().unwrap(),
             ClientEvent::Notice("hi".into())
         );
+    }
+
+    #[test]
+    fn a_zero_timeout_yields_during_internal_work_and_burst_wakes_are_coalesced() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut script = vec![hello(4, 4)];
+        script.extend((0..100).map(|nonce| Message::Ping { nonce }));
+        script.push(Message::Notice {
+            text: "after burst".into(),
+        });
+        let server = fake_server(listener, script);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let count = wakes.clone();
+        let mut client = Client::connect(
+            addr,
+            &ConnectOptions::default(),
+            Some(Box::new(move || {
+                count.fetch_add(1, Ordering::Relaxed);
+            })),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while client.events.len() != 101 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(client.events.len(), 101);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        // None means this ping was answered, not that the queue was drained.
+        assert_eq!(client.try_event().unwrap(), None);
+        assert_eq!(client.events.len(), 100);
+        assert!(client.has_pending_events());
+        for _ in 1..100 {
+            assert_eq!(client.try_event().unwrap(), None);
+        }
+        assert_eq!(
+            client.try_event().unwrap(),
+            Some(ClientEvent::Notice("after burst".into()))
+        );
+        assert!(!client.has_pending_events());
+        client.disconnect("done");
+        let received = server.join().unwrap();
+        let pongs: Vec<_> = received
+            .iter()
+            .filter_map(|message| match message {
+                Message::Pong { nonce } => Some(*nonce),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pongs, (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn budgeted_polls_and_queued_writes_finish_a_multi_window_file_download() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let source = payload.clone();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            assert!(matches!(
+                read_message(&mut socket).unwrap(),
+                Message::ClientHello { .. }
+            ));
+            let mut greeting = hello(4, 4);
+            if let Message::ServerHello {
+                features: enabled, ..
+            } = &mut greeting
+            {
+                *enabled |= features::FILE_TRANSFER | features::ATOMIC_FILES;
+            }
+            write_message(&mut socket, &greeting).unwrap();
+            let Message::FileRequest { id, .. } = read_message(&mut socket).unwrap() else {
+                panic!("expected download request");
+            };
+            let mut transfers = TransferManager::new(false);
+            let offer = transfers.offer_stream_with_id(
+                id,
+                TransferPurpose::FileDownload,
+                "payload.bin".into(),
+                source.len() as u64,
+                Box::new(std::io::Cursor::new(source)),
+            );
+            write_message(&mut socket, &offer).unwrap();
+            let mut policy = ClientTransferPolicy {
+                replacements: Default::default(),
+                downloads: Default::default(),
+            };
+            let mut confirmed = false;
+            while let Ok(message) = read_message(&mut socket) {
+                if matches!(message, Message::Disconnect { .. }) {
+                    break;
+                }
+                if let Some(outcome) = transfers.handle(&message, &mut policy) {
+                    assert!(outcome.failed.is_empty());
+                    confirmed |= outcome.sent.iter().any(|(sent, ..)| *sent == id);
+                    for reply in outcome.replies {
+                        write_message(&mut socket, &reply).unwrap();
+                    }
+                }
+            }
+            assert!(
+                confirmed,
+                "final acknowledgement must arrive before disconnect"
+            );
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("payload.bin");
+        let mut client = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        let id = client
+            .request_file("/remote/payload.bin", destination.clone())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "download must not strand a queued chunk"
+            );
+            match client.try_event().unwrap() {
+                Some(ClientEvent::FileDownloaded { id: done, path, .. }) => {
+                    assert_eq!(done, id);
+                    assert_eq!(path, destination);
+                    break;
+                }
+                None => {
+                    if !client.has_pending_events() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                event => panic!("unexpected event: {event:?}"),
+            }
+        }
+        assert_eq!(std::fs::read(destination).unwrap(), payload);
+        client.disconnect("done");
+        server.join().unwrap();
     }
 }

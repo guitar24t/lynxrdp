@@ -64,6 +64,8 @@ const STALL_AFTER: Duration = Duration::from_secs(2 * PING_INTERVAL.as_secs());
 /// How often the window repaints while the bar is up, so the round-trip and
 /// upload figures on it are not stale.
 const OVERLAY_TICK: Duration = Duration::from_millis(100);
+/// A busy transfer must give the event loop a turn to deliver input and paint.
+const NETWORK_BUDGET: Duration = Duration::from_millis(4);
 
 /// How many frames of presented damage are remembered, for buffer age.
 ///
@@ -374,6 +376,7 @@ pub struct App {
     last_gui_visible: bool,
     last_gui_rect: Option<Rect>,
     last_gui_message: String,
+    gui_activity: crate::transfer_panel::ActivityRepaint,
     /// Uploads finished (or given up on) since the queue was last empty, so
     /// progress can be reported across a whole drop rather than per file.
     upload_done: usize,
@@ -524,6 +527,7 @@ impl App {
             last_gui_visible: false,
             last_gui_rect: None,
             last_gui_message: String::new(),
+            gui_activity: Default::default(),
             upload_done: 0,
             clipboard_batch: None,
             clipboard_reads: Default::default(),
@@ -714,14 +718,8 @@ impl App {
 
     /// Send a message, if there is a link to send it down.
     ///
-    /// Every send in this file goes through here or [`App::send_key`], and the
-    /// guard is not tidiness. `Client::send` writes straight into the socket
-    /// with a fifteen-second write timeout, from this thread; against a link
-    /// that has half-died -- a sleeping laptop, a forward whose far end is
-    /// gone -- the write succeeds into the kernel buffer until the buffer
-    /// fills and then blocks for the whole timeout. One keystroke would freeze
-    /// the window for fifteen seconds, and the window is the thing that is
-    /// supposed to be telling the user what happened.
+    /// Sends enqueue without waiting for socket I/O. The guard also prevents
+    /// stale input from being queued while the viewer is reconnecting.
     fn send(&self, msg: &Message) {
         if self.link_up() {
             let _ = self.client.send(msg);
@@ -801,6 +799,8 @@ impl App {
         // because nothing is arriving to repaint -- these frames happen once a
         // second, when the wording changes.
         let mut transfers = self.client.transfer_details();
+        let active =
+            !transfers.is_empty() || !self.uploads.is_empty() || !self.upload_queue.is_empty();
         if !self.transfer_panel.open {
             // Keep outgoing clipboard traffic silent on the source computer.
             // The paste destination provides its transfer progress.
@@ -913,6 +913,7 @@ impl App {
         self.last_gui_visible = gui_now.is_some();
         self.last_gui_rect = gui_now;
         self.last_gui_message = self.transfer_panel.message.clone();
+        self.gui_activity.painted(now, &self.transfer_panel, active);
         self.dirty = None;
         self.presented_size = Some((size.width, size.height));
         if presented.is_err() {
@@ -1060,6 +1061,7 @@ impl App {
         if self.exit_reason.is_some() || !self.link_up() {
             return;
         }
+        let deadline = Instant::now() + NETWORK_BUDGET;
         loop {
             match self.client.try_event() {
                 Ok(Some(ev)) => match ev {
@@ -1142,11 +1144,15 @@ impl App {
                         return;
                     }
                 },
-                Ok(None) => break,
+                Ok(None) if !self.client.has_pending_events() => break,
+                Ok(None) => {}
                 Err(e) => {
                     self.on_link_lost(format!("protocol error: {e:#}"));
                     return;
                 }
+            }
+            if Instant::now() >= deadline {
+                break;
             }
         }
     }
@@ -1484,15 +1490,15 @@ impl App {
         {
             self.request_redraw();
         }
-        if self.transfer_panel.visible()
-            || self.last_gui_visible
-            || !self.uploads.is_empty()
-            || !self.client.transfer_details().is_empty()
+        let now = Instant::now();
+        let active = !self.uploads.is_empty()
+            || !self.upload_queue.is_empty()
+            || !self.client.transfer_details().is_empty();
+        if self.gui_activity.due(now, &self.transfer_panel, active)
             || self.transfer_panel.message != self.last_gui_message
         {
             self.request_redraw();
         }
-        let now = Instant::now();
         self.poll_reconnect(now);
         if let (Some(t), Some((w, h))) = (self.last_resize_event, self.pending_size) {
             if now.duration_since(t) >= RESIZE_DEBOUNCE {
@@ -2086,14 +2092,21 @@ impl App {
         {
             return false;
         }
-        let revision = crate::fileclip::change_counter();
-        if revision.is_none() {
+        let Some(revision) = crate::fileclip::change_counter() else {
             return false;
-        }
-        if revision == self.last_file_revision {
+        };
+        if Some(revision) == self.last_file_revision {
             return self.clipboard_has_files;
         }
-        match crate::fileclip::read_files() {
+        self.on_clipboard_files(revision, crate::fileclip::read_files())
+    }
+
+    /// Handle a native snapshot separately so startup/focus behavior can be
+    /// tested without reading or replacing the user's system clipboard.
+    fn on_clipboard_files(&mut self, revision: u64, copied: Result<Option<Vec<PathBuf>>>) -> bool {
+        let initial = self.last_file_revision.is_none();
+        let revision = Some(revision);
+        match copied {
             Ok(Some(paths)) if !paths.is_empty() => {
                 if crate::connection::received_clipboard_files(&paths) {
                     self.client.clear_clipboard_files();
@@ -2108,6 +2121,15 @@ impl App {
                         "Preparing {} copied file(s) in the remote session…",
                         paths.len()
                     )),
+                    Err(e) if initial && e.is::<crate::connection::InvalidClipboardSelection>() => {
+                        // Existing clipboard contents are not a new paste
+                        // request. Keep a diagnostic in details, without a
+                        // startup toast for an app bundle, folder or stale
+                        // local path. Still consume the revision and block
+                        // text/image fallback for this file selection.
+                        self.transfer_panel
+                            .record(format!("Existing clipboard files were not shared: {e:#}"));
+                    }
                     Err(e) => self
                         .transfer_panel
                         .notify(format!("Could not copy files: {e:#}")),
@@ -2163,7 +2185,14 @@ impl App {
     }
 
     fn next_wake(&self) -> Duration {
+        // A budgeted drain may leave messages already queued, with no new
+        // reader notification coming. Continue next turn, never drop them or
+        // wait for the 250 ms idle timer (which would throttle file transfers).
+        if self.link_up() && self.client.has_pending_events() {
+            return Duration::ZERO;
+        }
         let mut d = Duration::from_millis(250);
+        d = d.min(self.gui_activity.repaint_in(Instant::now()));
         if let Some(gfx) = &self.gfx {
             d = d.min(gfx.gui.repaint_in());
         }
@@ -2971,11 +3000,8 @@ impl ApplicationHandler<Wake> for App {
         if let Some(a) = self.attempt.take() {
             let _ = a.done.recv_timeout(Duration::from_millis(250));
         }
-        // Nothing is said down a link that has already failed. `Client::send`
-        // would block for the write timeout against a half-open socket, and
-        // this is the path a user takes when they close a window that is
-        // *already* telling them the connection is gone -- so the freeze would
-        // land exactly where it is least deserved.
+        // A failed link was already abandoned; it has no input to release or
+        // goodbye to deliver.
         if !self.link_up() {
             return;
         }
@@ -4449,6 +4475,90 @@ mod tests {
                 waker: make_waker().1,
             },
         )
+    }
+
+    #[test]
+    fn preexisting_unsupported_clipboard_is_quiet_but_new_copies_report_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("LynxRDP.app");
+        std::fs::create_dir(&bundle).unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        for paths in [
+            vec![bundle.clone()],
+            vec![dir.path().to_path_buf()],
+            vec![dir.path().join("moved-away.app")],
+            vec![file, bundle],
+        ] {
+            let (addr, _) = fake_session_with_features(1, features::CLIPBOARD_FILES);
+            let mut app = test_app(addr, None);
+            // A busy clipboard must not consume the initial snapshot either.
+            assert!(app.on_clipboard_files(
+                42,
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock).into())
+            ));
+            assert_eq!(app.last_file_revision, None);
+            assert!(app.on_clipboard_files(42, Ok(Some(paths.clone()))));
+            assert_eq!(app.last_file_revision, Some(42));
+            assert!(
+                app.clipboard_has_files,
+                "do not fall back to text/image sync"
+            );
+            assert!(!app.transfer_panel.visible(), "no startup toast: {paths:?}");
+            assert!(app.transfer_panel.message.is_empty());
+
+            // Once connected, a fresh unsupported copy still explains why
+            // it cannot be pasted; the fix must not hide every clipboard error.
+            assert!(app.on_clipboard_files(43, Ok(Some(paths))));
+            assert!(app.transfer_panel.visible());
+            assert!(app
+                .transfer_panel
+                .message
+                .starts_with("Could not copy files:"));
+        }
+    }
+
+    #[test]
+    fn regular_clipboard_files_are_shared_on_startup_and_after_an_ignored_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        for initially_unsupported in [false, true] {
+            let (addr, seen) = fake_session_with_features(1, features::CLIPBOARD_FILES);
+            let mut app = test_app(addr, None);
+            if initially_unsupported {
+                assert!(app.on_clipboard_files(1, Ok(Some(vec![dir.path().to_path_buf()]))));
+            }
+            assert!(app.on_clipboard_files(2, Ok(Some(vec![file.clone()]))));
+            assert!(!app.transfer_panel.visible());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if seen.lock().unwrap().iter().any(|m| {
+                    matches!(m, Message::FileList { files, .. }
+                        if files.len() == 1 && files[0].path == file.to_string_lossy())
+                }) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "regular file was not offered");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn an_initial_clipboard_wire_failure_still_notifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let (addr, _) = fake_session_with_features(1, features::CLIPBOARD_FILES);
+        let mut app = test_app(addr, None);
+        app.client.abandon("simulate a broken connection");
+        assert!(app.on_clipboard_files(1, Ok(Some(vec![file]))));
+        assert!(app.transfer_panel.visible());
+        assert!(app
+            .transfer_panel
+            .message
+            .starts_with("Could not copy files:"));
     }
 
     #[test]

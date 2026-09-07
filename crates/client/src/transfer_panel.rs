@@ -8,6 +8,43 @@ use std::{
 use winit::{event::WindowEvent, window::Window};
 
 const PROGRESS_DELAY: Duration = Duration::from_secs(1);
+const PROGRESS_TICK: Duration = Duration::from_millis(100);
+
+/// Network progress has no egui input event. Refresh it at a bounded rate,
+/// but let an idle details window sleep until input or an egui timer wakes it.
+#[derive(Default)]
+pub(crate) struct ActivityRepaint {
+    painted_at: Option<Instant>,
+    open: bool,
+    visible: bool,
+    active: bool,
+}
+
+impl ActivityRepaint {
+    pub fn painted(&mut self, now: Instant, panel: &Panel, active: bool) {
+        self.painted_at = Some(now);
+        self.open = panel.open;
+        self.visible = panel.visible();
+        self.active = active;
+    }
+
+    pub fn due(&self, now: Instant, panel: &Panel, active: bool) -> bool {
+        panel.open != self.open
+            || panel.visible() != self.visible
+            || active != self.active
+            || self.repaint_in(now).is_zero()
+    }
+
+    pub fn repaint_in(&self, now: Instant) -> Duration {
+        if self.active {
+            self.painted_at.map_or(Duration::ZERO, |last| {
+                PROGRESS_TICK.saturating_sub(now.saturating_duration_since(last))
+            })
+        } else {
+            Duration::MAX
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct Panel {
@@ -224,6 +261,15 @@ impl Panel {
                 open = false;
             }
             self.open = open;
+            if !open {
+                // The title bar handles its close button after the window's
+                // shapes have been built. Do not present those stale shapes
+                // and rely on a later timer/input event to erase them: finish
+                // this frame with the closed layout instead. Repaint is the
+                // fallback if egui has already used its layout-pass budget.
+                ctx.request_discard("file transfer details closed");
+                ctx.request_repaint();
+            }
         } else if !self.dismissed && (progress_ready || self.visible()) {
             egui::Area::new(egui::Id::new("transfer_notification"))
                 .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0])
@@ -330,7 +376,9 @@ impl Gui {
     ) -> Prepared {
         let mut actions = Vec::new();
         let output = self.ctx.run(self.state.take_egui_input(window), |ctx| {
-            actions = panel.show(ctx, queued, active);
+            // A close can request a second layout pass; keep actions already
+            // accepted in the input pass (for example Cancel followed by Esc).
+            actions.extend(panel.show(ctx, queued, active));
             if let Some(notice) = notice {
                 egui::Window::new(&notice.headline)
                     .id(egui::Id::new("connection_notice"))
@@ -412,6 +460,51 @@ impl Gui {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_controls_sleep_and_progress_is_paced_without_delaying_state_changes() {
+        use super::*;
+        let now = Instant::now();
+        let mut schedule = ActivityRepaint::default();
+        let mut panel = Panel::default();
+        assert!(!schedule.due(now, &panel, false));
+        panel.open = true;
+        assert!(schedule.due(now, &panel, false));
+        schedule.painted(now, &panel, false);
+        assert!(!schedule.due(now + Duration::from_secs(60), &panel, false));
+        assert_eq!(schedule.repaint_in(now), Duration::MAX);
+        assert!(schedule.due(now, &panel, true));
+        schedule.painted(now, &panel, true);
+        assert!(!schedule.due(now + PROGRESS_TICK / 2, &panel, true));
+        assert!(schedule.due(now + PROGRESS_TICK, &panel, true));
+        assert!(
+            schedule.due(now, &panel, false),
+            "completion should clear progress immediately"
+        );
+        panel.open = false;
+        assert!(
+            schedule.due(now, &panel, true),
+            "closing must not wait for progress"
+        );
+        schedule.painted(now, &panel, false);
+        assert!(!schedule.due(now + PROGRESS_TICK, &panel, false));
+    }
+
+    #[test]
+    fn repeated_notifications_repaint_after_the_previous_toast_expired() {
+        let now = Instant::now();
+        let mut schedule = ActivityRepaint::default();
+        let mut panel = Panel::default();
+        panel.notify("Transfer failed".into());
+        assert!(schedule.due(now, &panel, false));
+        schedule.painted(now, &panel, false);
+        assert!(!schedule.due(now, &panel, false));
+        panel.toast_until = Some(now - Duration::from_secs(1));
+        assert!(schedule.due(now, &panel, false));
+        schedule.painted(now, &panel, false);
+        panel.notify("Transfer failed".into());
+        assert!(schedule.due(now, &panel, false));
+    }
+
     use super::*;
     #[test]
     fn notifications_do_not_open_the_details_or_authorize_overwrites() {
@@ -526,7 +619,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                actions = panel.show(ctx, 0, active);
+                actions.extend(panel.show(ctx, 0, active));
             },
         );
         (output, actions)
@@ -576,6 +669,171 @@ mod tests {
             }],
             active,
         )
+    }
+
+    #[test]
+    fn close_click_clears_details_in_the_same_frame() {
+        for pixels_per_point in [1.0, 2.0] {
+            for warm in [1, 2, 3, 30] {
+                for batched in [false, true] {
+                    let ctx = egui::Context::default();
+                    crate::theme::apply(&ctx);
+                    ctx.set_pixels_per_point(pixels_per_point);
+                    let mut panel = Panel {
+                        open: true,
+                        ..Default::default()
+                    };
+                    for _ in 0..warm {
+                        frame(&ctx, &mut panel, vec![], &[]);
+                    }
+                    let (output, _) = frame(&ctx, &mut panel, vec![], &[]);
+                    let title = text_position(&output, "File transfers");
+                    let close = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| {
+                            if let egui::Shape::LineSegment { points, .. } = &shape.shape {
+                                let center = points[0].lerp(points[1], 0.5);
+                                if center.x > title.x
+                                    && (center.y - title.y).abs() < 2.0
+                                    && points[0].x != points[1].x
+                                    && points[0].y != points[1].y
+                                {
+                                    return Some(center);
+                                }
+                            }
+                            None
+                        })
+                        .expect("close icon");
+                    let (closed, _) = if batched {
+                        frame(
+                            &ctx,
+                            &mut panel,
+                            vec![
+                                egui::Event::PointerMoved(close),
+                                egui::Event::PointerButton {
+                                    pos: close,
+                                    button: egui::PointerButton::Primary,
+                                    pressed: true,
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                                egui::Event::PointerButton {
+                                    pos: close,
+                                    button: egui::PointerButton::Primary,
+                                    pressed: false,
+                                    modifiers: egui::Modifiers::NONE,
+                                },
+                            ],
+                            &[],
+                        )
+                    } else {
+                        click(&ctx, &mut panel, close, &[])
+                    };
+                    assert!(
+                        !panel.open,
+                        "first click must close, batched={batched}, warm={warm}"
+                    );
+                    assert!(
+                        closed.shapes.is_empty(),
+                        "the close click must remove the panel in the same frame"
+                    );
+                    assert_eq!(
+                        closed.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                        Duration::ZERO
+                    );
+                    let (cleared, _) = frame(&ctx, &mut panel, vec![], &[]);
+                    assert!(
+                        cleared.shapes.is_empty(),
+                        "next frame must remove the panel"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn closing_with_escape_does_not_lose_a_transfer_action_during_relayout() {
+        let ctx = egui::Context::default();
+        let mut panel = Panel {
+            open: true,
+            ..Default::default()
+        };
+        let active = [Transfer {
+            id: 77,
+            name: "report.pdf".into(),
+            progress: Some((5, 10)),
+        }];
+        frame(&ctx, &mut panel, vec![], &active);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &active);
+        let cancel = text_position(&output, "Cancel");
+        frame(
+            &ctx,
+            &mut panel,
+            vec![
+                egui::Event::PointerMoved(cancel),
+                egui::Event::PointerButton {
+                    pos: cancel,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &active,
+        );
+        let (output, actions) = frame(
+            &ctx,
+            &mut panel,
+            vec![
+                egui::Event::PointerButton {
+                    pos: cancel,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            &active,
+        );
+        assert!(!panel.open);
+        assert_eq!(actions, vec![Action::Cancel(77)]);
+        assert!(output.shapes.is_empty());
+    }
+
+    #[test]
+    fn closing_still_schedules_cleanup_if_the_layout_pass_budget_is_exhausted() {
+        let ctx = egui::Context::default();
+        ctx.options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
+        let mut panel = Panel {
+            open: true,
+            ..Default::default()
+        };
+        frame(&ctx, &mut panel, vec![], &[]);
+        frame(&ctx, &mut panel, vec![], &[]);
+        let (output, _) = frame(
+            &ctx,
+            &mut panel,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &[],
+        );
+        assert!(!panel.open);
+        assert_eq!(
+            output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+            Duration::ZERO
+        );
+        let (output, _) = frame(&ctx, &mut panel, vec![], &[]);
+        assert!(output.shapes.is_empty());
     }
     #[test]
     fn graphical_cancel_uses_the_transfer_id_and_fields_support_selection_and_paste() {

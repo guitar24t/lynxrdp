@@ -100,27 +100,88 @@ fn triangle(
     ];
     // Half-open edges ensure a shared diagonal is blended exactly once.
     let inclusive = edges.map(|(a, b)| b.y < a.y || (b.y == a.y && b.x > a.x));
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let p = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
-            if !clip.contains(p) {
-                continue;
+    // Most UI pixels are solid panel/row backgrounds. Egui represents these
+    // with a single UV in its white texel; sampling four texels and interpolating
+    // four identical vertex colours for every pixel made a Retina window cost
+    // tens of milliseconds, on the same thread that handles pointer events.
+    // Keep the general path for text/images and gradients, including AA fringes.
+    let constant_tex =
+        (v[0].uv == v[1].uv && v[0].uv == v[2].uv).then(|| sample(texture, v[0].uv.to_vec2()));
+    let constant_rgba = constant_tex
+        .filter(|_| v[0].color == v[1].color && v[0].color == v[2].color)
+        .map(|tex| std::array::from_fn::<_, 4, _>(|i| tex[i] * v[0].color[i] as f32 / 255.0));
+    if constant_rgba == Some([0.0; 4]) {
+        return;
+    }
+    let opaque = constant_rgba.filter(|rgba| rgba[3] == 255.0).map(|rgba| {
+        ((rgba[0].round() as u32) << 16) | ((rgba[1].round() as u32) << 8) | rgba[2].round() as u32
+    });
+    'rows: for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        if py < clip.min.y || py > clip.max.y {
+            continue;
+        }
+        // Intersect the triangle with this scanline. AA fringes and shadows
+        // often form very thin diagonal triangles with enormous bounding boxes.
+        // Only visit their covered span, not every pixel in that box.
+        let (mut start, mut end) = (x0, x1);
+        for (i, (a, b)) in edges.iter().enumerate() {
+            let dy = b.y - a.y;
+            if dy == 0.0 {
+                let e = (b.x - a.x) * (py - a.y);
+                if e < 0.0 || (e == 0.0 && !inclusive[i]) {
+                    continue 'rows;
+                }
+            } else {
+                let x = a.x + (py - a.y) * (b.x - a.x) / dy - 0.5;
+                // Round outwards, then check the endpoints with the original
+                // half-open edge test. This preserves shared-edge ownership.
+                if dy < 0.0 {
+                    start = start.max(x.floor().max(0.0) as u32);
+                } else {
+                    end = end.min((x.ceil().max(0.0) as u32).saturating_add(1));
+                }
             }
-            let e = edges.map(|(a, b)| edge(a, b, p));
-            if (0..3).any(|i| e[i] < 0.0 || (e[i] == 0.0 && !inclusive[i])) {
-                continue;
-            }
-            let weights = e.map(|e| e / area);
-            let uv = v[0].uv.to_vec2() * weights[0]
-                + v[1].uv.to_vec2() * weights[1]
-                + v[2].uv.to_vec2() * weights[2];
-            let tex = sample(texture, uv);
-            let mut rgba = [0.0; 4];
-            for i in 0..4 {
-                let color: f32 = (0..3).map(|j| v[j].color[i] as f32 * weights[j]).sum();
-                rgba[i] = tex[i] * color / 255.0;
-            }
+        }
+        let covered = |x| {
+            let p = egui::pos2(x as f32 + 0.5, py);
+            clip.contains(p)
+                && edges.iter().enumerate().all(|(i, &(a, b))| {
+                    let e = edge(a, b, p);
+                    e > 0.0 || (e == 0.0 && inclusive[i])
+                })
+        };
+        while start < end && !covered(start) {
+            start += 1;
+        }
+        while start < end && !covered(end - 1) {
+            end -= 1;
+        }
+        if start >= end {
+            continue;
+        }
+        let row = y as usize * size[0] as usize;
+        if let Some(color) = opaque {
+            dst[row + start as usize..row + end as usize].fill(color);
+            continue;
+        }
+        for x in start..end {
             let pixel = &mut dst[(y * size[0] + x) as usize];
+            let rgba = constant_rgba.unwrap_or_else(|| {
+                let p = egui::pos2(x as f32 + 0.5, py);
+                let e = edges.map(|(a, b)| edge(a, b, p));
+                let weights = e.map(|e| e / area);
+                let tex = constant_tex.unwrap_or_else(|| {
+                    let uv = v[0].uv.to_vec2() * weights[0]
+                        + v[1].uv.to_vec2() * weights[1]
+                        + v[2].uv.to_vec2() * weights[2];
+                    sample(texture, uv)
+                });
+                std::array::from_fn(|i| {
+                    let color: f32 = (0..3).map(|j| v[j].color[i] as f32 * weights[j]).sum();
+                    tex[i] * color / 255.0
+                })
+            });
             let mut result = 0;
             for (i, shift) in [16, 8, 0].into_iter().enumerate() {
                 let old = ((*pixel >> shift) & 255) as f32;
@@ -197,6 +258,182 @@ pub fn color(rgb: u32) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Deliberately simple bounding-box rasterizer, retained as a correctness
+    // oracle for the scanline and constant-colour optimizations.
+    fn reference_triangle(
+        dst: &mut [u32],
+        size: [u32; 2],
+        clip: egui::Rect,
+        mut v: [epaint::Vertex; 3],
+        scale: f32,
+        texture: &Texture,
+    ) {
+        for vertex in &mut v {
+            vertex.pos = vertex.pos * scale;
+        }
+        let mut area = edge(v[0].pos, v[1].pos, v[2].pos);
+        if area == 0.0 {
+            return;
+        }
+        if area < 0.0 {
+            v.swap(1, 2);
+            area = -area;
+        }
+        let bounds = egui::Rect::from_points(&[v[0].pos, v[1].pos, v[2].pos]).intersect(clip);
+        let x0 = bounds.min.x.max(0.0).floor() as u32;
+        let y0 = bounds.min.y.max(0.0).floor() as u32;
+        let x1 = bounds.max.x.min(size[0] as f32).ceil() as u32;
+        let y1 = bounds.max.y.min(size[1] as f32).ceil() as u32;
+        let edges = [
+            (v[1].pos, v[2].pos),
+            (v[2].pos, v[0].pos),
+            (v[0].pos, v[1].pos),
+        ];
+        // Half-open edges ensure a shared diagonal is blended exactly once.
+        let inclusive = edges.map(|(a, b)| b.y < a.y || (b.y == a.y && b.x > a.x));
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
+                if !clip.contains(p) {
+                    continue;
+                }
+                let e = edges.map(|(a, b)| edge(a, b, p));
+                if (0..3).any(|i| e[i] < 0.0 || (e[i] == 0.0 && !inclusive[i])) {
+                    continue;
+                }
+                let weights = e.map(|e| e / area);
+                let uv = v[0].uv.to_vec2() * weights[0]
+                    + v[1].uv.to_vec2() * weights[1]
+                    + v[2].uv.to_vec2() * weights[2];
+                let tex = sample(texture, uv);
+                let mut rgba = [0.0; 4];
+                for i in 0..4 {
+                    let color: f32 = (0..3).map(|j| v[j].color[i] as f32 * weights[j]).sum();
+                    rgba[i] = tex[i] * color / 255.0;
+                }
+                let pixel = &mut dst[(y * size[0] + x) as usize];
+                let mut result = 0;
+                for (i, shift) in [16, 8, 0].into_iter().enumerate() {
+                    let old = ((*pixel >> shift) & 255) as f32;
+                    result |= ((rgba[i] + old * (1.0 - rgba[3] / 255.0))
+                        .round()
+                        .clamp(0.0, 255.0) as u32)
+                        << shift;
+                }
+                *pixel = result;
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_triangles_match_reference_coverage_and_blending() {
+        let texture = Texture {
+            size: [2, 2],
+            pixels: vec![
+                Color32::WHITE,
+                Color32::RED,
+                Color32::BLUE,
+                Color32::TRANSPARENT,
+            ],
+        };
+        let mut seed = 1234u32;
+        let mut coordinate = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed % 960) as f32 / 16.0 - 8.0
+        };
+        for case in 0..600 {
+            let mut vertices = std::array::from_fn(|_| epaint::Vertex {
+                pos: egui::pos2(coordinate(), coordinate()),
+                uv: egui::pos2(0.0, 0.0),
+                color: Color32::from_rgb(27, 89, 147),
+            });
+            match case % 6 {
+                0 => {}
+                1 => vertices
+                    .iter_mut()
+                    .for_each(|v| v.color = Color32::from_black_alpha(128)),
+                2 => vertices
+                    .iter_mut()
+                    .for_each(|v| v.uv = egui::pos2(0.5, 0.5)),
+                3 => vertices
+                    .iter_mut()
+                    .for_each(|v| v.color = Color32::TRANSPARENT),
+                4 => vertices[1].color = Color32::from_rgba_premultiplied(60, 30, 20, 90),
+                _ => {
+                    vertices[1].uv = egui::pos2(1.0, 0.0);
+                    vertices[2].uv = egui::pos2(0.0, 1.0);
+                }
+            }
+            let clip = egui::Rect::from_min_max(egui::pos2(3.2, 2.6), egui::pos2(59.7, 60.1));
+            let scale = [1.0, 1.25, 2.0][case % 3];
+            let mut expected = vec![0x739bc1; 64 * 64];
+            let mut actual = expected.clone();
+            reference_triangle(&mut expected, [64, 64], clip, vertices, scale, &texture);
+            triangle(&mut actual, [64, 64], clip, vertices, scale, &texture);
+            for (i, (&a, &b)) in actual.iter().zip(&expected).enumerate() {
+                // Constant interpolation removes floating-point roundoff. It
+                // may change a rounded channel by one, never coverage/opacity.
+                for shift in [0, 8, 16] {
+                    assert!(
+                        ((a >> shift) & 255).abs_diff((b >> shift) & 255) <= 1,
+                        "case {case}, pixel {i}: {a:06x} != {b:06x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Repeatable CPU-only measurement at Retina resolution, without a display
+    /// server or network connection. Run with --ignored --nocapture.
+    #[test]
+    #[ignore = "manual rendering benchmark"]
+    fn hidpi_controls_benchmark() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        ctx.set_pixels_per_point(2.0);
+        let mut renderer = Renderer::default();
+        let mut panel = crate::transfer_panel::Panel::default();
+        panel.open = true;
+        let transfers = [crate::transfer_panel::Transfer {
+            id: 1,
+            name: "Project presentation.pdf".into(),
+            progress: Some((4_500_000, 12_000_000)),
+        }];
+        let mut pixels = vec![0; 1760 * 1120];
+        let mut elapsed = std::time::Duration::ZERO;
+        for frame in 0..35 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(880.0, 560.0),
+                    )),
+                    time: Some(frame as f64 / 60.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.heading("Connections");
+                        for row in 0..8 {
+                            ui.label(format!("Linux workstation {}", row + 1));
+                        }
+                    });
+                    panel.show(ctx, 0, &transfers);
+                },
+            );
+            let start = std::time::Instant::now();
+            renderer.paint(&ctx, output, &mut pixels, 1760, 1120);
+            std::hint::black_box(&pixels);
+            if frame >= 5 {
+                elapsed += start.elapsed();
+            }
+        }
+        eprintln!(
+            "HiDPI controls: {:.2} ms/frame",
+            elapsed.as_secs_f64() * 1000.0 / 30.0
+        );
+    }
     #[test]
     fn translucent_mesh_has_no_double_blended_diagonal_and_is_clipped() {
         let mut pixels = vec![0xffffff; 32 * 32];

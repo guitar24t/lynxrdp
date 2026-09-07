@@ -263,7 +263,7 @@ impl ApplicationHandler<Wake> for Desktop {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _: Wake) {
         self.poll(event_loop);
         if let Some(manager) = &self.manager {
-            if manager.ctx.has_requested_repaint() {
+            if manager.drawable() && manager.ctx.has_requested_repaint() {
                 manager.window.request_redraw();
             }
         }
@@ -353,7 +353,7 @@ impl ApplicationHandler<Wake> for Desktop {
         for viewer in &self.viewers {
             wake = wake.min(now + viewer.next_wake());
         }
-        if let Some(manager) = &self.manager {
+        if let Some(manager) = self.manager.as_ref().filter(|m| m.drawable()) {
             if now >= manager.repaint_at {
                 manager.window.request_redraw();
             } else {
@@ -386,6 +386,10 @@ struct ManagerWindow {
 }
 
 impl ManagerWindow {
+    fn drawable(&self) -> bool {
+        self.window.is_visible() != Some(false) && self.window.is_minimized() != Some(true)
+    }
+
     fn new(
         event_loop: &ActiveEventLoop,
         launcher: &Launcher,
@@ -436,6 +440,9 @@ impl ManagerWindow {
         launcher: &mut Launcher,
         #[cfg(unix)] mut broker: Option<&mut crate::askpass::broker::Broker>,
     ) -> Result<bool> {
+        if !self.drawable() {
+            return Ok(false);
+        }
         let size = self.window.inner_size();
         let (Some(w), Some(h)) = (
             std::num::NonZeroU32::new(size.width),
