@@ -16,7 +16,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 const CLOSE_GRACE: Duration = Duration::from_millis(100);
 
 pub(crate) struct Outbound {
-    socket: TcpStream,
+    socket: Arc<TcpStream>,
     sender: Option<Sender<Vec<u8>>>,
     queued_bytes: Arc<AtomicUsize>,
     error: Arc<Mutex<Option<String>>>,
@@ -26,7 +26,10 @@ pub(crate) struct Outbound {
 
 impl Outbound {
     pub fn new(socket: TcpStream) -> Result<Self> {
-        let mut stream = socket.try_clone()?;
+        // Keep the same OS handle alive on both threads. Windows cancellation
+        // must target the handle issuing the write, not a duplicated socket.
+        let socket = Arc::new(socket);
+        let stream = socket.clone();
         let (sender, receiver) = crossbeam_channel::bounded::<Vec<u8>>(MAX_MESSAGES);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let count = queued_bytes.clone();
@@ -37,7 +40,7 @@ impl Outbound {
             .name("lynxrdp-writer".into())
             .spawn(move || {
                 while let Ok(bytes) = receiver.recv() {
-                    let result = stream.write_all(&bytes);
+                    let result = (&*stream).write_all(&bytes);
                     count.fetch_sub(bytes.len(), Ordering::Relaxed);
                     if let Err(e) = result {
                         failure
@@ -96,8 +99,27 @@ impl Outbound {
             .unwrap()
             .get_or_insert_with(|| reason.to_owned())
             .clone();
-        let _ = self.socket.shutdown(Shutdown::Both);
+        self.stop_io();
         Err(anyhow!(reason))
+    }
+
+    fn stop_io(&self) {
+        let _ = self.socket.shutdown(Shutdown::Both);
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::{Foundation::HANDLE, System::IO::CancelIoEx};
+
+            // Winsock shutdown forbids subsequent sends but can leave a send
+            // already in progress waiting for its timeout. Cancel it before
+            // joining the worker. The Arc keeps this exact handle alive, and
+            // shutdown above prevents a new send racing past cancellation.
+            // No buffers/handles are freed until the worker has completed.
+            // https://learn.microsoft.com/windows/win32/api/ioapiset/nf-ioapiset-cancelioex
+            unsafe {
+                CancelIoEx(self.socket.as_raw_socket() as HANDLE, std::ptr::null());
+            }
+        }
     }
 
     pub fn close(&mut self, graceful: bool) {
@@ -108,7 +130,7 @@ impl Outbound {
             let _ = self.done.recv_timeout(CLOSE_GRACE);
         }
         // No write mutex is held here: shutdown must interrupt a blocked write.
-        let _ = self.socket.shutdown(Shutdown::Both);
+        self.stop_io();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -179,5 +201,26 @@ mod tests {
         writer.close(false);
         assert!(start.elapsed() < Duration::from_millis(500));
         assert!(writer.worker.is_none());
+    }
+
+    #[test]
+    fn closing_a_stalled_writer_cancels_io_without_waiting_for_the_socket_timeout() {
+        for graceful in [false, true] {
+            let (mut writer, _unread_peer) = pair();
+            for _ in 0..4 {
+                writer.send(vec![0; 1024 * 1024]).unwrap();
+            }
+            // Below the queue limit, so closure itself must stop the write;
+            // no preceding overload failure has already canceled it for us.
+            std::thread::sleep(Duration::from_millis(20));
+            let start = Instant::now();
+            writer.close(graceful);
+            assert!(
+                start.elapsed() < Duration::from_millis(500),
+                "close(graceful={graceful}) took {:?}",
+                start.elapsed()
+            );
+            assert!(writer.worker.is_none());
+        }
     }
 }
