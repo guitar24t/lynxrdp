@@ -223,6 +223,12 @@ jobs:
           lynxrdpd --check
           test -f /etc/pam.d/lynxrdp
           test -x /etc/lynxrdp/startwm.sh
+          # The rule must reach the host as a readable package-owned file.
+          # It also needs to disappear on removal (checked below), because
+          # it controls color management for all non-local sessions. The
+          # rules directory itself may be inaccessible to ordinary users.
+          sudo cmp packaging/polkit/02-lynxrdp-colord.rules /usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules
+          test "$(sudo stat -c '%a:%U:%G' /usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules)" = "644:root:root"
           systemd-analyze verify /usr/lib/systemd/system/lynxrdpd.service
           systemctl is-enabled lynxrdpd
           # Give the freshly-installed unit a moment to reach its running state.
@@ -285,6 +291,7 @@ jobs:
             rm -f /var/log/lynxrdp/citest.log /var/log/lynxrdp/citest.log.1.gz
           '
           sudo apt-get remove -y -q lynxrdp-server
+          sudo test ! -e /usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules
       - name: Inspect the .rpm
         run: |
           sudo apt-get install -y -q rpm
@@ -295,6 +302,7 @@ jobs:
           # the deb smoke test above cannot speak for the rpm, so check that
           # the snippet and its weak dependency actually made it in.
           rpm -qpl dist/lynxrdp-server-*.rpm | grep -qx /etc/logrotate.d/lynxrdp
+          rpm -qpl dist/lynxrdp-server-*.rpm | grep -qx /usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules
           rpm -qp --recommends dist/lynxrdp-server-*.rpm | grep -q logrotate
       - uses: actions/upload-artifact@v4
         with:

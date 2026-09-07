@@ -51,6 +51,18 @@ parser with property tests. `unsafe` in the rest of the tree is confined to
 places that must call C: the daemon's `libc` and PAM calls on the server,
 and the Win32 clipboard calls in the client's `fileclip.rs`.
 
+## Remote color management
+
+The server packages install
+`/usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules`. It returns an explicit
+denial for `org.freedesktop.color-manager.*` operations from non-local sessions,
+so desktop startup does not prompt for administrator authentication to register
+an Xvfb monitor. It grants no additional permissions. The rule affects all
+non-local sessions on the host, including other remote desktop software, and
+leaves local-console sessions and unrelated actions to the existing policy.
+Administrators can override it with an earlier local polkit rule. Package
+removal removes the rule too.
+
 ## File transfer and clipboard
 
 Files move over the transfer channel in both directions, so each side

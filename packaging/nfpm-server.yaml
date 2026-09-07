@@ -48,6 +48,13 @@ contents:
     dst: /usr/share/lynxrdp/pam/lynxrdp.rhel
     file_info:
       mode: 0644
+  # Package-owned so removal also removes the policy. Polkit reloads rules
+  # automatically; without polkit the file is inert, including on minimal
+  # servers that install their desktop environment later.
+  - src: packaging/polkit/02-lynxrdp-colord.rules
+    dst: /usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules
+    file_info:
+      mode: 0644
   - src: packaging/lynxrdpd.tmpfiles
     dst: /usr/lib/tmpfiles.d/lynxrdpd.conf
     file_info:

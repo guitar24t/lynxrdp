@@ -80,6 +80,19 @@ and started), `/etc/lynxrdp/lynxrdp.toml`, `/etc/lynxrdp/startwm.sh`, a PAM
 service file `/etc/pam.d/lynxrdp` and a logrotate snippet
 `/etc/logrotate.d/lynxrdp` (see [Session logs](#session-logs)).
 
+Both server packages also install
+`/usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules` to suppress the
+"Authentication is required to create a color managed device" prompt when a
+desktop starts. The rule silently denies color-management operations in all
+non-local sessions on the server, including sessions from other remote desktop
+software. Local-console policy is unchanged. The virtual Xvfb display does not
+need physical-monitor calibration.
+
+Polkit loads the rule automatically on installation or upgrade, with no reboot.
+It has no effect if polkit is absent and is removed when the server package is
+removed. Administrators who need remote color management can override it with an
+earlier rule in `/etc/polkit-1/rules.d/`.
+
 You need a desktop environment on the server. XFCE is a good, light choice:
 
 ```sh

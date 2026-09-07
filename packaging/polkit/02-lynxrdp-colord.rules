@@ -1,0 +1,13 @@
+// A headless desktop may try to register its virtual monitor with colord.
+// Remote sessions would then prompt for administrator authentication on
+// every login. Decline color-management operations without a prompt: Xvfb
+// does not need physical-monitor calibration.
+//
+// This applies to all non-local sessions on the server, including other
+// remote desktop servers. Local-console sessions keep their existing policy.
+polkit.addRule(function(action, subject) {
+    if (!subject.local &&
+        action.id.indexOf("org.freedesktop.color-manager.") === 0) {
+        return polkit.Result.NO;
+    }
+});
