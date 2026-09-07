@@ -43,8 +43,14 @@ max_in_flight = 2
 # measures justifies more. A fixed 2 frames per round trip is 40 fps at 50 ms
 # and 20 fps at 100 ms, and the transport here is an SSH tunnel that is often
 # crossing a WAN. The value above stays the floor either way: the session will
-# never allow itself fewer frames than you asked for, so set this to false if
-# you are tuning for latency and want max_in_flight taken literally.
+# never allow itself fewer frames than you asked for.
+#
+# Setting this to false is meant to hold the window at exactly max_in_flight,
+# for tuning latency rather than smoothness, but it does not reach a session
+# the daemon starts: the daemon builds the session's arguments without
+# --no-auto-in-flight, so adaptation stays on no matter what you put here.
+# Today only a hand-run `lynxrdp-session --no-auto-in-flight` holds the
+# window at the floor.
 max_in_flight_auto = true
 # Seconds a session may stay without a client before it is ended (0 = never).
 idle_timeout_secs = 0
@@ -65,8 +71,10 @@ dpi = 96
 # are up and what address to reach them on. Off by default.
 #
 # This is the only part of LynxRDP that talks to the network by itself. It
-# only ever sends: no port is opened here and nothing is read back, so the
-# loopback-only rule above still holds.
+# only ever sends: every report gets a socket of its own, connected to the
+# collector so the kernel picks the source address that is worth reporting,
+# never read from, and closed again -- so the loopback-only rule above still
+# holds.
 #
 # Reports are sealed so a packet capture cannot read your hostnames, but the
 # key is compiled into the software and is therefore not secret from anyone

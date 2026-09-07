@@ -6,9 +6,14 @@
 //!
 //! Three properties are deliberate:
 //!
-//! * **Outbound only.** No socket is bound to a wildcard address and nothing
-//!   is read back, so enabling this does not make the host reachable in any
-//!   way it was not already. The security model in SECURITY.md is unchanged.
+//! * **Outbound only.** No socket outlives the report it carries: `send_once`
+//!   binds an ephemeral port, connects it to the collector, sends, and drops
+//!   it. The bind is to the wildcard address, because it is the `connect` that
+//!   makes the kernel choose the source address it would really route from,
+//!   and that address is what the report claims -- anything narrower is a
+//!   guess that is wrong on a multi-homed host. Nothing is ever read from the
+//!   socket, so enabling this does not make the host reachable in any way it
+//!   was not already, and the security model in SECURITY.md is unchanged.
 //! * **UDP, and unacknowledged.** A monitoring server that is down, slow or
 //!   missing must never slow the daemon down or hold up a connection. A lost
 //!   report costs one interval of staleness and nothing else.

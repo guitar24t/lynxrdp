@@ -30,9 +30,9 @@ pub fn have(prog: &str) -> bool {
 /// A guard that prints a message and returns is reported by cargo as a
 /// *passing* test. That is the right behaviour on a developer's machine, where
 /// not everyone has `Xvfb` and `xclip`, and exactly the wrong one in CI: remove
-/// `xvfb` from the workflow's apt line and twenty-two end-to-end tests go green
-/// having covered nothing whatsoever. Nothing in the output distinguishes that
-/// from a real run.
+/// `xvfb` from the workflow's apt line and the whole end-to-end suite goes
+/// green having covered nothing whatsoever. Nothing in the output
+/// distinguishes that from a real run.
 ///
 /// `LYNXRDP_REQUIRE_E2E` is set on precisely the CI steps that install these
 /// dependencies, so there an absent one is the bug it actually is rather than a

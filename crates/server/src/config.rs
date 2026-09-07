@@ -54,18 +54,22 @@ pub struct AccessConfig {
 /// Heartbeat reports to a monitoring server.
 ///
 /// This is the one part of LynxRDP that talks to the network on its own, so
-/// it is off unless switched on. The daemon only ever *sends*: no port is
-/// opened and nothing is accepted in reply, so enabling it does not widen
+/// it is off unless switched on. The daemon only ever *sends*: every report
+/// gets a socket of its own, connected to the collector and dropped again,
+/// and nothing is ever read back from it, so enabling this does not widen
 /// the attack surface of the host. What it does do is put the hostname and
-/// address of this machine on the wire in the clear, once per interval --
-/// see SECURITY.md before pointing it across an untrusted network.
+/// address of this machine on the wire once per interval, sealed under a key
+/// that ships in the binary -- obfuscation rather than confidentiality; see
+/// SECURITY.md before pointing it across an untrusted network.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReportingConfig {
     /// Whether to send reports at all.
     pub enabled: bool,
     /// Where to send them, as `host:port`. The host may be a name or an
-    /// address; names are resolved once when the reporter starts.
+    /// address; a name is resolved again before every report, so a collector
+    /// that was not in DNS when the daemon started begins receiving them
+    /// without anyone having to restart it.
     pub destination: String,
     /// Seconds between reports.
     pub interval_secs: u64,
@@ -117,9 +121,13 @@ pub struct SessionConfig {
     ///
     /// On by default because the fixed default of 2 frames per round trip is
     /// 20 fps at 100 ms, and the transport this server is designed for is an
-    /// SSH tunnel across a WAN. Turn it off to hold the window at exactly
-    /// `max_in_flight`, which is what an operator tuning for latency rather
-    /// than smoothness is asking for.
+    /// SSH tunnel across a WAN. Turning it off is meant to hold the window at
+    /// exactly `max_in_flight`, which is what an operator tuning for latency
+    /// rather than smoothness is asking for -- but it does not reach a session
+    /// the daemon starts: `SessionManager::spawn` builds the argument list
+    /// without `--no-auto-in-flight`, and a session reads no configuration
+    /// file of its own, so today only a hand-run
+    /// `lynxrdp-session --no-auto-in-flight` holds the window there.
     pub max_in_flight_auto: bool,
     /// Seconds without a connected client after which the session is
     /// terminated. `0` keeps sessions forever (until logout).
@@ -130,7 +138,8 @@ pub struct SessionConfig {
     pub runtime_dir: PathBuf,
     /// Path of the `lynxrdp-session` executable.
     pub session_binary: PathBuf,
-    /// Directory for per-session log files (`<runtime_dir>/log` if unset).
+    /// Directory for per-session log files (`/var/log/lynxrdp` if unset --
+    /// the directory the packages create and logrotate rotates).
     pub log_dir: Option<PathBuf>,
     /// DPI reported by the X server.
     pub dpi: u32,

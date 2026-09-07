@@ -7,7 +7,7 @@ lynxrdpd (root)
  ├─ listens 127.0.0.1:3390 (and optionally a Unix socket)
  ├─ identifies the peer uid: /proc/net/tcp for TCP, SO_PEERCRED for Unix
  ├─ access policy (min uid, allow/deny lists, groups)
- ├─ handoff worker pool (one connection per uid at a time)
+ ├─ handoff worker pool (16 workers, at most two connections per uid)
  └─ per user: lynxrdpd --supervise (root)
               ├─ pam_open_session("lynxrdp")   ← systemd-logind session, XDG_RUNTIME_DIR, limits
               └─ lynxrdp-session (setuid user, own session id)
@@ -21,10 +21,14 @@ Only the first three lines run on the listening thread. They cost
 microseconds, and the `/proc/net/tcp` lookup has to happen there because it
 needs the peer's socket to still be in the kernel's table. The handoff itself
 does not: a cold start budgets 45 seconds for Xvfb, and a session its owner
-has stopped never answers at all, so it runs on a pool of workers. The pool
-admits one connection per uid at a time -- two spawning at once would leave
-one supervisor holding an X server on a socket the other had just unlinked --
-and refuses rather than queues when it is full.
+has stopped never answers at all, so it runs on a pool of sixteen workers
+behind a queue of thirty-two, of which any one uid may hold two places at
+once. Past that the connection is refused rather than left waiting: a queue
+that grew instead would hold client sockets for as long as one stopped session
+cared to stall, and would eventually hand a worker a connection whose client
+gave up minutes ago. One uid's handoffs are then serialised among themselves by
+a start latch -- two spawning at once would leave one supervisor holding an X
+server on a socket the other had just unlinked.
 
 The daemon never touches pixels or input. Once it has handed the client
 socket to the session process (`SCM_RIGHTS` over a root-only Unix socket in
@@ -38,8 +42,9 @@ then performs the same `/proc/net/tcp` uid check itself.
 ## Session core
 
 One thread owns the X connection objects and all decisions. It selects over
-three channels: X events (forwarded by a reader thread), client messages
-(forwarded by a per-connection reader thread) and a housekeeping tick.
+one event channel -- X events (forwarded by a reader thread), client messages
+(forwarded by a per-connection reader thread) and the file worker's replies all
+arrive on it -- a frame timer, and a housekeeping tick.
 
 Frame pipeline:
 
@@ -79,10 +84,26 @@ Frame pipeline:
    bit-identical to the server's, which is what keeps text crisp and lets
    the property tests assert exact round-trips.
 5. The copies and tiles are batched into one `ScreenUpdate`, which is
-   queued to the writer thread. `max_in_flight`
-   (default 2) frames may be unacknowledged; further damage accumulates
-   and is sent as one frame after the next ack. The client therefore never
-   has a backlog of stale frames.
+   queued to the writer thread. A bounded number of frames may be
+   unacknowledged; further damage accumulates and is sent as one frame
+   after the next ack. The client therefore never has a backlog of stale
+   frames.
+
+   `max_in_flight` (default 2) is the *floor* of that bound rather than
+   the bound itself, because two frames per round trip is 20 fps at 100 ms
+   on a transport that is by design a WAN SSH tunnel, and a bigger
+   constant is no answer either: the right number is the bandwidth-delay
+   product measured in frames, and only the link knows it. Each
+   acknowledgement therefore moves the window one slot towards the number
+   of frames that fit in the measured round trip, and one slot back when
+   the path has shortened or a sample says the frames already out there
+   are queueing — never below the configured value, and never above eight,
+   past which it would be buffering rather than pipelining. The estimate
+   behind it is a windowed *minimum* of recent samples, so the window
+   tracks the path rather than the backlog it created itself. A session run
+   by hand can hold the window at exactly `max_in_flight` with
+   `--no-auto-in-flight`; the daemon builds no such argument, so a session it
+   starts always adapts.
 
 Input is applied the moment it arrives, ahead of frame work. Pointer motion
 is injected with `XTestFakeInput`; keys are mapped from keysyms using the
@@ -99,7 +120,13 @@ mouse position, so pointer feedback is independent of network latency.
 Length-prefixed binary messages (see `crates/proto/src/message.rs`),
 little endian, no TLS (the SSH tunnel provides confidentiality and
 integrity). Handshake: `ClientHello` → `ServerHello | Rejected` → full
-`ScreenUpdate`. Everything is versioned by a single `PROTOCOL_VERSION`.
+`ScreenUpdate`. `PROTOCOL_VERSION` rises whenever the protocol gains
+anything, but the two ends are not required to match it:
+`MIN_COMPATIBLE_VERSION` is a separate floor that moves only for a change an
+older peer cannot survive, and the server answers with the older of the two
+numbers so that an old client's plain equality check still passes. The agreed
+number is then put aside; what each side may actually do is carried by the
+feature bits the two hellos exchange, not by the version.
 
 Message tags below 128 are **structural**: a peer that cannot decode one
 cannot stay in sync, so an unknown tag there is fatal. Tags at or above 128
@@ -154,12 +181,18 @@ for stalled reads and publication. Pending opens are capped at 64 per session.
 Dropping an adapter cancels queued work without sending a blocking cleanup job;
 the worker releases cancelled handles when it can next run.
 
-Both sides use `proto::clipboard_batch::ClipBatch` for unique cross-platform
-names, eight concurrent file requests, cancellation of superseded batches, and
-settling every success or failure. A partial batch publishes the successful
-files and reports the missing ones. Disconnect clears transfer state but keeps
-the server's ID allocator advancing. Open callbacks are generation-checked
-before their pending entry is removed.
+Both sides share `proto::clipboard_batch`'s naming rules, which sanitise and
+deduplicate on every platform rather than under `cfg(windows)`, so that the set
+of collisions is the same everywhere and the case that silently overwrites a
+file cannot appear only on the platform nobody tested on. The `ClipBatch` type
+itself now backs drag-and-drop alone (`session/drop.rs`): one slot per file, at
+most eight requests outstanding, every id resolved exactly once whether it
+arrived or failed, and a batch that lost a file cancelled whole rather than
+delivered short. A clipboard copy plans no batch -- it publishes names and
+sizes at once through `lynxrdp_filecopy::Files` and fetches contents only when
+the native reader asks. Disconnect clears transfer state but keeps the server's
+ID allocator advancing. Open callbacks are generation-checked before their
+pending entry is removed.
 
 `proto::atomic_file` stages on the destination filesystem and publishes only on
 successful completion. The server resolves upload parents using directory
@@ -182,28 +215,39 @@ confirmed termination in its Running Desktops window.
 `crates/client/src/connection.rs` is a UI-free protocol client used by the
 GUI and by the tests. `app.rs` is a winit `ApplicationHandler` on top of it.
 `tunnel.rs` runs the system `ssh` with `-N -L … -o ExitOnForwardFailure=yes`
-and waits for the local port to accept connections (which OpenSSH only does
-after authentication succeeded).
+and waits for the local end of the forward to accept connections (which
+OpenSSH only does after authentication succeeded). That end is a Unix socket
+in a `0700` directory wherever OpenSSH supports one and `--local-port` has not
+asked for a fixed port, because a loopback port belongs to nobody for the whole
+authentication window and, once bound, is reachable by every process of every
+user on the machine.
 
-The binary has two entry points and one process model. Started with a
-destination it opens a session window directly; started with no arguments it
-opens the connection manager (`launcher.rs`, an egui window over
-`profiles.rs`), and **connecting re-invokes the same executable as a child
-process** (`launch.rs`).
+The binary has two entry points. Started with a destination it opens a session
+window directly; started with no arguments it opens the connection manager
+(`launcher.rs`, an egui window over `profiles.rs`), and **connecting re-invokes
+the same executable as a child process** (`launch.rs`).
 
-That split is forced and then useful. Forced, because a process may hold only
-one winit event loop, and the launcher already holds one — a session cannot
-open its window in the launcher's process. Useful, because several sessions
-can then run at once, a session that dies cannot take the manager with it,
-and the argument list a saved connection produces is exactly what a user
-could have typed, so the GUI and the command line cannot drift apart.
+On Windows and Linux that split is forced and then useful. Forced, because a
+process may hold only one winit event loop, and the launcher already holds
+one — a session cannot open its window in the launcher's process. Useful,
+because several sessions can then run at once, a session that dies cannot take
+the manager with it, and the argument list a saved connection produces is
+exactly what a user could have typed, so the GUI and the command line cannot
+drift apart.
+
+macOS is the exception. There one application owns the manager and every
+session window in a single event loop (`app/desktop.rs`, reached from
+`launcher::run`), and connecting queues a profile for that host rather than
+spawning anything -- so anything that assumes a child process on this path
+(a pid, an exit status, a tail of the session's stderr) is inert there.
 
 `profiles.rs` holds no credentials of any kind. SSH owns authentication, and
 a second, weaker copy of it on disk would be a liability with no benefit.
 
 `update/` is the connection manager's self-updater, and it lives on the
-launcher side only — a session window is a child process with no menus, and
-replacing an executable under a desktop that is mid-keystroke would be rude.
+launcher side only — the menus that could offer an update are the launcher's,
+and replacing an executable under a desktop that is mid-keystroke would be
+rude.
 Its shape follows the same rule as the rest of the client: everything that
 decides anything is a pure function taking its inputs as arguments — which
 release, which asset, whether this installation may be replaced and how —
@@ -223,7 +267,7 @@ and will not replace itself.
 
 ## Monitoring reports
 
-`crates/server/src/reporting.rs` is optional and off by default. When it is
+`crates/server/src/reporting/mod.rs` is optional and off by default. When it is
 on, the daemon sends one JSON datagram per interval to a monitoring server.
 
 It runs on its own thread rather than in the accept loop, for one reason:
@@ -257,16 +301,21 @@ scheme need not be a flag day.
   updates, keyboard (verified with an in-process X11 window that receives
   the events), pointer (`xdotool`), resize (RandR), clipboard text, images
   and file copies (`xclip`), file upload and download including refusal of
-  a path-traversing destination, reconnection, lifecycle.
+  a path-traversing destination, targeted drops onto the application under
+  the pointer and onto the bare desktop, reconnection, lifecycle.
 * `crates/server/tests/daemon.rs` runs `lynxrdpd --allow-non-root` and
   checks identification, handoff, session reuse and policy rejections.
+* `crates/server/tests/tunnel_e2e.rs` stands up a throwaway `sshd` and
+  connects through a real `ssh -L` forward. It is the only test that
+  exercises the transport the product actually ships over.
 * CI builds the client on Windows, macOS (Apple Silicon) and Linux
   (x86_64, aarch64), builds the `.deb`/`.rpm`, installs the `.deb` and
   checks the service starts.
 * The Windows and macOS clipboard file backends are the one part CI cannot
-  exercise fully: they are compiled for their targets under
-  `clippy -D warnings`, and the CF_HDROP block builder is pure and unit
-  tested, but pasting into a real Explorer or Finder is a manual check.
+  exercise fully: they are built and their unit tests run on their own
+  runners -- the CF_HDROP block builder is pure and tested there -- but
+  pasting into a real Explorer or Finder is a manual check, and
+  `clippy -D warnings` runs only on Linux, so it never sees either of them.
 
 ### Session controls
 
@@ -281,8 +330,11 @@ pixels are restored, so closing or moving a panel leaves no stale pixels.
 
 Local controls capture only their own pointer gestures and keyboard focus.
 Clicking the remote desktop returns keyboard focus to it; a remote drag retains
-its release even when crossing local controls. Drops start safe uploads
-immediately. A dismissible notification replaces the former full-window transfer
-menu, and the optional details window includes progress, cancellation, download
-fields, and recent activity. Failed transfers remain visible in recent activity
-when later files in a batch finish successfully.
+its release even when crossing local controls. A file dropped on the window goes
+to the remote application under the pointer, or to the session's desktop folder
+when it lands on the bare desktop; a target that accepts neither is told so
+("that location does not accept copied files") rather than being sent the file
+anyway or silently swallowing it. A dismissible notification replaces the former
+full-window transfer menu, and the optional details window includes progress,
+cancellation, download fields, and recent activity. Failed transfers remain
+visible in recent activity when later files in a batch finish successfully.

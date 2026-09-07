@@ -19,8 +19,15 @@ server as the sole authentication and transport-security boundary.
   user's session; there is no username field to tamper with.
 * Root and system accounts are refused by default (`access.min_uid`,
   `access.deny_users`), and `allow_users`/`allow_groups` can restrict
-  access further. PAM account checks (`pam_acct_mgmt`) also apply, so
-  locked or expired accounts cannot open sessions.
+  access further. Those checks always run. The PAM account check
+  (`pam_acct_mgmt`) does not: it happens only where the supervisor is
+  root, `session.pam_service` names a service, `/etc/pam.d/<service>`
+  exists and libpam can be `dlopen`ed, and if any of those is missing the
+  session starts without one. Where it does run, locked and expired
+  accounts cannot open sessions; where it does not -- a daemon started
+  `--allow-non-root`, or a host with no PAM file for the service --
+  nothing else in LynxRDP enforces account expiry, and the access lists
+  above are the whole of the policy.
 
 ## Local users on the server
 
@@ -36,20 +43,71 @@ cannot reach anybody else's session:
 * The session process verifies the uid in every handoff it receives and
   that the handoff comes from root or itself.
 
+One flag turns part of this off. `--insecure-skip-peer-check` drops the uid
+check on a session's own `--listen` socket, so any local user may connect to
+it; its own help calls it testing only, and it is listed in
+`lynxrdp-session --help` rather than hidden. `lynxrdpd` never passes it, and
+never gives a session a `--listen` address at all -- the sessions it starts
+are reachable only over the control socket, whose checks the flag does not
+touch. So it can only be in play on a session someone started by hand, and
+on a multi-user host it should not be in play at all.
+
+## Local users on the client
+
+The client opens local endpoints of its own while it is running, and the
+same question applies to them: what stops another user of the same machine
+reaching in? None of them speaks the LynxRDP protocol, and none is reached
+from the network.
+
+* **The askpass socket, on macOS.** One process there hosts the connection
+  manager and every session window, so SSH's passphrase prompts are
+  answered in that window rather than by a second application: the askpass
+  helper `ssh` runs relays the prompt back over a Unix socket whose path it
+  is handed in `LYNXRDP_ASKPASS_SOCKET`. That socket sits in a temporary
+  directory set to 0700, and the mode is the whole of the protection -- the
+  broker does not check `SO_PEERCRED`. A uid that can traverse that
+  directory can already read the process's memory, so the check would buy
+  nothing. The passphrase is zeroed in place on both sides of the socket
+  once it has been passed on, which defends against a core file and against
+  nothing else.
+* **The clipboard's WebDAV server, on macOS.** Pasting files from a session
+  mounts a read-only WebDAV volume, which means a loopback TCP listener any
+  local user can connect to. What they cannot do is name a file: every URL
+  sits below a path prefix of 24 random characters generated for that copy,
+  and a request that does not match it is answered with a 404. Only
+  `OPTIONS`, `PROPFIND`, `HEAD` and `GET` are answered at all, and what they
+  can reach is what the session had already offered.
+* **The FUSE mount, on Linux.** The same paste is a read-only FUSE mount
+  instead, made without `allow_other`, so the kernel refuses every uid but
+  the one that mounted it.
+
 ## Privilege separation
 
 `lynxrdpd` runs as root but does very little: accept, identify, decide,
 spawn, hand over. Per session it forks a supervisor that opens the PAM
-session and then `exec`s `lynxrdp-session` after `initgroups`/`setgid`/
-`setuid` (and verifies that regaining root fails). All X11, image and
-protocol parsing code runs with the user's privileges only.
+session and then `exec`s `lynxrdp-session` after `setgroups`/`setgid`/
+`setuid` (and verifies that regaining root fails). The group list handed
+to `setgroups` is resolved in the parent, before the fork, rather than by
+calling `initgroups(3)` in the child: that lookup goes through NSS, which
+may dlopen a module and allocate, and neither is legal between `fork` and
+`exec` -- least of all in a process that has just pulled the whole name
+service stack in through libpam. All X11, image and protocol parsing code
+runs with the user's privileges only.
 
 The protocol crate is `#![forbid(unsafe_code)]`, so that is compiler
 enforced rather than a convention: every length is bounds-checked, message
 sizes are capped before allocation, and random input is thrown at the
-parser with property tests. `unsafe` in the rest of the tree is confined to
-places that must call C: the daemon's `libc` and PAM calls on the server,
-and the Win32 clipboard calls in the client's `fileclip.rs`.
+parser with property tests. That guarantee stops at the crate boundary.
+Outside it, `unsafe` is used wherever the code has to reach an interface
+Rust cannot describe: the daemon's `libc` and PAM calls and the credential
+switch itself, descriptor passing, the session's raw socket, `openat` and X
+shared-memory calls, the process control around Xvfb and the desktop, and
+the platform calls the client makes for the clipboard, drag-and-drop, the
+Windows console it reattaches to and its own installer. One use is not like
+the others: the blocks in the client's askpass path that overwrite an SSH
+passphrase with zeroes in place, which are there to bound how long the
+secret survives in the heap -- the one place here where `unsafe` is what
+makes the code safer rather than the price of calling C.
 
 ## Remote color management
 
@@ -82,8 +140,8 @@ offer from the other:
   is what stops a compromised session from pushing files onto the client.
 * **The client serves only what it published.** When the session asks for
   a file by path, the client answers only for paths it explicitly put on
-  the clipboard, so a file request cannot be turned into a read of
-  arbitrary client files.
+  the clipboard or named in a drag-and-drop it started, so a file request
+  cannot be turned into a read of arbitrary client files.
 * **Sizes are bounded everywhere.** Transfers are capped at
   `MAX_TRANSFER_SIZE`, clipboard text at 4 MiB, clipboard images at 64 MiB
   and decoded images at `MAX_PIXELS`, so a hostile peer cannot make either
@@ -128,10 +186,17 @@ The optional `[reporting]` section is the only part of LynxRDP that speaks to th
 own accord, and it is off unless you switch it on. What it does and does not
 change:
 
-* **It opens nothing.** The daemon only sends. No socket is bound to a
-  wildcard address, no reply is read, and the loopback-only rule above is
-  untouched. Enabling reporting does not make the host reachable in any way
-  it was not already.
+* **It opens nothing that answers.** The daemon only sends, but it does bind:
+  the socket a report goes out on takes a wildcard address and an ephemeral
+  port, and an `ss -lun` will show it. It is `connect`ed to the collector
+  before anything leaves, which is what makes the kernel drop a datagram from
+  anywhere else; nothing is ever read back from it; and it is closed as soon
+  as the report is away, one socket per report rather than one for as long as
+  reporting is on. The wildcard bind is how the kernel is asked which source
+  address it would really route from, which is the address the report claims
+  the host is reachable on and the one thing that cannot be guessed on a
+  multi-homed host. The loopback-only rule above is untouched, and enabling
+  reporting does not make the host reachable in any way it was not already.
 * **It does disclose.** Each interval the hostname, the address the host
   would be reached on, the LynxRDP version and the number of running sessions
   leave the machine. They are sealed (see below), which stops a casual

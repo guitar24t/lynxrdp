@@ -16,10 +16,14 @@
 //! * Input is applied the moment it arrives, ahead of any frame work.
 //! * No transfer byte is read or written here. Opening, creating, reading and
 //!   writing all go through [`super::fileio`], on a thread of their own,
-//!   because this one cannot afford to wait on a disk. One `stat` per path is
-//!   still taken inline when the *session* copies files to the clipboard --
-//!   see [`Core::on_clipboard_event`] -- and is the last filesystem call left
-//!   on this thread.
+//!   because this one cannot afford to wait on a disk. Two things are still
+//!   done inline, both on the clipboard path: one `stat` per path when the
+//!   *session* copies files (see [`Core::on_clipboard_event`]), and the whole
+//!   of [`Core::stage_client_files`] when the *client* does -- publishing the
+//!   client's copy creates the staging directories and mounts a FUSE view,
+//!   which execs `fusermount3`, and the mount it replaces has to be unmounted
+//!   and deleted first. Nothing rate limits `Message::FileList`, so that
+//!   second one is a hitch a client can ask for as often as it likes.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -615,14 +619,13 @@ impl Core {
                 }
                 let mut files = Vec::new();
                 for p in &paths {
-                    // The one filesystem call left on this thread, and it is a
-                    // known gap rather than an oversight: an offer has to carry
-                    // a size, and answering that from the worker would mean a
-                    // second asynchronous round trip for a path the user just
-                    // copied by hand. A `stat` per file is orders of magnitude
-                    // cheaper than the reads and writes this module moved off,
-                    // but on a mount that has stopped answering it hitches the
-                    // frame loop just the same.
+                    // Inline, and a known gap rather than an oversight: an
+                    // offer has to carry a size, and answering that from the
+                    // worker would mean a second asynchronous round trip for a
+                    // path the user just copied by hand. A `stat` per file is
+                    // orders of magnitude cheaper than the reads and writes
+                    // this module moved off, but on a mount that has stopped
+                    // answering it hitches the frame loop just the same.
                     //
                     // Directories would need recursive listing; skip them
                     // rather than offering something we cannot deliver.

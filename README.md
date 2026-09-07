@@ -52,8 +52,12 @@ your SSH credentials.
   connection manager with saved connections, and installs like any other
   program: a Start Menu entry on Windows, `LynxRDP.app` on macOS, an
   applications-menu entry on Linux. Every command line option is still there.
-* **Pure Rust, tiny dependency surface.** No C libraries are linked at build
-  time. The X server (Xvfb) and `libpam` are used at runtime.
+* **Pure Rust, tiny dependency surface.** Building needs a C compiler —
+  zstd and the updater's TLS each compile a little vendored C of their own —
+  but no system development package: x11rb speaks X11 over a socket rather
+  than through Xlib, and rustls carries its own CA roots. At runtime the
+  server wants an X server (Xvfb) and finds `libpam` by `dlopen`, so the same
+  binary works on a host that has no PAM at all.
 * **Runs without root too.** `lynxrdp-session --listen 127.0.0.1:3390` serves
   your own session with the same security property, no daemon needed.
 * **Optional fleet view.** Servers can report their hostname and address to a
@@ -209,10 +213,10 @@ of saved connections with **Connect**, **New**, **Edit** and **Delete**.
 Double-clicking a connection opens it.
 
 A saved connection holds the host, user, SSH port, identity file, extra
-`ssh -o` options, screen size, and the fullscreen, dynamic-resize and
-clipboard switches. **It never holds a password or a passphrase**: SSH
-already owns authentication, and there is nothing here worth a second,
-weaker copy of it.
+`ssh -o` options, the LynxRDP port on the server's loopback interface, screen
+size, magnification, and the fullscreen, dynamic-resize and clipboard
+switches. **It never holds a password or a passphrase**: SSH already owns
+authentication, and there is nothing here worth a second, weaker copy of it.
 
 They live in one editable TOML file:
 
@@ -222,9 +226,10 @@ They live in one editable TOML file:
 | macOS | `~/Library/Application Support/LynxRDP/connections.toml` |
 | Windows | `%APPDATA%\LynxRDP\connections.toml` |
 
-Each session opens as its own process, so several can run at once and one
-crashing cannot take the manager with it. Closing the manager leaves running
-sessions alone.
+On Windows and Linux each session opens as its own process, so several can
+run at once and one crashing cannot take the manager with it; on macOS the
+manager and its session windows are one application instead. Either way,
+closing the manager leaves running sessions alone.
 
 ### From the command line
 
@@ -250,6 +255,7 @@ lynxrdp -p 2222 user@host           # SSH port
 lynxrdp -i ~/.ssh/work user@host    # identity file
 lynxrdp -o ProxyJump=bastion host   # any ssh -o option (repeatable)
 lynxrdp --size 2560x1440 host       # initial remote screen size
+lynxrdp --scale 2 host              # magnify by a whole factor, 1 to 4
 lynxrdp -f host                     # fullscreen (toggle: Ctrl+Alt+Enter)
 lynxrdp --remote-socket /run/lynxrdp/lynxrdp.sock host   # if the server
                                     # is configured with listen.unix_socket
@@ -383,7 +389,9 @@ lynxrdp-session --listen 127.0.0.1:3390 --startwm /etc/lynxrdp/startwm.sh
 ```
 
 It refuses connections from sockets not owned by your uid, which is the same
-guarantee the daemon provides, so `lynxrdp you@server` works unchanged.
+guarantee the daemon provides, so `lynxrdp you@server` works unchanged. The
+one switch that gives that up is `--insecure-skip-peer-check`, which accepts
+any local uid and exists for tests.
 
 ## Configuration
 
@@ -396,8 +404,15 @@ guarantee the daemon provides, so `lynxrdp you@server` works unchanged.
 | `access.allow_users`, `allow_groups` | empty | Restrict who may connect. |
 | `session.default_width/height` | `1920x1080` | Size when the client does not ask for one. |
 | `session.max_width/height` | `4096x2160` | Upper bound (Xvfb virtual screen). |
-| `session.max_fps`, `max_in_flight` | `60`, `2` | Latency/smoothness knobs. |
-| `session.idle_timeout_secs` | `0` | End sessions nobody is connected to. |
+| `session.max_fps`, `max_in_flight` | `60`, `2` | Latency/smoothness knobs. `max_in_flight` is a floor rather than a ceiling: a session raises its own window towards the round trip it measures, up to 8. |
+| `session.idle_timeout_secs` | `0` | Seconds without a connected client before a session is ended. `0`, the default, means never: a desktop nobody comes back to keeps running until the user logs out of it. |
+
+`session.max_in_flight_auto = false` is meant to hold that window at exactly
+the number configured, but the daemon does not pass the setting through to
+the sessions it starts, so a daemon-started session always adapts. The only
+thing that holds it today is `lynxrdp-session --no-auto-in-flight` run by
+hand — a command-line switch rather than this key, because a session in user
+mode never reads this file.
 
 ### Session logs
 
@@ -428,6 +443,17 @@ Requirements: Rust 1.80+ (stable). For the Linux end-to-end tests: `Xvfb`,
 ```sh
 cargo build --release --workspace
 cargo test --workspace                 # unit tests + Xvfb end-to-end tests
+```
+
+Both of those are Linux commands: `crates/server` is
+`#![cfg(target_os = "linux")]` from its crate root down, so elsewhere its
+binaries have no `main` and the workspace does not build at all. On Windows
+and macOS build and test the client crates alone instead, which is what CI
+runs on those runners:
+
+```sh
+cargo build --release -p lynxrdp-client
+cargo test -p lynxrdp-proto -p lynxrdp-client -p lynxrdp-filecopy
 ```
 
 Packages (needs [nfpm](https://nfpm.goreleaser.com/)):
@@ -481,8 +507,9 @@ interval_secs = 60
 
 Each interval the daemon sends one small datagram with its hostname, the
 address it would be reached on, the version and how many sessions are
-running. It only ever sends: no port is opened, so the loopback-only rule is
-unchanged.
+running. It only ever sends — nothing listens, and the socket a report goes
+out on is connected to the monitoring server and never read — so the
+loopback-only rule is unchanged.
 
 Reports are sealed with ChaCha20-Poly1305 so a packet capture does not read
 as a list of your hostnames. The key is baked into the software, so this is
@@ -502,6 +529,7 @@ cd tools/lynxrdp-monitor && pip install -r requirements.txt && ./lynxrdp-monitor
 | Path | What |
 | --- | --- |
 | `crates/proto` | Wire protocol, framing, tile codec, copy detection, keysyms. Shared by both sides. |
+| `crates/filecopy` | Clipboard file offers whose contents are fetched only when something reads them: FUSE on Linux, `IDataObject` on Windows, a loopback WebDAV mount on macOS. Used by both sides. |
 | `crates/server` | `lynxrdpd` (daemon) and `lynxrdp-session` (per-user session). Linux only. |
 | `crates/client` | `lynxrdp` GUI client and the headless client library. |
 | `packaging/` | nfpm configs, systemd unit, PAM files, `startwm.sh`, the logrotate snippet, the NSIS installer, the macOS bundle and disk image scripts. |
