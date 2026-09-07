@@ -106,7 +106,13 @@ mod tests {
         assert_eq!(std::fs::metadata(&files.paths[0]).unwrap().len(), 5);
         assert!(files.requests.is_empty());
         let path = files.paths[0].clone();
-        let read = std::thread::spawn(move || std::fs::read(path).unwrap());
+        let destination = parent.path().join("pasted.txt");
+        // Exercise macOS copyfile through std::fs::copy, as a file manager
+        // does, rather than only testing a buffered Rust read of the source.
+        let read = std::thread::spawn(move || {
+            assert_eq!(std::fs::copy(path, &destination).unwrap(), 5);
+            std::fs::read(destination).unwrap()
+        });
         let fetch = files
             .requests
             .recv_timeout(Duration::from_secs(10))

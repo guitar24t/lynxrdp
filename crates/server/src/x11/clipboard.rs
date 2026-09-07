@@ -688,6 +688,12 @@ impl Clipboard {
             return Vec::new();
         }
         let text = String::from_utf8_lossy(&data).into_owned();
+        if let Some(paths) = lynxrdp_proto::urilist::parse_gnome_text(&text) {
+            // Desktop Icons advertises only text, but this is a file copy.
+            // Send metadata directly; never put the internal envelope onto
+            // Finder's clipboard or fetch the contents before Paste.
+            return vec![ClipboardEvent::Files(paths)];
+        }
         if text.is_empty() || self.last_text.as_deref() == Some(text.as_str()) {
             return Vec::new();
         }

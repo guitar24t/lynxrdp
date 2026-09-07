@@ -1178,6 +1178,11 @@ fn clipboard_gnome_files_round_trip_without_echoing() {
     clipboard_files_round_trip("x-special/gnome-copied-files");
 }
 
+#[test]
+fn clipboard_desktop_text_envelope_is_a_file_offer_not_text() {
+    clipboard_files_round_trip("UTF8_STRING");
+}
+
 fn clipboard_files_round_trip(target: &str) {
     require_xvfb!();
     if skip_unless(have("xclip"), "xclip not installed") {
@@ -1189,6 +1194,11 @@ fn clipboard_files_round_trip(target: &str) {
     let list = lynxrdp_proto::urilist::build(std::slice::from_ref(&f));
     let list = if target == "x-special/gnome-copied-files" {
         format!("copy\n{list}")
+    } else if target == "UTF8_STRING" {
+        format!(
+            "x-special/nautilus-clipboard\ncopy\n{}",
+            list.replace("\r\n", "\n")
+        )
     } else {
         list
     };
@@ -1215,10 +1225,10 @@ fn clipboard_files_round_trip(target: &str) {
     let mut got: Option<Vec<lynxrdp_proto::FileEntry>> = None;
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline && got.is_none() {
-        if let Ok(Some(ClientEvent::ClipboardFiles(files))) =
-            c.poll_event(Duration::from_millis(200))
-        {
-            got = Some(files);
+        match c.poll_event(Duration::from_millis(200)).unwrap() {
+            Some(ClientEvent::ClipboardFiles(files)) => got = Some(files),
+            Some(ClientEvent::Clipboard(_)) => panic!("file copy was delivered as plain text"),
+            _ => {}
         }
     }
     let files = got.expect("client never received the file list");

@@ -90,6 +90,33 @@ pub fn parse(list: &str) -> Vec<PathBuf> {
     out
 }
 
+/// GNOME Desktop Icons places file copies on the text clipboard using this
+/// envelope instead of advertising text/uri-list. Recognize only the complete
+/// native format; ordinary text and malformed/partial lists remain text.
+/// A cut is intentionally treated as a copy: remote pastes never delete sources.
+pub fn parse_gnome_text(text: &str) -> Option<Vec<PathBuf>> {
+    let mut lines = text.lines();
+    if lines.next()? != "x-special/nautilus-clipboard" {
+        return None;
+    }
+    if !matches!(lines.next()?, "copy" | "cut") {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for line in lines {
+        // Ignore the envelope's final newline, not malformed empty entries.
+        if paths.len() >= MAX_URIS || line.is_empty() || line.contains('\0') {
+            return None;
+        }
+        let mut parsed = parse(line);
+        if parsed.len() != 1 {
+            return None;
+        }
+        paths.push(parsed.remove(0));
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
 /// Build a `text/uri-list` from local paths.
 ///
 /// Lines are CRLF terminated, which is what RFC 2483 specifies and what file
@@ -191,5 +218,43 @@ mod tests {
     fn base_name_of_a_path() {
         assert_eq!(base_name(Path::new("/a/b/c.txt")).as_deref(), Some("c.txt"));
         assert_eq!(base_name(Path::new("/")), None);
+    }
+}
+
+#[cfg(test)]
+mod gnome_text_tests {
+    use super::*;
+    #[test]
+    fn native_desktop_copy_and_cut_are_file_lists() {
+        for action in ["copy", "cut"] {
+            for newline in ["\n", "\r\n"] {
+                let text = [
+                    "x-special/nautilus-clipboard",
+                    action,
+                    "file:///tmp/a%20b.txt",
+                    "file:///tmp/c.txt",
+                    "",
+                ]
+                .join(newline);
+                assert_eq!(
+                    parse_gnome_text(&text).unwrap(),
+                    vec![PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/c.txt")]
+                );
+            }
+        }
+    }
+    #[test]
+    fn ordinary_text_and_invalid_envelopes_are_not_file_copies() {
+        for text in [
+            "file:///tmp/a",
+            "copy\nfile:///tmp/a",
+            "x-special/nautilus-clipboard\ncopy\n",
+            "x-special/nautilus-clipboard\ncopy\nhello",
+            "x-special/nautilus-clipboard\nmove\nfile:///tmp/a",
+            "x-special/nautilus-clipboard\ncopy\nfile:///tmp/a\nhttps://example.com",
+            "x-special/nautilus-clipboard\ncopy\nfile://remote/tmp/a",
+        ] {
+            assert!(parse_gnome_text(text).is_none(), "{text:?}");
+        }
     }
 }

@@ -98,6 +98,24 @@ fn header(stream: &mut TcpStream, status: &str, len: u64, extra: &str) -> Result
     write!(stream,"HTTP/1.1 {status}\r\nContent-Length: {len}\r\nConnection: close\r\nDAV: 1\r\nAllow: OPTIONS, PROPFIND, HEAD, GET\r\n{extra}\r\n")?;
     Ok(())
 }
+/// HTTP byte ranges may extend beyond EOF. Native uncached reads use a
+/// buffer-sized range, so rejecting those prevents even requesting the file.
+fn byte_range(range: &str, size: u64) -> Option<(u64, u64)> {
+    let last = size.checked_sub(1)?;
+    let (start, end) = range.strip_prefix("bytes=")?.split_once('-')?;
+    if start.is_empty() {
+        let count = end.parse::<u64>().ok()?;
+        return (count > 0).then_some((size.saturating_sub(count), last));
+    }
+    let start = start.parse::<u64>().ok()?;
+    let end = if end.is_empty() {
+        last
+    } else {
+        end.parse::<u64>().ok()?.min(last)
+    };
+    (start <= end && start < size).then_some((start, end))
+}
+
 fn serve(mut stream: TcpStream, source: &Source, prefix: &str) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -192,20 +210,7 @@ fn serve(mut stream: TcpStream, source: &Source, prefix: &str) -> Result<()> {
             let size = source.files[i].size;
             let range = field("Range");
             let (start, end) = if let Some(range) = range {
-                let parsed = range
-                    .strip_prefix("bytes=")
-                    .and_then(|r| r.split_once('-'))
-                    .and_then(|(a, b)| {
-                        Some((
-                            a.parse::<u64>().ok()?,
-                            if b.is_empty() {
-                                size.checked_sub(1)?
-                            } else {
-                                b.parse().ok()?
-                            },
-                        ))
-                    })
-                    .filter(|(a, b)| a <= b && *b < size);
+                let parsed = byte_range(range, size);
                 let Some(r) = parsed else {
                     return header(
                         &mut stream,
@@ -304,6 +309,39 @@ mod tests {
         assert!(request(&server.url, "GET", "a%20%26%20b.txt", "").ends_with("hello"));
         assert!(requests.is_empty());
     }
+    #[test]
+    fn native_reads_can_extend_past_eof_and_read_suffixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, requests) = Source::new(
+            dir.path(),
+            &[lynxrdp_proto::FileEntry {
+                path: "small.txt".into(),
+                size: 5,
+            }],
+        )
+        .unwrap();
+        let server = Server::start(source).unwrap();
+        let url = server.url.clone();
+        let worker = std::thread::spawn(move || {
+            request(&url, "GET", "small.txt", "Range: bytes=0-4095\r\n")
+        });
+        let fetch = requests
+            .recv_timeout(Duration::from_secs(2))
+            .expect("valid read must request contents");
+        std::fs::write(&fetch.destination, b"hello").unwrap();
+        fetch.result.send(Some(fetch.destination)).unwrap();
+        let response = worker.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 206"));
+        assert!(response.contains("Content-Range: bytes 0-4/5\r\n"));
+        assert!(response.ends_with("hello"));
+        assert!(request(&server.url, "GET", "small.txt", "Range: bytes=-2\r\n").ends_with("lo"));
+        assert!(
+            request(&server.url, "GET", "small.txt", "Range: bytes=5-\r\n")
+                .starts_with("HTTP/1.1 416")
+        );
+        assert!(requests.is_empty());
+    }
+
     #[test]
     fn disconnect_releases_pending_get() {
         let dir = tempfile::tempdir().unwrap();
