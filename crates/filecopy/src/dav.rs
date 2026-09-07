@@ -117,6 +117,10 @@ fn byte_range(range: &str, size: u64) -> Option<(u64, u64)> {
 }
 
 fn serve(mut stream: TcpStream, source: &Source, prefix: &str) -> Result<()> {
+    // macOS inherits the listener's nonblocking mode on accepted sockets.
+    // Workers use timed blocking reads, including between fragmented headers;
+    // otherwise a perfectly ordinary pause is WouldBlock and resets the copy.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -274,6 +278,42 @@ mod tests {
         socket.read_to_string(&mut response).unwrap();
         response
     }
+
+    #[test]
+    fn a_connection_can_wait_for_fragmented_request_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, requests) = Source::new(
+            dir.path(),
+            &[lynxrdp_proto::FileEntry {
+                path: "small.txt".into(),
+                size: 5,
+            }],
+        )
+        .unwrap();
+        let server = Server::start(source).unwrap();
+        let (addr, path) = server
+            .url
+            .strip_prefix("http://")
+            .unwrap()
+            .split_once('/')
+            .unwrap();
+        let mut socket = TcpStream::connect(addr).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // A TCP accept need not arrive with request bytes. Leave time for a
+        // worker to begin reading, then split the headers across two writes.
+        std::thread::sleep(Duration::from_millis(50));
+        write!(socket, "HEAD /{path}small.txt HTTP/1.1\r\n").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        write!(socket, "Host: {addr}\r\n\r\n").unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Length: 5\r\n"));
+        assert!(requests.is_empty(), "metadata must not fetch file contents");
+    }
+
     #[test]
     fn metadata_is_lazy_and_get_fetches_once() {
         let dir = tempfile::tempdir().unwrap();
