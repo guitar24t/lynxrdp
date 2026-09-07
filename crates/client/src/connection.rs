@@ -293,6 +293,7 @@ pub struct Client {
     /// Files this client offered on the clipboard, by the path it advertised.
     /// The session may only read files that appear here.
     offered_files: HashMap<String, PathBuf>,
+    clipboard_transfers: std::collections::HashSet<u64>,
     offered_drops: HashMap<u64, HashMap<String, PathBuf>>,
 }
 
@@ -448,6 +449,7 @@ impl Client {
             replacements: Default::default(),
             pending_image: None,
             offered_files: HashMap::new(),
+            clipboard_transfers: Default::default(),
             offered_drops: HashMap::new(),
         })
     }
@@ -725,11 +727,17 @@ impl Client {
     /// global window until it finishes. No event follows -- the caller asked
     /// for this and already knows.
     pub fn cancel_transfer(&mut self, id: u64) {
+        self.clipboard_transfers.remove(&id);
         self.downloads.remove(&id);
         self.replacements.remove(&id);
         if let Some(end) = self.transfers.cancel(id, "no longer wanted") {
             let _ = self.send(&end);
         }
+    }
+
+    /// Background staging triggered by Copy, rather than an explicit transfer.
+    pub fn is_clipboard_transfer(&self, id: u64) -> bool {
+        self.clipboard_transfers.contains(&id)
     }
 
     /// Structured progress for graphical transfer controls.
@@ -906,6 +914,7 @@ impl Client {
             self.fail_transfer(id, reason);
         }
         for (id, purpose, name) in outcome.sent {
+            self.clipboard_transfers.remove(&id);
             if purpose == TransferPurpose::FileUpload {
                 self.queued
                     .push_back(ClientEvent::FileUploaded { id, name });
@@ -923,6 +932,7 @@ impl Client {
 
     /// Record a transfer as failed and release whatever it was holding.
     fn fail_transfer(&mut self, id: u64, reason: String) {
+        self.clipboard_transfers.remove(&id);
         self.downloads.remove(&id);
         self.replacements.remove(&id);
         self.queued
@@ -985,6 +995,7 @@ impl Client {
                 .remove(&id)
                 .map(|_| ClientEvent::FileDropResult { id, ok, reason }),
             Message::FileRequest { id, path } => {
+                let clipboard_copy = self.offered_files.contains_key(&path);
                 // Serve only what this client put on the clipboard: the
                 // session must not be able to read arbitrary local files.
                 match self
@@ -1001,6 +1012,9 @@ impl Client {
                         .and_then(|f| f.metadata().map(|m| (f, m.len())))
                     {
                         Ok((file, size)) => {
+                            if clipboard_copy {
+                                self.clipboard_transfers.insert(id);
+                            }
                             let name = local
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())

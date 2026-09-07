@@ -7,6 +7,8 @@ use std::{
 };
 use winit::{event::WindowEvent, window::Window};
 
+const PROGRESS_DELAY: Duration = Duration::from_secs(1);
+
 #[derive(Default)]
 pub struct Panel {
     pub open: bool,
@@ -18,6 +20,7 @@ pub struct Panel {
     toast_until: Option<Instant>,
     dismissed: bool,
     had_active: bool,
+    active_since: Option<Instant>,
     history: std::collections::VecDeque<String>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +75,18 @@ impl Panel {
     pub fn show(&mut self, ctx: &egui::Context, queued: usize, active: &[Transfer]) -> Vec<Action> {
         let mut actions = Vec::new();
         let active_now = !active.is_empty() || queued != 0;
+        let now = Instant::now();
+        let progress_ready = if active_now {
+            let since = *self.active_since.get_or_insert(now);
+            let remaining = PROGRESS_DELAY.saturating_sub(now.saturating_duration_since(since));
+            if !remaining.is_zero() {
+                ctx.request_repaint_after(remaining);
+            }
+            remaining.is_zero()
+        } else {
+            self.active_since = None;
+            false
+        };
         let changed_message = self.message != self.seen_message;
         if self.had_active && !active_now && !changed_message {
             // Clear a preparation message as soon as its transfer finishes.
@@ -209,7 +224,7 @@ impl Panel {
                 open = false;
             }
             self.open = open;
-        } else if !self.dismissed && (!active.is_empty() || queued != 0 || self.visible()) {
+        } else if !self.dismissed && (progress_ready || self.visible()) {
             egui::Area::new(egui::Id::new("transfer_notification"))
                 .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0])
                 .order(egui::Order::Foreground)
@@ -221,7 +236,7 @@ impl Panel {
                         .inner_margin(12.0)
                         .show(ui, |ui| {
                             ui.set_width(width.min(300.0));
-                            if !active.is_empty() || queued != 0 {
+                            if progress_ready {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
                                     ui.label(format!("Copying {} file(s)", active.len() + queued));
@@ -424,6 +439,7 @@ mod tests {
             progress: Some((10, 100)),
         }];
         frame(&ctx, &mut panel, vec![], &active);
+        panel.active_since = Some(Instant::now() - PROGRESS_DELAY);
         let (output, _) = frame(&ctx, &mut panel, vec![], &active);
         text_position(&output, "report.pdf");
         assert!(!panel.open);
@@ -463,6 +479,35 @@ mod tests {
         frame(&ctx, &mut panel, vec![], &[]);
         assert!(panel.visible());
         assert!(!panel.open);
+    }
+    #[test]
+    fn quick_transfers_never_flash_and_each_new_batch_waits() {
+        let ctx = egui::Context::default();
+        let mut panel = Panel::default();
+        let active = [Transfer {
+            id: 1,
+            name: "copied.txt".into(),
+            progress: Some((0, 10)),
+        }];
+        let (output, _) = frame(&ctx, &mut panel, vec![], &active);
+        assert!(output.shapes.is_empty());
+        frame(&ctx, &mut panel, vec![], &[]);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &[]);
+        assert!(output.shapes.is_empty());
+        assert!(panel.active_since.is_none());
+        frame(&ctx, &mut panel, vec![], &active);
+        panel.active_since = Some(Instant::now() - PROGRESS_DELAY);
+        frame(&ctx, &mut panel, vec![], &active);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &active);
+        text_position(&output, "copied.txt");
+        frame(&ctx, &mut panel, vec![], &[]);
+        frame(&ctx, &mut panel, vec![], &[]);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &active);
+        assert!(output.shapes.is_empty());
+        panel.notify("Transfer failed".into());
+        frame(&ctx, &mut panel, vec![], &active);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &active);
+        text_position(&output, "Transfer failed");
     }
     fn frame(
         ctx: &egui::Context,

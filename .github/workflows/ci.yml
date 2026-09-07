@@ -39,7 +39,7 @@ jobs:
         # is the only test that exercises the transport the product ships over.
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q xvfb xterm xfonts-base xdotool xclip python3-gi gir1.2-gtk-3.0 xdg-user-dirs x11-utils x11-xserver-utils libxkbcommon-x11-0 libxkbcommon0 openssh-server openssh-client
+          sudo apt-get install -y -q xvfb xterm xfonts-base xdotool xclip python3-gi gir1.2-gtk-3.0 xdg-user-dirs fuse3 x11-utils x11-xserver-utils libxkbcommon-x11-0 libxkbcommon0 openssh-server openssh-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets
@@ -66,6 +66,8 @@ jobs:
         run: cargo test --workspace --doc
       - name: Graphical session input (Xvfb)
         run: python3 tools/check-session-ui.py
+      - name: Native file clipboard (Xvfb)
+        run: xvfb-run -a cargo test -p lynxrdp-client --lib x11_file_copy -- --ignored --test-threads=1
       - name: Shared application window lifecycle (Xvfb)
         run: xvfb-run -a cargo test -p lynxrdp-client --lib shared_host_closes -- --ignored --test-threads=1
 
@@ -105,7 +107,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Test protocol and client crates
-        run: cargo test -p lynxrdp-proto -p lynxrdp-client --target ${{ matrix.target }}
+        run: cargo test -p lynxrdp-proto -p lynxrdp-client -p lynxrdp-filecopy --target ${{ matrix.target }}
       - name: Build release client
         run: cargo build --release -p lynxrdp-client --target ${{ matrix.target }}
       - name: Package

@@ -6,6 +6,7 @@ mod desktop_drop;
 mod drop;
 pub mod engine;
 pub mod fileio;
+mod lazy_clipboard;
 pub mod listener;
 pub mod socket;
 pub mod xserver;

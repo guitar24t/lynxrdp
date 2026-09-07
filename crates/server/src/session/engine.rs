@@ -53,7 +53,6 @@ use crate::x11::input::InputInjector;
 use crate::x11::resize::resize_screen;
 use crate::x11::XDisplay;
 use crate::SERVER_NAME;
-use lynxrdp_proto::clipboard_batch::ClipBatch;
 
 /// How long a client may take to send its hello.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -237,14 +236,15 @@ pub struct Core {
     upload_dir: PathBuf,
     /// Clipboard formats the client last announced.
     client_formats: u32,
-    /// Where the client's clipboard files are staged before being offered
-    /// to the session.
-    staging_dir: tempfile::TempDir,
     drops: Option<super::drop::Drops>,
     /// Downloads in flight while staging: transfer id to destination.
     staging_downloads: std::collections::HashMap<u64, PathBuf>,
-    /// Files staged so far in the current batch.
-    staging_batch: Option<ClipBatch>,
+    // Drop pending replies before mounts, then remove their parent directory.
+    staging_results: std::collections::HashMap<u64, crossbeam_channel::Sender<Option<PathBuf>>>,
+    /// Current metadata-only clipboard offer; reads request contents lazily.
+    staging_batch: Option<super::lazy_clipboard::Files>,
+    /// Private mounts and content caches for client clipboard references.
+    staging_dir: tempfile::TempDir,
     upload_options: Option<(u64, bool)>,
     /// Every file the session opens or writes goes through here, on a thread
     /// of its own.
@@ -384,6 +384,7 @@ impl Core {
             drops,
             staging_downloads: std::collections::HashMap::new(),
             staging_batch: None,
+            staging_results: Default::default(),
             upload_options: None,
             fileio,
             pending_downloads: std::collections::HashMap::new(),
@@ -450,6 +451,7 @@ impl Core {
                     }
                 }
             }
+            self.pump_clipboard_batch();
             if let Err(e) = self.pump() {
                 log::error!("frame pump error: {e:#}");
                 return Exit::XError(format!("{e:#}"));
@@ -651,70 +653,61 @@ impl Core {
         Ok(())
     }
 
-    /// The client copied files; fetch them so the session can paste them.
-    ///
-    /// They are staged as real local files because an X11 selection owner
-    /// must answer a paste immediately and cannot wait for a round trip.
+    /// Publish names and sizes immediately. Native file reads during paste
+    /// fetch contents, without blocking X11 selection replies or the core loop.
     fn stage_client_files(&mut self, files: Vec<lynxrdp_proto::FileEntry>) {
         if self.clipboard.is_none() || files.is_empty() {
             return;
         }
-        if let Some(old) = self.staging_batch.take() {
-            for id in old.live_ids() {
-                if let Some(msg) = self.transfers.cancel(id, "clipboard replaced") {
-                    self.send_to_client(vec![msg]);
-                }
+        for id in self.staging_downloads.keys().copied().collect::<Vec<_>>() {
+            if let Some(msg) = self.transfers.cancel(id, "clipboard replaced") {
+                self.send_to_client(vec![msg]);
             }
         }
+        self.staging_results.clear();
         self.staging_downloads.clear();
-        let dir = self
-            .staging_dir
-            .path()
-            .join(self.transfers.next_id().to_string());
-        self.staging_batch = Some(ClipBatch::new(dir, &files));
-        self.pump_clipboard_batch();
+        self.staging_batch = None;
+        match super::lazy_clipboard::Files::new(self.staging_dir.path(), &files) {
+            Ok(batch) => {
+                if let Err(e) = self
+                    .clipboard
+                    .as_mut()
+                    .unwrap()
+                    .set_files(batch.paths.clone())
+                {
+                    self.send_to_client(vec![Message::Notice {
+                        text: format!("Could not offer copied files: {e:#}"),
+                    }]);
+                } else {
+                    self.staging_batch = Some(batch);
+                    self.send_to_client(vec![Message::Notice {
+                        text: format!(
+                            "{} copied file(s) ready. Paste into a folder in the remote session.",
+                            files.len()
+                        ),
+                    }]);
+                }
+            }
+            Err(e) => self.send_to_client(vec![Message::Notice {
+                text: format!("Could not offer copied files: {e:#}"),
+            }]),
+        }
     }
 
     fn pump_clipboard_batch(&mut self) {
-        while let Some((remote, dest, slot)) = self
+        while let Some(fetch) = self
             .staging_batch
-            .as_mut()
-            .and_then(ClipBatch::next_request)
+            .as_ref()
+            .and_then(|b| b.requests.try_recv().ok())
         {
             let id = self.transfers.next_id();
             self.transfers.expect(id);
-            self.staging_downloads.insert(id, dest);
-            self.staging_batch.as_mut().unwrap().requested(slot, id);
-            self.send_to_client(vec![Message::FileRequest { id, path: remote }]);
-        }
-        if self.staging_batch.as_ref().is_some_and(ClipBatch::done) {
-            let batch = self.staging_batch.take().unwrap();
-            let total = batch.total();
-            let files = batch.into_files();
-            if files.len() != total {
-                self.send_to_client(vec![Message::Notice {
-                    text: format!("Clipboard: {} of {total} files received", files.len()),
-                }]);
-            }
-            if !files.is_empty() {
-                if let Some(cb) = self.clipboard.as_mut() {
-                    let received = files.len();
-                    if let Err(e) = cb.set_files(files) {
-                        log::warn!("clipboard: {e:#}");
-                        self.send_to_client(vec![Message::Notice {
-                            text: format!("Could not prepare the remote clipboard: {e:#}"),
-                        }]);
-                    } else {
-                        self.send_to_client(vec![Message::Notice {
-                            text: if received == total {
-                                format!("{received} copied file(s) ready. Paste into a folder in the remote session.")
-                            } else {
-                                format!("Only {received} of {total} copied files are ready to paste. Copy the missing files again to retry.")
-                            },
-                        }]);
-                    }
-                }
-            }
+            self.staging_downloads.insert(id, fetch.destination);
+            self.staging_results.insert(id, fetch.result);
+            self.send_to_client(vec![Message::FileRequest {
+                id,
+                path: fetch.remote,
+            }]);
         }
     }
 
@@ -723,8 +716,8 @@ impl Core {
             drops.settle(id, success);
         }
         let path = self.staging_downloads.remove(&id);
-        if let Some(batch) = self.staging_batch.as_mut() {
-            batch.resolve(id, path.filter(|_| success));
+        if let Some(result) = self.staging_results.remove(&id) {
+            let _ = result.send(path.filter(|_| success));
         }
     }
 
@@ -1077,6 +1070,7 @@ impl Core {
         if let Some(drops) = &mut self.drops {
             drops.reset();
         }
+        self.staging_results.clear();
         self.staging_batch = None;
         self.last_client_seen = Instant::now();
         Ok(())

@@ -19,6 +19,7 @@ name = "lynxrdp_client"
 path = "src/lib.rs"
 
 [dependencies]
+lynxrdp-filecopy = { path = "../filecopy" }
 ctrlc = "3"
 lynxrdp-proto = { workspace = true }
 anyhow = { workspace = true }
@@ -64,7 +65,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 tar = { version = "0.4", default-features = false }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["xfixes"] }
 
 # Clipboard file lists have no cross-platform crate, so each platform brings
 # its own minimal binding: CF_HDROP on Windows, NSPasteboard on macOS.

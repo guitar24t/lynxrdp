@@ -275,19 +275,25 @@ Successful copies are silent; error messages disappear automatically after four 
 The detailed transfer window opens only when you choose **Transfers**.
 You can keep typing, clicking, and dragging in the remote desktop while files copy.
 
-On Windows, select files in Explorer and press **Ctrl+C**, then switch to the
-remote session. LynxRDP prepares the files automatically; paste them into the
-remote file manager with **Ctrl+V**. There is no transfer menu to open. For larger
-copies, wait for the progress bar to disappear before pasting. Copying files in the remote
-file manager similarly prepares them for pasting into Explorer. A newer local
-clipboard copy takes priority over a remote download that is still finishing.
+Copy files in Explorer, Finder, or an X11 Linux file manager and paste into the
+remote folder or desktop, or copy in the session and paste locally. Both directions
+share only names and sizes when you copy. File contents transfer when the destination
+reads the file for Paste; repeated pastes reuse the fetched contents. Copying opens
+no transfer window or readiness notification. Keep the session connected until the
+paste finishes. A newer clipboard copy replaces the previous offer.
 
-File clipboard transfers copy the originals; they do not move or delete them.
+Windows uses native virtual-file clipboard streams. macOS uses its built-in WebDAV
+filesystem with a private, read-only loopback mount; no extra filesystem extension
+or administrator prompt is needed. Linux uses FUSE 3 (`/dev/fuse` and `fusermount3`),
+included in client and server package dependencies. Missing native support reports
+an error, without falling back to transferring files on Copy. Linux file clipboard
+integration requires X11 or XWayland. Both endpoints must run a version with deferred
+clipboard support; older servers can still fetch offers immediately.
+
+File clipboard operations copy originals; they do not move or delete them.
 Folder clipboard copies are not supported yet: drag folders into the session
-to copy them. Finder file copies on macOS are supported too; paste in the remote
-file manager after the transfer finishes. Linux clients can drag local files.
-Unreadable files and unsupported selections show a notification instead of
-silently omitting part of a copy.
+to copy them. Unreadable files and unsupported selections show a brief error.
+
 
 Choose **Transfers** on the connection bar, or press **Ctrl+Alt+T**, for a movable,
 non-modal graphical window with per-file progress bars and **Cancel** buttons.

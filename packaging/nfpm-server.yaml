@@ -75,6 +75,7 @@ overrides:
   deb:
     depends:
       - xvfb
+      - fuse3
       - libpam0g
       - libc6
     recommends:
@@ -91,6 +92,7 @@ overrides:
   rpm:
     depends:
       - xorg-x11-server-Xvfb
+      - fuse3
       - pam
     recommends:
       # Same reasoning as the deb: a weak dependency, because a missing

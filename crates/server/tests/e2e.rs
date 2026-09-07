@@ -979,6 +979,23 @@ fn downloading_a_missing_file_fails_cleanly() {
     assert!(err.to_string().contains("here.txt"), "{err}");
 }
 
+/// Drive protocol replies while a native file reader waits for lazy contents.
+fn read_clipboard_file(client: &mut Client, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let path = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::fs::read(path));
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(result) = rx.try_recv() {
+            return result;
+        }
+        client.poll_event(Duration::from_millis(20)).unwrap();
+        assert!(Instant::now() < deadline, "native clipboard read timed out");
+    }
+}
+
 #[test]
 fn clipboard_files_from_the_client_are_staged_for_the_session() {
     require_xvfb!();
@@ -1027,6 +1044,62 @@ fn clipboard_files_from_the_client_are_staged_for_the_session() {
     assert_eq!(std::fs::read(&a).unwrap(), b"alpha contents");
     assert_eq!(std::fs::read(&b).unwrap(), vec![7u8; 5000]);
 
+    // Nautilus splits the GNOME payload on every LF and treats even an
+    // empty final field as a file. Check the bytes, not the permissive URI
+    // parser, which hides this error by dropping empty lines.
+    let gnome = s.x(
+        "xclip",
+        &[
+            "-selection",
+            "clipboard",
+            "-t",
+            "x-special/gnome-copied-files",
+            "-o",
+        ],
+    );
+    assert!(gnome.status.success());
+    let payload = String::from_utf8(gnome.stdout).unwrap();
+    let entries: Vec<_> = payload.split('\n').collect();
+    assert_eq!(entries[0], "copy");
+    assert_eq!(
+        entries.len(),
+        staged.len() + 1,
+        "unexpected empty clipboard source: {payload:?}"
+    );
+    assert!(entries[1..]
+        .iter()
+        .all(|uri| uri.starts_with("file://") && !uri.contains('\r')));
+
+    // GNOME Shell Desktop Icons uses a distinct text envelope, with a
+    // required trailing LF that its parser removes before copying.
+    let desktop = s.x(
+        "xclip",
+        &["-selection", "clipboard", "-t", "UTF8_STRING", "-o"],
+    );
+    assert!(desktop.status.success());
+    let desktop_text = String::from_utf8(desktop.stdout).unwrap();
+    assert_eq!(
+        desktop_text,
+        format!("x-special/nautilus-clipboard\n{payload}\n")
+    );
+
+    // Merely announcing files and probing their names/sizes must transfer no
+    // contents, even while clipboard managers inspect all offered formats.
+    for path in &staged {
+        assert!(std::fs::metadata(path).unwrap().is_file());
+    }
+    let idle = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < idle {
+        c.poll_event(Duration::from_millis(20)).unwrap();
+    }
+    assert!(c.transfer_rows().is_empty());
+    let cache = staged[0].parent().unwrap().parent().unwrap().join("cache");
+    assert_eq!(
+        std::fs::read_dir(cache).unwrap().count(),
+        0,
+        "Copy eagerly downloaded file contents"
+    );
+
     // The staged files must be real, complete copies the session can open.
     let mut names: Vec<String> = staged
         .iter()
@@ -1035,13 +1108,64 @@ fn clipboard_files_from_the_client_are_staged_for_the_session() {
     names.sort();
     assert_eq!(names, vec!["alpha.txt", "beta.bin"]);
     for p in &staged {
-        let content = std::fs::read(p).unwrap();
+        let content = read_clipboard_file(&mut c, p).unwrap();
         if p.ends_with("alpha.txt") {
             assert_eq!(content, b"alpha contents");
         } else {
             assert_eq!(content, vec![7u8; 5000]);
         }
     }
+    // Repeated pastes reuse fetched bytes even if the source is no longer
+    // available. They do not start another transfer.
+    std::fs::remove_file(&a).unwrap();
+    let alpha = staged.iter().find(|p| p.ends_with("alpha.txt")).unwrap();
+    assert_eq!(
+        read_clipboard_file(&mut c, alpha).unwrap(),
+        b"alpha contents"
+    );
+}
+
+#[test]
+fn clipboard_disconnect_releases_a_waiting_native_reader() {
+    require_xvfb!();
+    if skip_unless(have("xclip"), "xclip not installed") {
+        return;
+    }
+    let session = Session::start(320, 240, "none", &[]);
+    let mut client = session.connect(None);
+    let source = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"lazy bytes").unwrap();
+    client
+        .offer_clipboard_files(&[source.path().to_path_buf()])
+        .unwrap();
+    assert!(wait_for(&mut client, Duration::from_secs(5), |event, _| {
+        matches!(event, ClientEvent::Notice(text) if text.contains("copied file(s) ready"))
+    }));
+    let out = session.x(
+        "xclip",
+        &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
+    );
+    let paths = lynxrdp_proto::urilist::parse(&String::from_utf8_lossy(&out.stdout));
+    let path = paths[0].clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::fs::read(path));
+    });
+    // Do not service FileRequest: the native read must wait for contents.
+    assert!(rx.recv_timeout(Duration::from_millis(250)).is_err());
+    client.disconnect("test disconnect during paste");
+    assert!(rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("native read stayed blocked")
+        .is_err());
+    drop(client);
+    let mut reconnected = session.connect(None);
+    reconnected.ping().unwrap();
+    assert!(wait_for(
+        &mut reconnected,
+        Duration::from_secs(5),
+        |event, _| matches!(event, ClientEvent::Rtt(_))
+    ));
 }
 
 #[test]
@@ -1144,7 +1268,10 @@ fn clipboard_files_round_trip(target: &str) {
     );
     let paths = lynxrdp_proto::urilist::parse(&String::from_utf8_lossy(&out.stdout));
     assert_eq!(paths.len(), 1);
-    assert_eq!(std::fs::read(&paths[0]).unwrap(), b"from the session");
+    assert_eq!(
+        read_clipboard_file(&mut c, &paths[0]).unwrap(),
+        b"from the session"
+    );
     let _ = owner.kill();
     let _ = owner.wait();
 }
@@ -1281,7 +1408,7 @@ fn latency_probe() {
 }
 
 #[test]
-fn clipboard_duplicates_and_partial_failure_publish_the_successful_files() {
+fn clipboard_paste_preserves_duplicate_names_and_reports_missing_sources() {
     require_xvfb!();
     if skip_unless(have("xclip"), "xclip not installed") {
         return;
@@ -1308,9 +1435,13 @@ fn clipboard_duplicates_and_partial_failure_publish_the_successful_files() {
             &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
         );
         let files = lynxrdp_proto::urilist::parse(&String::from_utf8_lossy(&out.stdout));
-        if files.len() == 2 {
+        if files.len() == 3 {
             assert_ne!(files[0], files[1]);
-            let mut contents: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+            assert!(read_clipboard_file(&mut c, &files[2]).is_err());
+            let mut contents: Vec<_> = files[..2]
+                .iter()
+                .map(|p| read_clipboard_file(&mut c, p).unwrap())
+                .collect();
             contents.sort();
             assert_eq!(contents, vec![b"first".to_vec(), b"second".to_vec()]);
             break;

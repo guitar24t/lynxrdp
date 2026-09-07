@@ -248,8 +248,14 @@ impl Clipboard {
         if paths.is_empty() {
             return Ok(());
         }
+        // GNOME Shell's Desktop Icons extension reads its file clipboard
+        // through the text API. Its marker and final LF are required by the
+        // desktop parser; Nautilus's separate binary target must omit that LF.
+        self.owned_text = Some(format!(
+            "x-special/nautilus-clipboard\ncopy\n{}",
+            lynxrdp_proto::urilist::build(&paths).replace("\r\n", "\n")
+        ));
         self.owned_files = Some(paths);
-        self.owned_text = None;
         self.owned_png = None;
         self.acquire()
     }
@@ -738,9 +744,14 @@ impl Clipboard {
     fn uri_list_payload(&self, gnome: bool) -> Option<String> {
         let files = self.owned_files.as_ref()?;
         let list = lynxrdp_proto::urilist::build(files);
-        // GNOME's variant is the same list prefixed with the operation.
+        // GNOME splits on LF without ignoring empty entries. Unlike the
+        // standard URI list, its payload must not end with a newline: that
+        // would add an empty source and crash Nautilus 40 while copying.
         Some(if gnome {
-            format!("copy\n{}", list.replace("\r\n", "\n"))
+            format!(
+                "copy\n{}",
+                list.trim_end_matches("\r\n").replace("\r\n", "\n")
+            )
         } else {
             list
         })

@@ -4,7 +4,7 @@
 //! Explorer and Finder file copies are also readable for pasting into the session.
 //!
 //! `arboard` has no file-list API, so this is per-platform. Every backend
-//! offers the same thing: a list of local paths, already downloaded, that the
+//! publishes a list of local paths (including deferred file references) that the
 //! platform's file manager understands. They also refuse the same things — an
 //! empty list, and paths a pasting application would resolve differently from
 //! us. Those two rules live in [`write_files`] rather than in each backend:
@@ -29,12 +29,20 @@ use anyhow::{bail, Context, Result};
 /// Whether this build can put files on the local clipboard.
 pub const SUPPORTED: bool = cfg!(any(unix, windows));
 
-/// Read an Explorer or Finder copy without changing the clipboard or deleting cut files.
+/// Read a native file copy without changing the clipboard or deleting cut files.
 pub fn read_files() -> Result<Option<Vec<PathBuf>>> {
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     return imp::read_files();
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     Ok(None)
+}
+
+/// File clipboard generation. X11 uses selection notifications on a worker.
+pub fn change_counter() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    return imp::file_counter();
+    #[cfg(not(target_os = "linux"))]
+    crate::clipchange::change_counter()
 }
 
 /// Put `paths` on the local clipboard as a file list.
@@ -100,6 +108,10 @@ fn dropfiles_blob(names: &[Vec<u16>]) -> Vec<u8> {
     blob
 }
 
+#[cfg(target_os = "linux")]
+#[path = "fileclip_x11_read.rs"]
+mod x11_reader;
+
 #[cfg(all(unix, not(target_os = "macos")))]
 mod imp {
     use std::path::PathBuf;
@@ -116,6 +128,9 @@ mod imp {
     use x11rb::protocol::Event;
     use x11rb::rust_connection::RustConnection;
     use x11rb::wrapper::ConnectionExt as _;
+
+    #[cfg(target_os = "linux")]
+    pub use super::x11_reader::{file_counter, read_files};
 
     /// The selection owner, started on first use and reused afterwards.
     ///
@@ -158,6 +173,8 @@ mod imp {
         timestamp: xproto::Atom,
         uri_list: xproto::Atom,
         gnome_copied: xproto::Atom,
+        utf8: xproto::Atom,
+        text: xproto::Atom,
     }
 
     /// An X connection that owns the CLIPBOARD selection, shared between the
@@ -207,6 +224,8 @@ mod imp {
                 uri_list: atom(&conn, "text/uri-list")?,
                 // Nautilus and friends look for this one when pasting.
                 gnome_copied: atom(&conn, "x-special/gnome-copied-files")?,
+                utf8: atom(&conn, "UTF8_STRING")?,
+                text: atom(&conn, "TEXT")?,
             };
             let owner = Arc::new(Owner {
                 conn,
@@ -379,6 +398,8 @@ mod imp {
                     self.atoms.timestamp,
                     self.atoms.uri_list,
                     self.atoms.gnome_copied,
+                    self.atoms.utf8,
+                    self.atoms.text,
                 ];
                 self.conn.change_property32(
                     PropMode::REPLACE,
@@ -401,12 +422,27 @@ mod imp {
                 )?;
                 return Ok(true);
             }
-            if target == self.atoms.uri_list || target == self.atoms.gnome_copied {
+            if [
+                self.atoms.uri_list,
+                self.atoms.gnome_copied,
+                self.atoms.utf8,
+                self.atoms.text,
+            ]
+            .contains(&target)
+            {
                 let list = urilist::build(&files);
-                let payload = if target == self.atoms.gnome_copied {
+                let payload = if target == self.atoms.utf8 || target == self.atoms.text {
+                    format!(
+                        "x-special/nautilus-clipboard\ncopy\n{}",
+                        list.replace("\r\n", "\n")
+                    )
+                } else if target == self.atoms.gnome_copied {
                     // The GNOME format puts the operation on the first line
                     // and separates with LF, not the CRLF of RFC 2483.
-                    format!("copy\n{}", list.replace("\r\n", "\n"))
+                    format!(
+                        "copy\n{}",
+                        list.trim_end_matches("\r\n").replace("\r\n", "\n")
+                    )
                 } else {
                     list
                 };
@@ -711,6 +747,51 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an isolated Xvfb clipboard and xclip"]
+    fn x11_file_copy_observes_repeated_copies_and_native_formats() {
+        let _ = change_counter();
+        for name in ["first.txt", "second with spaces.txt"] {
+            let paths = vec![PathBuf::from("/tmp").join(name)];
+            write_files(&paths).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if read_files().ok().flatten().as_ref() == Some(&paths) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "file copy was not observed"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let gnome = std::process::Command::new("xclip")
+                .args([
+                    "-selection",
+                    "clipboard",
+                    "-o",
+                    "-target",
+                    "x-special/gnome-copied-files",
+                ])
+                .output()
+                .unwrap();
+            assert!(gnome.status.success());
+            let gnome = String::from_utf8(gnome.stdout).unwrap();
+            assert!(gnome.starts_with("copy\n"));
+            assert!(!gnome.ends_with('\n'));
+            let desktop = std::process::Command::new("xclip")
+                .args(["-selection", "clipboard", "-o", "-target", "UTF8_STRING"])
+                .output()
+                .unwrap();
+            assert!(desktop.status.success());
+            assert_eq!(
+                String::from_utf8(desktop.stdout).unwrap(),
+                format!("x-special/nautilus-clipboard\n{gnome}\n")
+            );
+        }
+    }
 
     #[test]
     fn support_matches_the_platform() {

@@ -351,7 +351,7 @@ pub struct App {
     /// File selections already offered, including files received from the host.
     last_file_revision: Option<u64>,
     clipboard_has_files: bool,
-    /// Local clipboard generation when a remote download started.
+    /// Local clipboard generation when a remote offer began preparation.
     clipboard_batch_revision: Option<u64>,
     /// Hash of the last image seen on the local clipboard, so an image we
     /// received from the session is not immediately offered back to it.
@@ -377,11 +377,10 @@ pub struct App {
     /// Uploads finished (or given up on) since the queue was last empty, so
     /// progress can be reported across a whole drop rather than per file.
     upload_done: usize,
-    /// The clipboard file copy being staged, if any.
-    clipboard_batch: Option<ClipBatch>,
-    /// Number of clipboard batches this process has started, which is what
-    /// gives each one its own directory.
-    clipboard_batches: u64,
+    // Release waiting readers before dropping/unmounting their file references.
+    clipboard_reads: std::collections::HashMap<u64, crossbeam_channel::Sender<Option<PathBuf>>>,
+    clipboard_offer: Option<crossbeam_channel::Receiver<anyhow::Result<lynxrdp_filecopy::Files>>>,
+    clipboard_batch: Option<lynxrdp_filecopy::Files>,
     last_clipboard_poll: Instant,
     last_ping: Instant,
     rtt: Option<Duration>,
@@ -527,7 +526,8 @@ impl App {
             last_gui_message: String::new(),
             upload_done: 0,
             clipboard_batch: None,
-            clipboard_batches: 0,
+            clipboard_reads: Default::default(),
+            clipboard_offer: None,
             last_clipboard_poll: now,
             last_ping: now,
             rtt: None,
@@ -800,7 +800,12 @@ impl App {
         // is blended too. Repainting everything is cheap here precisely
         // because nothing is arriving to repaint -- these frames happen once a
         // second, when the wording changes.
-        let transfers = self.client.transfer_details();
+        let mut transfers = self.client.transfer_details();
+        if !self.transfer_panel.open {
+            // Keep outgoing clipboard traffic silent on the source computer.
+            // The paste destination provides its transfer progress.
+            transfers.retain(|transfer| !self.client.is_clipboard_transfer(transfer.id));
+        }
         let asked_full = self.full_redraw || notice.is_some();
         let Some(gfx) = self.gfx.as_mut() else {
             return Ok(());
@@ -1219,6 +1224,8 @@ impl App {
         self.drop_target = None;
         self.drop_deadline = None;
         self.upload_done = 0;
+        self.clipboard_reads.clear();
+        self.clipboard_offer = None;
         if self.clipboard_batch.take().is_some() {
             log::warn!("a clipboard file copy was abandoned with the link");
         }
@@ -1466,6 +1473,7 @@ impl App {
     }
 
     fn housekeeping(&mut self) {
+        self.pump_clipboard_batch();
         if self.drop_deadline.is_some_and(|d| Instant::now() >= d) {
             self.flush_drop();
         }
@@ -1642,6 +1650,8 @@ impl App {
                 self.drop_target = None;
                 self.drop_deadline = None;
                 self.uploads.clear();
+                self.clipboard_reads.clear();
+                self.clipboard_offer = None;
                 self.clipboard_batch = None;
                 for (id, _) in self.client.transfer_rows() {
                     self.client.cancel_transfer(id);
@@ -1879,163 +1889,95 @@ impl App {
         self.update_title();
     }
 
-    /// The session copied files: download them, then offer them locally.
+    /// Publish names and sizes; native file reads request contents later.
     fn on_remote_files(&mut self, files: Vec<lynxrdp_proto::FileEntry>) {
         if files.is_empty() || !self.link_up() {
             return;
         }
-        // A copy in the session replaces whatever the last one was staging.
-        // The old transfers are cancelled rather than left to finish: nobody
-        // will paste them, and each one holds a descriptor and a share of the
-        // connection's global transfer window until it ends.
-        if let Some(old) = self.clipboard_batch.take() {
-            for id in old.live_ids() {
-                self.client.cancel_transfer(id);
-            }
+        for id in self.clipboard_reads.keys() {
+            self.client.cancel_transfer(*id);
         }
-        let dir = match clipboard_staging_dir()
-            .and_then(|root| new_batch_dir(&root, &mut self.clipboard_batches))
-        {
-            Ok(d) => d,
-            Err(e) => {
-                log::warn!("cannot prepare the clipboard staging directory: {e:#}");
-                self.transfer_panel
-                    .notify(format!("Could not prepare copied files: {e:#}"));
-                self.request_redraw();
-                return;
-            }
-        };
-        log::info!(
-            "fetching {} file(s) copied in the session into {}",
-            files.len(),
-            dir.display()
-        );
-        self.clipboard_batch_revision = crate::clipchange::change_counter();
-        self.transfer_panel.record(format!(
-            "Preparing {} file(s) to paste on this computer…",
-            files.len()
-        ));
-        self.request_redraw();
-        self.clipboard_batch = Some(ClipBatch::new(dir, &files));
-        self.pump_clipboard_batch();
+        self.clipboard_reads.clear();
+        self.clipboard_offer = None;
+        self.clipboard_batch = None;
+        self.clipboard_batch_revision = crate::fileclip::change_counter();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.clipboard_offer = Some(rx);
+        // Mounting a native reference can take time. Never block the frame loop.
+        let spawned = std::thread::Builder::new()
+            .name("clipboard-offer".into())
+            .spawn(move || {
+                let result = clipboard_staging_dir()
+                    .and_then(|root| lynxrdp_filecopy::Files::new(&root, &files));
+                let _ = tx.send(result);
+            });
+        if let Err(e) = spawned {
+            self.clipboard_offer = None;
+            self.transfer_panel
+                .notify(format!("Could not prepare copied files: {e}"));
+        }
     }
 
-    /// Issue what the batch is allowed to have in flight, and publish it once
-    /// every file in it has either arrived or failed.
     fn pump_clipboard_batch(&mut self) {
         if !self.link_up() {
-            // Nothing can be asked for and nothing can arrive. The batch goes
-            // with the link rather than being published half empty.
             return;
         }
-        while let Some((remote, dest, slot)) = self
-            .clipboard_batch
-            .as_mut()
-            .and_then(ClipBatch::next_request)
+        if let Some(result) = self
+            .clipboard_offer
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
         {
-            match self.client.request_file(&remote, dest) {
-                Ok(id) => {
-                    if let Some(b) = self.clipboard_batch.as_mut() {
-                        b.requested(slot, id);
+            self.clipboard_offer = None;
+            if !clipboard_was_replaced(
+                self.clipboard_batch_revision,
+                crate::fileclip::change_counter(),
+            ) {
+                let published = result.and_then(|files| {
+                    #[cfg(windows)]
+                    let mut files = files;
+                    #[cfg(windows)]
+                    files.publish()?;
+                    #[cfg(not(windows))]
+                    crate::fileclip::write_files(&files.paths)?;
+                    Ok(files)
+                });
+                match published {
+                    Ok(files) => {
+                        self.last_file_revision = crate::fileclip::change_counter();
+                        self.clipboard_has_files = true;
+                        self.clipboard_batch = Some(files);
                     }
+                    Err(e) => self
+                        .transfer_panel
+                        .notify(format!("Could not offer copied files: {e:#}")),
                 }
-                // Nothing to record: taking it off the queue already made the
-                // batch one file closer to finishing, and its slot stays empty
-                // so the file is simply missing from what gets published.
-                Err(e) => log::warn!("cannot fetch {remote}: {e:#}"),
             }
         }
-        if self.clipboard_batch.as_ref().is_some_and(ClipBatch::done) {
-            if let Some(b) = self.clipboard_batch.take() {
-                self.publish_clipboard_batch(b);
-            }
-        }
-    }
-
-    /// One staged file resolved, one way or the other.
-    fn on_clipboard_file(&mut self, id: u64, path: Option<PathBuf>) {
-        let Some(b) = self.clipboard_batch.as_mut() else {
-            return;
-        };
-        if !b.resolve(id, path) {
-            // Not ours: an upload, or a leftover from a superseded batch.
-            return;
-        }
-        self.pump_clipboard_batch();
-    }
-
-    /// Put whatever arrived on the local clipboard.
-    ///
-    /// Whatever *arrived*, not everything that was asked for: one file the
-    /// session offered and this side could not create used to strand the
-    /// entire copy, because the batch was a count that only ever went down on
-    /// success. The user pressed Ctrl+V, got their old clipboard back, and the
-    /// explanation went to a terminal a windowed client does not have.
-    fn publish_clipboard_batch(&mut self, batch: ClipBatch) {
-        if clipboard_was_replaced(
-            self.clipboard_batch_revision,
-            crate::clipchange::change_counter(),
-        ) {
-            self.transfer_panel.notify("File copy finished, but a newer clipboard copy was kept. Copy the remote files again to paste them here.".into());
-            self.request_redraw();
-            if let Some(parent) = batch.dir().parent() {
-                prune_batches(parent, KEEP_STAGED_BATCHES);
-            }
-            return;
-        }
-        let asked = batch.total();
-        let dir = batch.dir().to_path_buf();
-        let files = batch.into_files();
-        if files.is_empty() {
-            self.transfer_panel.notify(format!(
-                "Could not prepare any of the {asked} copied files. Copy them again to retry."
-            ));
-            log::warn!("none of the {asked} file(s) copied in the session could be staged");
-        } else {
-            if files.len() < asked {
-                log::warn!(
-                    "{} of {asked} file(s) could not be staged; offering the {} that could",
-                    asked - files.len(),
-                    files.len()
-                );
-            }
-            match crate::fileclip::write_files(&files) {
-                Ok(()) => {
-                    self.last_file_revision = crate::clipchange::change_counter();
-                    self.clipboard_has_files = true;
-                    if files.len() == asked {
-                        self.transfer_panel
-                            .record(format!("{} files copied to this computer", files.len()));
-                    } else {
-                        self.transfer_panel.notify(format!("Only {} of {asked} files are ready to paste. Copy the missing files again to retry.", files.len()));
-                    }
+        while let Some(request) = self
+            .clipboard_batch
+            .as_ref()
+            .and_then(|files| files.requests.try_recv().ok())
+        {
+            match self
+                .client
+                .request_file(&request.remote, request.destination)
+            {
+                Ok(id) => {
+                    self.clipboard_reads.insert(id, request.result);
                 }
                 Err(e) => {
-                    // The files are still on disk, so say where rather than
-                    // leaving the user with nothing.
-                    log::warn!("could not put the files on the clipboard: {e:#}");
-                    self.transfer_panel.notify(format!(
-                        "Clipboard unavailable. Your files are saved in {}",
-                        dir.display()
-                    ));
-                    for f in &files {
-                        log::info!("downloaded to {}", f.display());
-                    }
+                    let _ = request.result.send(None);
+                    self.transfer_panel
+                        .notify(format!("Could not paste file: {e:#}"));
                 }
             }
         }
-        // Pruning happens here and not at startup. A staged file has to outlive
-        // the paste that reads it -- a file manager opens it when the user
-        // pastes, which may be minutes later -- so directories are removed only
-        // once a newer batch has replaced them, and the last few are kept
-        // because the paste of the previous copy may still be in progress.
-        // Doing it at startup instead would delete a directory a *running*
-        // download is writing into and then recreate it empty, which is the
-        // one ordering that loses data.
-        if let Some(parent) = dir.parent() {
-            prune_batches(parent, KEEP_STAGED_BATCHES);
+    }
+
+    fn on_clipboard_file(&mut self, id: u64, path: Option<PathBuf>) {
+        if let Some(reply) = self.clipboard_reads.remove(&id) {
+            let _ = reply.send(path);
         }
-        self.request_redraw();
     }
 
     /// Forget an upload that finished or failed, and start the next.
@@ -2134,7 +2076,7 @@ impl App {
         true
     }
 
-    /// Start staging Explorer copies as soon as the session receives focus.
+    /// Advertise local copies as soon as the session receives focus.
     /// A busy clipboard is retried on the next tick, even if its counter did
     /// not change. Received file lists are marked seen to prevent echo loops.
     fn poll_clipboard_files(&mut self) -> bool {
@@ -2144,7 +2086,7 @@ impl App {
         {
             return false;
         }
-        let revision = crate::clipchange::change_counter();
+        let revision = crate::fileclip::change_counter();
         if revision.is_none() {
             return false;
         }
@@ -2153,6 +2095,16 @@ impl App {
         }
         match crate::fileclip::read_files() {
             Ok(Some(paths)) if !paths.is_empty() => {
+                #[cfg(not(windows))]
+                if self
+                    .clipboard_batch
+                    .as_ref()
+                    .is_some_and(|files| files.paths == paths)
+                {
+                    self.last_file_revision = revision;
+                    self.clipboard_has_files = true;
+                    return true;
+                }
                 self.last_file_revision = revision;
                 self.clipboard_has_files = true;
                 match self.client.offer_clipboard_files(&paths) {
@@ -3044,14 +2996,8 @@ fn clipboard_was_replaced(start: Option<u64>, current: Option<u64>) -> bool {
     matches!((start, current), (Some(a), Some(b)) if a != b)
 }
 
-/// Where files copied in the session are downloaded before being offered on
-/// the local clipboard. A file manager pasting them reads them from here, so
-/// they outlive the paste rather than living in a directory we delete.
-///
-/// This is the root; each copy gets a numbered subdirectory of its own from
-/// [`new_batch_dir`]. It is per process so that two sessions cannot fight over
-/// the same names, and the process id is reused by the operating system, which
-/// is exactly why `new_batch_dir` refuses to reuse a directory it finds.
+/// Per-process root for private deferred file references and paste caches.
+/// Each native offer owns a unique temporary directory below this root.
 pub fn clipboard_staging_dir() -> anyhow::Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("lynxrdp-clipboard-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
@@ -3060,15 +3006,6 @@ pub fn clipboard_staging_dir() -> anyhow::Result<PathBuf> {
 
 /// Prefix of a per-copy staging directory under [`clipboard_staging_dir`].
 const BATCH_PREFIX: &str = "batch-";
-
-/// How many staged copies are kept before the oldest are deleted.
-///
-/// More than one, because a file manager reads a pasted file when the *paste*
-/// happens: copying something new in the session while the previous paste is
-/// still being written would otherwise delete the bytes out from under it.
-/// Four is a couple of copies' worth of grace and still a bounded amount of
-/// temporary space.
-const KEEP_STAGED_BATCHES: usize = 4;
 
 /// Largest number of files one drop may upload, so dropping a huge tree
 /// does not queue thousands of transfers by accident.
@@ -4657,16 +4594,15 @@ mod tests {
         app.uploads.push((1, "a.txt".into()));
         app.upload_queue
             .push_back((PathBuf::from("/tmp/b.txt"), "b.txt".into()));
-        app.clipboard_batch = Some(ClipBatch::new(
-            PathBuf::from("/staging"),
-            &entries(&["/a/one.txt"]),
-        ));
+        let (reply, waiting) = crossbeam_channel::bounded(1);
+        app.clipboard_reads.insert(42, reply);
         app.last_clipboard = Some("stale".into());
 
         app.on_link_lost("connection closed".into());
         assert!(app.uploads.is_empty());
         assert!(app.upload_queue.is_empty());
         assert!(app.clipboard_batch.is_none());
+        assert!(waiting.recv().is_err());
         assert_eq!(app.last_clipboard, None);
 
         // And a drop onto a dimmed window queues nothing rather than failing

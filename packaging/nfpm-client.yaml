@@ -49,11 +49,13 @@ scripts:
 overrides:
   deb:
     depends:
+      - fuse3
       - openssh-client
       - libxkbcommon-x11-0
       - libxkbcommon0
   rpm:
     depends:
+      - fuse3
       - openssh-clients
       - libxkbcommon-x11
       - libxkbcommon
