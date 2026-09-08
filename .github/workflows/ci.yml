@@ -21,7 +21,7 @@ jobs:
     name: Format and lint
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -33,7 +33,7 @@ jobs:
     name: Test (Linux, Xvfb end-to-end)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install X test dependencies
         # openssh-server is for tunnel_e2e, which starts a throwaway sshd and
         # is the only test that exercises the transport the product ships over.
@@ -107,7 +107,7 @@ jobs:
             bin: lynxrdp.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -141,7 +141,7 @@ jobs:
           packaging/make-app-bundle.sh \
             "target/${{ matrix.target }}/release/lynxrdp" stage
           packaging/make-dmg.sh stage/LynxRDP.app dist "${{ matrix.name }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lynxrdp-client-${{ matrix.name }}
           path: dist/*
@@ -155,8 +155,8 @@ jobs:
       run:
         working-directory: tools/lynxrdp-monitor
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install
@@ -189,11 +189,15 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.22"
+          # nfpm is fetched with `go install`; this repository has no Go module
+          # of its own, so there is nothing for the default module cache to key
+          # on and leaving it enabled only logs a missing go.sum every run.
+          cache: false
       - name: Install nfpm
         run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.1
       # Built inside AlmaLinux 9 (RHEL 9 ABI, glibc 2.34) rather than on the
@@ -312,7 +316,7 @@ jobs:
           rpm -qpl dist/lynxrdp-server-*.rpm | grep -qx /etc/logrotate.d/lynxrdp
           rpm -qpl dist/lynxrdp-server-*.rpm | grep -qx /usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules
           rpm -qp --recommends dist/lynxrdp-server-*.rpm | grep -q logrotate
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lynxrdp-server-${{ matrix.name }}
           path: dist/*

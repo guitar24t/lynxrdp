@@ -38,7 +38,7 @@ jobs:
           - { name: windows-x86_64, os: windows-latest,   target: x86_64-pc-windows-msvc,    bin: lynxrdp.exe }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -66,7 +66,7 @@ jobs:
           packaging/make-app-bundle.sh \
             "target/${{ matrix.target }}/release/lynxrdp" stage
           packaging/make-dmg.sh stage/LynxRDP.app dist "${{ matrix.name }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lynxrdp-client-${{ matrix.name }}
           path: dist/*
@@ -81,11 +81,13 @@ jobs:
           - { name: aarch64, os: ubuntu-24.04-arm, arch: arm64 }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.22"
+          # No Go module in this repository; see the note in ci.yml.
+          cache: false
       - run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.1
       # Built against the RHEL 9 glibc; see the note in ci.yml.
       - name: Build server and client (release, against the RHEL 9 glibc)
@@ -107,7 +109,7 @@ jobs:
             target/release/lynxrdp-session \
             target/release/lynxrdp
       - run: packaging/package-server.sh "${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lynxrdp-server-${{ matrix.name }}
           path: dist/*
@@ -117,7 +119,7 @@ jobs:
     needs: [build-client, package-server]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Collect
@@ -126,7 +128,7 @@ jobs:
           find artifacts -type f -exec cp {} release/ \;
           (cd release && sha256sum * > SHA256SUMS)
           ls -la release
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: release/*
           generate_release_notes: true
