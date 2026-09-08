@@ -11,7 +11,7 @@
 # with its own tests).
 #
 # Regenerate with:
-#     cargo test -p lynxrdp-proto --test wire_corpus -- --ignored regenerate
+#     LYNXRDP_WRITE_WIRE_CORPUS=1 cargo test -p lynxrdp-proto --test wire_corpus -- --ignored regenerate
 
 min-compatible-version = 3
 

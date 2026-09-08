@@ -103,7 +103,8 @@ Rust cannot describe: the daemon's `libc` and PAM calls and the credential
 switch itself, descriptor passing, the session's raw socket, `openat` and X
 shared-memory calls, the process control around Xvfb and the desktop, and
 the platform calls the client makes for the clipboard, drag-and-drop, the
-Windows console it reattaches to and its own installer. One use is not like
+Windows console it reattaches to, cancelling a socket write Winsock has left
+blocked, and its own installer. One use is not like
 the others: the blocks in the client's askpass path that overwrite an SSH
 passphrase with zeroes in place, which are there to bound how long the
 secret survives in the heap -- the one place here where `unsafe` is what

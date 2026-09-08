@@ -651,6 +651,26 @@ impl Core {
             }
             ClipboardEvent::Unavailable(format) => {
                 log::debug!("clipboard format {format:#x} turned out to be unavailable");
+                // Silence, for both kinds of format that reach here. One the
+                // client asked for it cannot have asked for, since the offer
+                // above is masked by what it said it understands; text it never
+                // asks for at all, being fetched on our own initiative, but a
+                // client with clipboard sharing switched off is not receiving
+                // that copy either and should not be told one failed.
+                if self.client_clipboard_formats() & format == 0 {
+                    return Ok(());
+                }
+                // `ClipboardRequest` has no failure reply, and the client keeps
+                // no record of having asked, so a conversion that cannot be
+                // completed reaches the user as nothing whatsoever: their
+                // clipboard keeps its old contents and the next paste is stale
+                // with no sign that anything went wrong. Widening the protocol
+                // for that would mean a new message shape carrying something
+                // only a person ever reads, so it goes out as the message that
+                // already exists for telling a person something.
+                self.send_to_client(vec![Message::Notice {
+                    text: unavailable_notice(format),
+                }]);
             }
         }
         Ok(())
@@ -1706,6 +1726,24 @@ fn frames_per_rtt(rtt: Duration, interval: Duration) -> u32 {
     n.clamp(1, u128::from(MAX_IN_FLIGHT_CAP)) as u32
 }
 
+/// What to tell the user when a format the session offered cannot be produced.
+///
+/// This is read by somebody who copied something in the session and is about
+/// to paste it on their own desktop, so it names what they copied rather than
+/// the conversion that failed; the format mask and the X-level reason are in
+/// the log, for whoever is reading that instead.
+fn unavailable_notice(format: u32) -> String {
+    let what = match format {
+        clipboard_format::PNG => "image",
+        clipboard_format::FILES => "files",
+        clipboard_format::TEXT => "text",
+        // Unreachable while the mask holds only the three known formats, and
+        // still better than a sentence with a hole in it.
+        _ => "content",
+    };
+    format!("The {what} copied in the remote session could not be transferred to your clipboard.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1806,5 +1844,38 @@ mod tests {
             rtt.record(t0 + Duration::from_micros(i), ms(50));
         }
         assert!(rtt.samples.len() <= RTT_SAMPLES);
+    }
+
+    #[test]
+    fn an_undeliverable_format_is_named_in_words_the_user_copied_in() {
+        // The failure this guards is silence: the whole answer to an
+        // unavailable format used to be a debug line, so the person waiting to
+        // paste was told nothing and pasted something stale instead.
+        for (format, word) in [
+            (clipboard_format::TEXT, "text"),
+            (clipboard_format::PNG, "image"),
+            (clipboard_format::FILES, "files"),
+        ] {
+            let notice = unavailable_notice(format);
+            assert!(
+                notice.contains(word),
+                "format {format:#x} produced {notice:?}, which does not say what did not arrive"
+            );
+            assert!(notice.contains("clipboard"), "{notice:?}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_format_still_produces_a_whole_sentence() {
+        let notice = unavailable_notice(1 << 20);
+        assert!(
+            notice.contains("clipboard") && notice.ends_with('.'),
+            "{notice:?}"
+        );
+        // The hole this is really guarding: an empty word from the fallback
+        // arm leaves "The  copied in the remote session ...", which still
+        // mentions the clipboard and still ends in a full stop, so the two
+        // assertions above would not notice it.
+        assert!(!notice.contains("The  "), "{notice:?}");
     }
 }

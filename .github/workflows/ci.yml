@@ -43,7 +43,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets
+      # Set here too, and not only on the end-to-end steps below, because one
+      # ordinary unit test has an external dependency: x11/empty_drop.rs runs a
+      # python3 fixture for the empty-view contract. Its guard skips where
+      # python3 is absent, which is right on a developer's machine and wrong
+      # here -- python3 arrives with the apt line above, so an absence is a
+      # broken workflow and has to fail rather than quietly cover nothing.
       - name: Unit tests
+        env:
+          LYNXRDP_REQUIRE_E2E: "1"
         run: cargo test --workspace --lib --bins
       # LYNXRDP_REQUIRE_E2E turns every "dependency missing, skipping" guard
       # into a failure. Without it a skipped test is reported as a pass, so

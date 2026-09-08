@@ -64,7 +64,7 @@ use lynxrdp_proto::message::reject;
 
 use super::send_rejection;
 use super::users::UserInfo;
-use crate::config::Config;
+use crate::config::{Config, SessionConfig};
 use crate::handoff::{send_handoff, Handoff, Reply};
 use crate::session::xserver::{ensure_owned_dir, LooseMode};
 
@@ -553,34 +553,7 @@ impl SessionManager {
             }
         }
         let s = &self.cfg.session;
-        let mut session_args: Vec<String> = vec![
-            "--width".into(),
-            s.default_width.to_string(),
-            "--height".into(),
-            s.default_height.to_string(),
-            "--max-width".into(),
-            s.max_width.to_string(),
-            "--max-height".into(),
-            s.max_height.to_string(),
-            "--dpi".into(),
-            s.dpi.to_string(),
-            "--xserver".into(),
-            s.xserver.clone(),
-            "--startwm".into(),
-            s.startwm.clone(),
-            "--max-fps".into(),
-            s.max_fps.to_string(),
-            "--max-in-flight".into(),
-            s.max_in_flight.to_string(),
-            "--idle-timeout".into(),
-            s.idle_timeout_secs.to_string(),
-            "--session-id".into(),
-            session_id.to_string(),
-        ];
-        for a in &s.xserver_args {
-            session_args.push("--xserver-arg".into());
-            session_args.push(a.clone());
-        }
+        let session_args = session_argv(s, session_id);
         let exe = std::env::current_exe().context("locating lynxrdpd executable")?;
         let mut cmd = Command::new(exe);
         cmd.arg("--supervise")
@@ -1055,6 +1028,50 @@ fn try_handoff(
     }
 }
 
+/// Everything in `[session]` that a session process is told about.
+///
+/// This list is the whole of a session's configuration: the process reads no
+/// file of its own, so a key that is not turned into an argument here is a key
+/// an operator can set to no effect at all. `max_in_flight_auto` was one for a
+/// while, which is why the mapping now sits on its own with a test against it.
+fn session_argv(s: &SessionConfig, session_id: u64) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--width".into(),
+        s.default_width.to_string(),
+        "--height".into(),
+        s.default_height.to_string(),
+        "--max-width".into(),
+        s.max_width.to_string(),
+        "--max-height".into(),
+        s.max_height.to_string(),
+        "--dpi".into(),
+        s.dpi.to_string(),
+        "--xserver".into(),
+        s.xserver.clone(),
+        "--startwm".into(),
+        s.startwm.clone(),
+        "--max-fps".into(),
+        s.max_fps.to_string(),
+        "--max-in-flight".into(),
+        s.max_in_flight.to_string(),
+        "--idle-timeout".into(),
+        s.idle_timeout_secs.to_string(),
+        "--session-id".into(),
+        session_id.to_string(),
+    ];
+    // The session's own switch is the negative one -- adaptation is on unless
+    // it is given -- so this appears only when an operator has turned the
+    // window down to a fixed size, and it carries no value of its own.
+    if !s.max_in_flight_auto {
+        args.push("--no-auto-in-flight".into());
+    }
+    for a in &s.xserver_args {
+        args.push("--xserver-arg".into());
+        args.push(a.clone());
+    }
+    args
+}
+
 fn new_session_id() -> u64 {
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1263,5 +1280,32 @@ Num       RefCount Protocol Flags    Type St Inode Path
         // Entries go when they reach zero, so this map is bounded by who is
         // connecting now rather than by everyone who ever has.
         assert!(lock(&admission.in_flight).is_empty());
+    }
+
+    /// `max_in_flight_auto = false` has to reach the session as
+    /// `--no-auto-in-flight`, because that argument is the only thing a
+    /// session ever hears about the setting.
+    ///
+    /// It was parsed, validated and offered in the packaged template, and then
+    /// dropped here, so the only session that honoured it was one an operator
+    /// ran by hand. Anything else added to `[session]` and forgotten in
+    /// `session_argv` fails the same silent way.
+    #[test]
+    fn turning_off_the_adaptive_window_reaches_the_session() {
+        let mut cfg = Config::default();
+        assert!(cfg.session.max_in_flight_auto);
+        let on = session_argv(&cfg.session, 1);
+        assert!(!on.iter().any(|a| a == "--no-auto-in-flight"));
+
+        cfg.session.max_in_flight_auto = false;
+        let off = session_argv(&cfg.session, 1);
+        assert!(
+            off.iter().any(|a| a == "--no-auto-in-flight"),
+            "the daemon dropped session.max_in_flight_auto: {off:?}"
+        );
+        // A bare switch and not a pair: every other setting here is `--flag
+        // value`, and giving this one a value of its own would fail the
+        // session's parse rather than configure anything.
+        assert_eq!(off.len(), on.len() + 1);
     }
 }

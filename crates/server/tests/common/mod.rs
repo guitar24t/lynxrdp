@@ -24,6 +24,29 @@ pub fn have(prog: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a FUSE filesystem can actually be mounted here.
+///
+/// The clipboard staging directory is a FUSE mount
+/// (`lynxrdp_filecopy::Files::new`), and `fuser` wants two unrelated things for
+/// it: it opens `/dev/fuse` and tries `mount(2)` directly, falling back to the
+/// setuid `fusermount3` helper when the kernel refuses -- which, unprivileged,
+/// it always does. Neither piece implies the other, so check both. A container
+/// image can carry the `fuse3` package while its device cgroup denies the node,
+/// and a host can expose the node with nothing having installed the helper.
+/// Opening the device rather than stat-ing it is the point: a device that will
+/// not open is an error `fuser` returns rather than retries through the helper,
+/// and the interesting failure is a node that is present and not ours to use.
+/// The session under test is our own child at our own uid, so what this process
+/// may open, it may open too.
+pub fn have_fuse() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .is_ok()
+        && have("fusermount3")
+}
+
 /// Decide whether to skip a test whose external dependency is missing, and
 /// return whether the caller should bail out.
 ///

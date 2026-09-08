@@ -116,6 +116,11 @@ sudo lynxrdpd --check          # validates /etc/lynxrdp/lynxrdp.toml
 sudo lynxrdpd --dump-config    # prints the effective configuration
 ```
 
+`--check` reads the values, not the world they name: it will pass a
+configuration whose `startwm`, `session_binary` or `xserver` does not exist on
+this host, and the first sign of that is a session that will not start. If you
+have pointed any of those somewhere unusual, check them yourself.
+
 ## Installing the client
 
 The client is a desktop application. Every platform has an installer on the
@@ -407,12 +412,10 @@ any local uid and exists for tests.
 | `session.max_fps`, `max_in_flight` | `60`, `2` | Latency/smoothness knobs. `max_in_flight` is a floor rather than a ceiling: a session raises its own window towards the round trip it measures, up to 8. |
 | `session.idle_timeout_secs` | `0` | Seconds without a connected client before a session is ended. `0`, the default, means never: a desktop nobody comes back to keeps running until the user logs out of it. |
 
-`session.max_in_flight_auto = false` is meant to hold that window at exactly
-the number configured, but the daemon does not pass the setting through to
-the sessions it starts, so a daemon-started session always adapts. The only
-thing that holds it today is `lynxrdp-session --no-auto-in-flight` run by
-hand — a command-line switch rather than this key, because a session in user
-mode never reads this file.
+`session.max_in_flight_auto = false` holds that window at exactly the number
+configured, for tuning latency rather than smoothness. It takes effect on the
+next daemon restart. A session in user mode never reads this file, so there the
+same thing is asked for with `lynxrdp-session --no-auto-in-flight`.
 
 ### Session logs
 

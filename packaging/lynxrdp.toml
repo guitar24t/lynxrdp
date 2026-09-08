@@ -43,14 +43,9 @@ max_in_flight = 2
 # measures justifies more. A fixed 2 frames per round trip is 40 fps at 50 ms
 # and 20 fps at 100 ms, and the transport here is an SSH tunnel that is often
 # crossing a WAN. The value above stays the floor either way: the session will
-# never allow itself fewer frames than you asked for.
-#
-# Setting this to false is meant to hold the window at exactly max_in_flight,
-# for tuning latency rather than smoothness, but it does not reach a session
-# the daemon starts: the daemon builds the session's arguments without
-# --no-auto-in-flight, so adaptation stays on no matter what you put here.
-# Today only a hand-run `lynxrdp-session --no-auto-in-flight` holds the
-# window at the floor.
+# never allow itself fewer frames than you asked for. Set this to false to
+# hold the window at exactly max_in_flight, which is what tuning for latency
+# rather than smoothness asks for.
 max_in_flight_auto = true
 # Seconds a session may stay without a client before it is ended (0 = never).
 idle_timeout_secs = 0

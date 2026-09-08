@@ -80,12 +80,15 @@ cargo test -p lynxrdp-server --test privdrop   # needs root; skips cleanly other
 cargo test -p lynxrdp-server --test tunnel_e2e # needs sshd; CI runs it now
 ```
 
-Two dependencies have no guard at all and fail rather than skip. `python3` is
-required by an ordinary unit test (`x11/empty_drop.rs` shells out to a fixture
-script for the empty-view contract), and FUSE by the clipboard-file end-to-end
-tests, because `lynxrdp_filecopy::Files::new` execs `fusermount3`. CI installs
-both; a container without `/dev/fuse` fails those tests rather than skipping
-them.
+Two dependencies are easy to miss because nothing else in the tree needs them.
+`python3` is required by an ordinary unit test -- `x11/empty_drop.rs` shells out
+to a fixture script for the empty-view contract, which is why the `--lib --bins`
+step sets `LYNXRDP_REQUIRE_E2E` too -- and FUSE by the clipboard-file end-to-end
+tests, because `lynxrdp_filecopy::Files::new` opens `/dev/fuse` and execs
+`fusermount3`. Both now skip cleanly when the dependency is absent and fail
+where that variable says the environment is supposed to have it. A container
+with the `fuse3` package but no device node is the case the FUSE guard checks
+both halves for.
 
 **Two tests reach github.com and are `#[ignore]`d for it.** A suite that fails
 on an aeroplane is a suite people learn to ignore, so neither CI nor a plain
@@ -97,15 +100,20 @@ which makes them worth running by hand when either end changes:
 cargo test -p lynxrdp-client --lib -- --ignored --nocapture
 ```
 
-On Linux that line picks up two more — the X11 file-clipboard test and the
-shared-window one — which need a display and fail rather than skip without one;
-CI runs exactly those two under `xvfb-run`. Widening `--ignored` further is
-worse than inconvenient: `cargo test -p lynxrdp-proto -- --ignored` rewrites the
-checked-in wire corpus (`crates/proto/tests/corpus/messages.hex`), and unlike
-the report fixture nothing gates it on an environment variable. It refuses to
-change an existing encoding unless `MIN_COMPATIBLE_VERSION` has risen — but that
-refusal is skipped entirely when the file is absent, so a deleted corpus comes
-back regenerated and looking clean.
+That line picks up a third everywhere, `gui_paint`'s rendering benchmark, which
+needs nothing and only prints timings. On Linux it picks up two more still — the
+X11 file-clipboard test and the shared-window one — which need a display and
+fail rather than skip without one; CI runs exactly those two under `xvfb-run`.
+
+Widening `--ignored` across the workspace is a different matter, because two
+ignored tests rewrite checked-in fixtures. Both now refuse unless told
+explicitly: `LYNXRDP_WRITE_REPORT_FIXTURE` for the monitoring fixture and
+`LYNXRDP_WRITE_WIRE_CORPUS` for `crates/proto/tests/corpus/messages.hex`, so a
+bare `cargo test -p lynxrdp-proto -- --ignored` fails loudly rather than
+quietly rewriting the one file that holds `MIN_COMPATIBLE_VERSION` to its
+promise. The corpus refuses to change an existing encoding unless that floor has
+risen, and refuses to create the file at all without `LYNXRDP_CREATE_WIRE_CORPUS`
+-- deleting it was previously a way to launder a wire change past the check.
 
 **`cargo build -p lynxrdp-server` on its own can fail to link with
 `unable to find library -lxcb`,** on a host with `libxcb` but no `libxcb-devel`.

@@ -38,7 +38,7 @@
 //! dropped. Dropping them was not an edge case -- a client that has just been
 //! offered PNG and FILES asks for both in the same burst, and the second
 //! request used to be answered with nothing at all, so that format never
-//! arrived and the paste stayed pending forever.
+//! arrived and the user pasted whatever their clipboard held before.
 //!
 //! Every conversion also carries a deadline. `ConvertSelection` has no timeout
 //! of its own, and a selection owner that never replies would otherwise block
@@ -419,21 +419,24 @@ impl Clipboard {
         Ok(events)
     }
 
-    /// Drop the outstanding conversion and everything queued behind it,
-    /// telling the far end that none of it is coming.
+    /// Drop the outstanding conversion and everything queued behind it.
     ///
-    /// Silence is the one answer we must not give: the client shows a paste as
-    /// pending until it hears something, so an abandoned conversion has to come
-    /// back as `Unavailable` even though nothing went wrong on the wire.
-    fn cancel_all(&mut self) -> Vec<ClipboardEvent> {
-        let mut events = Vec::new();
-        if let Some(fetch) = self.fetch.take() {
-            if fetch.target != self.atoms.targets {
-                events.push(ClipboardEvent::Unavailable(fetch.format));
-            }
-        }
-        events.extend(self.queue.drain(..).map(ClipboardEvent::Unavailable));
-        events
+    /// Nothing is reported upwards, and that is a decision rather than an
+    /// omission. Both callers are a selection being superseded -- the session's
+    /// owner changing under us, or ourselves taking the selection for a copy
+    /// made on the client -- which is the ordinary case of somebody copying
+    /// something else. The client holds no state waiting on a conversion: it
+    /// answers a `ClipboardOffer` by asking for a format and then forgets, so
+    /// an abandoned one leaves nothing behind to be told, and an `Unavailable`
+    /// here would only warn a user whose copy is working exactly as they
+    /// expect. What takes the abandoned conversion's place differs by caller
+    /// and in no case wants one: a new session-side owner is asked for
+    /// `TARGETS` a few lines below and a fresh offer follows from that, an
+    /// owner that merely went away leaves nothing to offer at all, and a
+    /// client-side copy is content the client already holds.
+    fn cancel_all(&mut self) {
+        self.fetch = None;
+        self.queue.clear();
     }
 
     fn dispatch(&mut self, ev: &Event) -> Result<Vec<ClipboardEvent>> {
@@ -451,14 +454,14 @@ impl Clipboard {
                 // owner and its format list. That owner has gone and will never
                 // answer, and the formats were indexes into a list that no
                 // longer applies, so none of it may be carried across.
-                let events = self.cancel_all();
+                self.cancel_all();
                 if e.owner == x11rb::NONE {
-                    return Ok(events);
+                    return Ok(Vec::new());
                 }
                 self.owner_time = e.timestamp;
                 // Learn what the new owner can produce before fetching.
                 self.request(self.atoms.targets, 0, e.timestamp)?;
-                Ok(events)
+                Ok(Vec::new())
             }
             Event::SelectionNotify(e) if e.requestor == self.window => self.on_selection_notify(e),
             Event::PropertyNotify(e)
@@ -684,8 +687,11 @@ impl Clipboard {
             return vec![ClipboardEvent::Image(data)];
         }
         if data.len() > MAX_CLIPBOARD_BYTES {
+            // Reported, not dropped, for the same reason the oversized image a
+            // few lines above is: silence leaves the user's clipboard holding
+            // whatever it held before, and their next paste is quietly stale.
             log::warn!("clipboard text too large ({} bytes)", data.len());
-            return Vec::new();
+            return vec![ClipboardEvent::Unavailable(format)];
         }
         let text = String::from_utf8_lossy(&data).into_owned();
         if let Some(paths) = lynxrdp_proto::urilist::parse_gnome_text(&text) {

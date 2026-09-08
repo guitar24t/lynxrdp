@@ -100,10 +100,11 @@ Frame pipeline:
    are queueing — never below the configured value, and never above eight,
    past which it would be buffering rather than pipelining. The estimate
    behind it is a windowed *minimum* of recent samples, so the window
-   tracks the path rather than the backlog it created itself. A session run
-   by hand can hold the window at exactly `max_in_flight` with
-   `--no-auto-in-flight`; the daemon builds no such argument, so a session it
-   starts always adapts.
+   tracks the path rather than the backlog it created itself.
+   `max_in_flight_auto = false` turns the adaptation off and holds the
+   window at the configured value; a session reads no configuration file of
+   its own, so that reaches it as `--no-auto-in-flight` on the argument
+   list the daemon builds.
 
 Input is applied the moment it arrives, ahead of frame work. Pointer motion
 is injected with `XTestFakeInput`; keys are mapped from keysyms using the
@@ -221,6 +222,18 @@ in a `0700` directory wherever OpenSSH supports one and `--local-port` has not
 asked for a fixed port, because a loopback port belongs to nobody for the whole
 authentication window and, once bound, is reachable by every process of every
 user on the machine.
+
+Nothing on the winit thread waits for the network. Sends are queued to a writer
+thread (`outbound.rs`) behind a bound on both messages and bytes, and an
+overloaded link is **closed rather than trimmed**: dropping a message to relieve
+pressure would eventually drop a key or button *release*, and a modifier stuck
+down on the remote desktop is worse than a connection that ends and says so.
+Reads are drained under a few milliseconds' budget per turn of the event loop,
+because transfer chunks, acknowledgements and pings produce no UI event at all
+and a fast transfer could otherwise keep a zero-timeout poll running
+indefinitely; whatever is left is picked up next turn rather than waiting on the
+idle timer. The reader wakes the loop once per burst instead of once per
+message, for the same reason.
 
 The binary has two entry points. Started with a destination it opens a session
 window directly; started with no arguments it opens the connection manager

@@ -14,7 +14,7 @@ use lynxrdp_client::connection::{Client, ClientEvent, ConnectOptions};
 use lynxrdp_proto::{keysym, Rect};
 
 mod common;
-use common::{have, skip_unless};
+use common::{have, have_fuse, skip_unless};
 
 macro_rules! require_xvfb {
     () => {
@@ -996,10 +996,57 @@ fn read_clipboard_file(client: &mut Client, path: &std::path::Path) -> std::io::
     }
 }
 
+/// Publishing a clipboard file list drives the session into
+/// `lynxrdp_filecopy::Files::new`, which mounts FUSE, so a box without
+/// `/dev/fuse` or `fusermount3` must skip these the way it skips every other
+/// missing dependency. Nothing in the types ties the call to the guard, and the
+/// omission is invisible until someone runs the suite in a container, so read
+/// the source instead: a call to `offer_clipboard_files` has to be preceded,
+/// in the same function, by the guard that lets the run bow out.
+#[test]
+fn clipboard_file_tests_ask_for_fuse_before_using_it() {
+    const THIS_TEST: &str = "clipboard_file_tests_ask_for_fuse_before_using_it";
+    // Comments come out first. Prose naming either marker would otherwise read
+    // as a call, and a doc comment sits *above* its `fn`, so it falls in the
+    // preceding function's chunk -- the paragraph above this one was enough to
+    // accuse `read_clipboard_file`. Splitting what remains on a column-zero
+    // `fn ` gives one chunk per top-level function; nested ones are indented
+    // and stay with their parent, which is what we want, because a guard and
+    // the call it protects share a body.
+    let source = include_str!("e2e.rs")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut checked = 0;
+    for body in source.split("\nfn ") {
+        // This function names both markers itself and is not its own subject.
+        if body.starts_with(THIS_TEST) {
+            continue;
+        }
+        let Some(offer) = body.find("offer_clipboard_files") else {
+            continue;
+        };
+        let name = body.split('(').next().unwrap_or(body);
+        let guard = body
+            .find("have_fuse()")
+            .unwrap_or_else(|| panic!("{name} stages clipboard files with no FUSE guard"));
+        assert!(
+            guard < offer,
+            "{name} stages clipboard files before its FUSE guard"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "the scan matched nothing; has the call moved?");
+}
+
 #[test]
 fn clipboard_files_from_the_client_are_staged_for_the_session() {
     require_xvfb!();
     if skip_unless(have("xclip"), "xclip not installed") {
+        return;
+    }
+    if skip_unless(have_fuse(), "FUSE not available (clipboard file staging)") {
         return;
     }
     let s = Session::start(320, 240, "none", &[]);
@@ -1131,6 +1178,9 @@ fn clipboard_disconnect_releases_a_waiting_native_reader() {
     if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
+    if skip_unless(have_fuse(), "FUSE not available (clipboard file staging)") {
+        return;
+    }
     let session = Session::start(320, 240, "none", &[]);
     let mut client = session.connect(None);
     let source = tempfile::NamedTempFile::new().unwrap();
@@ -1186,6 +1236,9 @@ fn clipboard_desktop_text_envelope_is_a_file_offer_not_text() {
 fn clipboard_files_round_trip(target: &str) {
     require_xvfb!();
     if skip_unless(have("xclip"), "xclip not installed") {
+        return;
+    }
+    if skip_unless(have_fuse(), "FUSE not available (clipboard file staging)") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -1421,6 +1474,9 @@ fn latency_probe() {
 fn clipboard_paste_preserves_duplicate_names_and_reports_missing_sources() {
     require_xvfb!();
     if skip_unless(have("xclip"), "xclip not installed") {
+        return;
+    }
+    if skip_unless(have_fuse(), "FUSE not available (clipboard file staging)") {
         return;
     }
     let s = Session::start(320, 240, "none", &[]);

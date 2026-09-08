@@ -121,13 +121,12 @@ pub struct SessionConfig {
     ///
     /// On by default because the fixed default of 2 frames per round trip is
     /// 20 fps at 100 ms, and the transport this server is designed for is an
-    /// SSH tunnel across a WAN. Turning it off is meant to hold the window at
-    /// exactly `max_in_flight`, which is what an operator tuning for latency
-    /// rather than smoothness is asking for -- but it does not reach a session
-    /// the daemon starts: `SessionManager::spawn` builds the argument list
-    /// without `--no-auto-in-flight`, and a session reads no configuration
-    /// file of its own, so today only a hand-run
-    /// `lynxrdp-session --no-auto-in-flight` holds the window there.
+    /// SSH tunnel across a WAN. Turning it off holds the window at exactly
+    /// `max_in_flight`, which is what an operator tuning for latency rather
+    /// than smoothness is asking for. A session reads no configuration file of
+    /// its own, so this reaches it only as an argument: `session_argv` in
+    /// `daemon::manager` emits `--no-auto-in-flight` when it is false, and a
+    /// setting that never grows such a line is a setting that does nothing.
     pub max_in_flight_auto: bool,
     /// Seconds without a connected client after which the session is
     /// terminated. `0` keeps sessions forever (until logout).

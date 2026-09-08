@@ -19,8 +19,12 @@
 //! Read the assertion; it names the message and the byte that moved, and it
 //! spells out the two things you are allowed to do about it. The short version
 //! is *undo it*, or *raise the floor* — and regenerating is not on the list,
-//! because [`regenerate_corpus`] refuses to rewrite an existing entry unless
-//! [`MIN_COMPATIBLE_VERSION`] has actually risen.
+//! because [`regenerate_corpus`] writes only when `LYNXRDP_WRITE_WIRE_CORPUS`
+//! asks it to, and then still refuses to rewrite an existing entry unless
+//! [`MIN_COMPATIBLE_VERSION`] has actually risen. Nor is deleting the file: the
+//! refusal is a comparison against what is on disk, so with nothing there it
+//! has nothing to refuse, and a missing corpus is therefore turned away in its
+//! own right. Writing a first corpus takes a second, separate opt-in.
 //!
 //! # What is deliberately not in here
 //!
@@ -45,8 +49,29 @@ const CORPUS: &str = "tests/corpus/messages.hex";
 /// The line naming the floor these bytes are pinned at.
 const FLOOR_KEY: &str = "min-compatible-version";
 
-/// How to rebuild the file, quoted verbatim in every failure message.
-const REGENERATE: &str = "cargo test -p lynxrdp-proto --test wire_corpus -- --ignored regenerate";
+/// The variable [`regenerate_corpus`] will not write a byte without.
+///
+/// Named after `LYNXRDP_WRITE_REPORT_FIXTURE`, which guards the other golden
+/// file in this tree (`crates/server/tests/report_fixture.rs`) against the same
+/// thing: `cargo test -- --ignored` is a flag people sweep with, and a golden
+/// file that rewrites itself when they do has stopped being golden.
+const WRITE_VAR: &str = "LYNXRDP_WRITE_WIRE_CORPUS";
+
+/// The separate opt-in for writing a corpus where no file exists yet.
+///
+/// Deliberately not the same variable as [`WRITE_VAR`]. Everything the
+/// regenerator refuses, it refuses by comparing against the bytes on disk, so
+/// with no file there it can hold nobody to anything -- and that state is
+/// reached by deleting a file, which announces nothing. Writing the first
+/// corpus is a real thing to want, about once in the life of the file, and this
+/// is how somebody says so out loud.
+const CREATE_VAR: &str = "LYNXRDP_CREATE_WIRE_CORPUS";
+
+/// How to rebuild the file, quoted verbatim in every failure message. The
+/// variable is part of the line because a command a failure tells somebody to
+/// run has to be one that works.
+const REGENERATE: &str = "LYNXRDP_WRITE_WIRE_CORPUS=1 cargo test -p lynxrdp-proto \
+     --test wire_corpus -- --ignored regenerate";
 
 /// Every message, with values chosen to make a layout change visible.
 ///
@@ -529,7 +554,9 @@ fn load() -> Corpus {
     let path = corpus_path();
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
-            "cannot read {}: {e}\n\nIf the corpus is genuinely missing, create it with:\n    {REGENERATE}",
+            "cannot read {}: {e}\n\nIf the corpus is genuinely missing rather than \
+             deleted, writing the first one is its own deliberate act:\n    \
+             {CREATE_VAR}=1 {REGENERATE}",
             path.display()
         )
     });
@@ -869,19 +896,111 @@ fn corpus_has_no_stale_entries() {
     );
 }
 
+/// Why a regeneration must not write, or `None` if it may.
+///
+/// The environment gates live here rather than inline in [`regenerate_corpus`]
+/// so that ordinary tests can reach them: a guard nothing exercises is a guard
+/// nobody notices the hole in, and this one had one. What the regenerator
+/// refuses further down, it refuses by comparing against the bytes on disk, so
+/// an absent file passed straight through -- `rm messages.hex`, regenerate, and
+/// a change to any message at all came back pinned as though it had always been
+/// that shape.
+fn regeneration_refusal(
+    write_opt_in: bool,
+    create_opt_in: bool,
+    corpus_exists: bool,
+) -> Option<String> {
+    if !write_opt_in {
+        return Some(format!(
+            "refusing to rewrite {CORPUS} without {WRITE_VAR}=1.\n\n\
+             This is a tool rather than a check, and failing is how it says so: a \
+             sweep of `cargo test -- --ignored` must not rewrite a golden file in \
+             passing, and somebody who ran it on purpose is owed a reason for the \
+             file not moving. Ask for it by name:\n    {REGENERATE}"
+        ));
+    }
+    if !corpus_exists && !create_opt_in {
+        return Some(format!(
+            "refusing to write {CORPUS} when there is no corpus there.\n\n\
+             Every refusal this tool makes is a comparison against the bytes on \
+             disk, so with no file to compare against there is nothing left to \
+             refuse: a wire change of any size would be written out as though it \
+             had always been that shape, in a diff that reads as a new file. If \
+             the corpus was deleted, put it back -- `git restore \
+             crates/proto/{CORPUS}` -- and run this again. If it genuinely does \
+             not exist yet, which is true once in the life of the file, say \
+             so:\n    {CREATE_VAR}=1 {REGENERATE}"
+        ));
+    }
+    None
+}
+
+/// The regenerator writes nothing unless it was asked for by name.
+///
+/// `--ignored` is a flag people sweep with, this crate included, and while the
+/// flag was the only thing in the way, sweeping it over this crate rewrote the
+/// checked-in corpus as a side effect of running the suite.
+#[test]
+fn regeneration_refuses_without_its_environment_variable() {
+    let refusal =
+        regeneration_refusal(false, false, true).expect("no opt-in at all must be refused");
+    // Whoever ran it on purpose has to come away knowing which word to say.
+    assert!(refusal.contains(WRITE_VAR), "{refusal}");
+    assert!(
+        regeneration_refusal(false, true, true).is_some(),
+        "the create opt-in is not a licence to rewrite a corpus that exists"
+    );
+    assert!(regeneration_refusal(true, false, true).is_none());
+}
+
+/// A deleted corpus cannot be laundered back into existence.
+///
+/// The floor check, the changed-entry check and the dropped-entry check are all
+/// comparisons against the file, so an absent one skipped every one of them:
+/// deleting `messages.hex` and regenerating produced a clean-looking corpus
+/// pinning whatever the encoders happened to do that afternoon, which is the
+/// outcome the corpus exists to make impossible.
+#[test]
+fn a_deleted_corpus_cannot_be_quietly_recreated() {
+    let refusal =
+        regeneration_refusal(true, false, false).expect("a missing corpus must be refused");
+    assert!(refusal.contains(CREATE_VAR), "{refusal}");
+    // Writing the very first corpus stays possible, and only on purpose.
+    assert!(regeneration_refusal(true, true, false).is_none());
+}
+
 /// Rewrite the corpus from the current encoders.
 ///
-/// Ignored by default: it is a tool, not a check. It will happily *add* new
-/// entries, because a message an old peer has never seen cannot break it. It
-/// refuses to change or drop an existing one unless `MIN_COMPATIBLE_VERSION`
-/// has risen above the floor recorded in the file -- otherwise "just regenerate
-/// it" becomes the path of least resistance and the corpus stops meaning
-/// anything.
+/// Ignored *and* gated on [`WRITE_VAR`], the way
+/// `crates/server/tests/report_fixture.rs` gates the other golden file here: it
+/// is a tool, not a check. It will happily *add* new entries, because a message
+/// an old peer has never seen cannot break it. It refuses to change or drop an
+/// existing one unless `MIN_COMPATIBLE_VERSION` has risen above the floor
+/// recorded in the file -- otherwise "just regenerate it" becomes the path of
+/// least resistance and the corpus stops meaning anything -- and it refuses a
+/// missing file outright, that being the one state in which it has nothing to
+/// compare against.
 #[test]
-#[ignore = "regenerates the checked-in corpus; run deliberately"]
+#[ignore = "rewrites the checked-in corpus; set LYNXRDP_WRITE_WIRE_CORPUS"]
 fn regenerate_corpus() {
     let path = corpus_path();
-    let existing = std::fs::read_to_string(&path).ok().map(|t| parse(&t));
+    // Presence decides the refusal, so it is settled before the file is
+    // parsed: `parse` panics on a corpus it cannot read, and a truncated one
+    // should still be answered with the refusal that names the opt-in rather
+    // than with a parser's complaint about the file it was never allowed to
+    // rewrite.
+    let raw = std::fs::read_to_string(&path).ok();
+    if let Some(refusal) = regeneration_refusal(
+        std::env::var_os(WRITE_VAR).is_some(),
+        std::env::var_os(CREATE_VAR).is_some(),
+        raw.is_some(),
+    ) {
+        panic!("{refusal}");
+    }
+    let existing = raw.map(|t| parse(&t));
+
+    // Reaching here with no file means the create opt-in was given, and then
+    // there is no recorded floor for the current one to have risen above.
     let old_floor = existing
         .as_ref()
         .map_or(MIN_COMPATIBLE_VERSION, |c| c.floor);
