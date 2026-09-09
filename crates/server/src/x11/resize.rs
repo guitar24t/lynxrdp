@@ -76,10 +76,15 @@ pub fn resize_screen(display: &Arc<XDisplay>, width: u32, height: u32, dpi: u32)
             id
         }
     };
-    let (mm_w, mm_h) = mm_for(width, height, dpi);
-    let growing = width > cur_w || height > cur_h;
-    if growing {
-        conn.randr_set_screen_size(root, width as u16, height as u16, mm_w, mm_h)?
+    // The root must contain the active CRTC throughout the change. A resize
+    // can grow one axis while shrinking the other (1920x1080 -> 1728x1084 on
+    // fullscreen startup), so neither final size can be installed first:
+    // the new root clips the old CRTC, and the old root clips the new CRTC.
+    // Grow to contain both, switch modes, then trim any shrinking axes.
+    let (stage_w, stage_h) = (cur_w.max(width), cur_h.max(height));
+    if (stage_w, stage_h) != (cur_w, cur_h) {
+        let (mm_w, mm_h) = mm_for(stage_w, stage_h, dpi);
+        conn.randr_set_screen_size(root, stage_w as u16, stage_h as u16, mm_w, mm_h)?
             .check()
             .context("set screen size")?;
     }
@@ -99,8 +104,8 @@ pub fn resize_screen(display: &Arc<XDisplay>, width: u32, height: u32, dpi: u32)
     if r.status != randr::SetConfig::SUCCESS {
         bail!("RANDR SetCrtcConfig failed: {:?}", r.status);
     }
-    if !growing {
-        // Shrinking: the CRTC must fit before the screen can shrink.
+    if (width, height) != (stage_w, stage_h) {
+        let (mm_w, mm_h) = mm_for(width, height, dpi);
         conn.randr_set_screen_size(root, width as u16, height as u16, mm_w, mm_h)?
             .check()
             .context("set screen size")?;

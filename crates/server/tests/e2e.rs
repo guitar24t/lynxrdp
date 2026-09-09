@@ -596,11 +596,74 @@ fn resize_changes_screen_and_resends() {
 }
 
 #[test]
+fn resize_can_shrink_one_axis_while_growing_the_other() {
+    require_xvfb!();
+    // The default desktop entering a Mac's fullscreen viewport: four pixels
+    // taller, but 192 pixels narrower. Neither switching the mode first nor
+    // setting the final root size first fits; both need an intermediate root.
+    let s = Session::start(1920, 1080, "none", &["--dpi", "192"]);
+    let mut c = s.connect(None);
+    s.x("xsetroot", &["-solid", "#123456"]);
+    assert!(wait_for(&mut c, Duration::from_secs(5), |_, c| c
+        .framebuffer()
+        .get(0, 0)
+        == 0x123456));
+    for (width, height) in [
+        (1728, 1084),
+        (1920, 1080), // The reverse: wider but shorter.
+        (1000, 800),  // Both shrinking.
+        (1280, 800),  // Width alone grows.
+        (1280, 960),  // Height alone grows.
+        (1280, 800),  // Height alone shrinks.
+        (1000, 800),  // Width alone shrinks.
+        (1920, 1080), // Both growing.
+        (1728, 1084), // Repeat after old modes have been cleaned up.
+    ] {
+        c.request_resize(width, height).unwrap();
+        let (width, height) = (u32::from(width), u32::from(height));
+        assert!(
+            wait_for(&mut c, Duration::from_secs(10), |ev, _| matches!(
+                ev,
+                ClientEvent::Resized { width: w, height: h } if (*w, *h) == (width, height)
+            )),
+            "no resize to {width}x{height}"
+        );
+        assert_eq!(c.size(), (width, height));
+        // The notification alone is not enough: the right/bottom edges must
+        // arrive in the new framebuffer, and X11 must agree about its size.
+        assert!(wait_for(&mut c, Duration::from_secs(10), |_, c| c
+            .framebuffer()
+            .get(width - 1, height - 1)
+            == 0x123456));
+        let out = s.x("xdpyinfo", &[]);
+        let text = String::from_utf8_lossy(&out.stdout);
+        let (mm_w, mm_h) = lynxrdp_server::x11::resize::mm_for(width, height, 192);
+        assert!(
+            text.contains(&format!(
+                "dimensions:    {width}x{height} pixels ({mm_w}x{mm_h} millimeters)"
+            )),
+            "xdpyinfo: {text}"
+        );
+    }
+}
+
+#[test]
 fn initial_size_from_hello() {
     require_xvfb!();
     let s = Session::start(640, 480, "none", &[]);
     let c = s.connect(Some((1024, 768)));
     assert_eq!(c.size(), (1024, 768));
+}
+
+#[test]
+fn initial_size_can_shrink_one_axis_while_growing_the_other() {
+    require_xvfb!();
+    let s = Session::start(1920, 1080, "none", &[]);
+    let mut c = s.connect(Some((1728, 1084)));
+    assert_eq!(c.size(), (1728, 1084));
+    assert!(wait_for(&mut c, Duration::from_secs(10), |ev, c| {
+        matches!(ev, ClientEvent::Frame { .. }) && c.size() == (1728, 1084)
+    }));
 }
 
 #[test]
