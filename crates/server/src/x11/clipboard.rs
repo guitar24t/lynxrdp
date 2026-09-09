@@ -303,12 +303,24 @@ impl Clipboard {
     /// PNG and FILES draws two requests from the client back to back, both
     /// arrive in the same drain of its message channel, and the second used to
     /// be discarded with a debug line and no reply at all.
-    pub fn request_format(&mut self, format: u32) -> Result<()> {
-        if self.owns_selection() || self.available & format == 0 {
-            return Ok(());
+    pub fn request_format(&mut self, format: u32) -> Result<Vec<ClipboardEvent>> {
+        if self.owns_selection() {
+            // The selection is ours, so this content came from the client to
+            // begin with and there is nothing to convert. Saying so would be
+            // telling it about its own copy.
+            return Ok(Vec::new());
+        }
+        if self.available & format == 0 {
+            // Asked for a format this owner never offered, which is what a
+            // request racing an owner change looks like. Nothing is coming,
+            // and this side is the only one that can know that.
+            return Ok(vec![ClipboardEvent::Unavailable(format)]);
         }
         let Some(target) = self.target_for(format) else {
-            return Ok(());
+            // Offered, but with no X target to convert through. Same again:
+            // an answer that will never arrive unless one is manufactured
+            // here.
+            return Ok(vec![ClipboardEvent::Unavailable(format)]);
         };
         // Already coming, or already waiting: asking twice would convert the
         // same selection twice for one paste. This is tested before the
@@ -319,14 +331,17 @@ impl Clipboard {
         // here as if it were new would convert it twice and offer the client
         // two copies of the same paste.
         if self.fetch.as_ref().is_some_and(|f| f.format == format) || self.queue.contains(&format) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if self.fetch.is_some() || !self.queue.is_empty() {
             log::debug!("clipboard: queueing a request for format {format:#x}");
             self.queue.push_back(format);
-            return Ok(());
+            return Ok(Vec::new());
         }
-        self.request(target, format, self.owner_time)
+        // Silence from here on is the right answer: the conversion is under
+        // way, and either a reply or the deadline will produce one.
+        self.request(target, format, self.owner_time)?;
+        Ok(Vec::new())
     }
 
     /// The X target atom that produces `format`, if we can ask for it at all.
@@ -700,7 +715,18 @@ impl Clipboard {
             // Finder's clipboard or fetch the contents before Paste.
             return vec![ClipboardEvent::Files(paths)];
         }
-        if text.is_empty() || self.last_text.as_deref() == Some(text.as_str()) {
+        if text.is_empty() {
+            // Silent, unlike the empty image above, and the difference is
+            // deliberate: a zero-byte PNG can only be a conversion that went
+            // wrong, while an empty text selection is something a user can
+            // genuinely hold. Neither replacing their clipboard with nothing
+            // nor telling them a paste failed would be true.
+            return Vec::new();
+        }
+        if self.last_text.as_deref() == Some(text.as_str()) {
+            // Our own copy coming back around: the client sent this text, we
+            // took the selection to offer it, and the owner change has handed
+            // it straight back.
             return Vec::new();
         }
         self.last_text = Some(text.clone());

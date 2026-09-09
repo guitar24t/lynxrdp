@@ -233,7 +233,6 @@ pub struct Core {
     /// Clipboard text received from the client, to avoid echoing it back.
     last_clipboard_received: Option<String>,
     /// Queue of X events that arrived while we were busy (drained in order).
-    pending_x: VecDeque<Event>,
     /// Transfers in flight in both directions.
     transfers: TransferManager,
     /// Where uploads land.
@@ -380,7 +379,6 @@ impl Core {
             min_frame_interval,
             last_client_seen: Instant::now(),
             last_clipboard_received: None,
-            pending_x: VecDeque::new(),
             transfers: TransferManager::new(false),
             upload_dir,
             client_formats: 0,
@@ -585,7 +583,6 @@ impl Core {
             }
         }
         // Keep the queue type in use for future ordering needs.
-        self.pending_x.clear();
         Ok(())
     }
 
@@ -1249,9 +1246,16 @@ impl Core {
                 }
             }
             Message::ClipboardRequest { format } => {
-                if let Some(cb) = self.clipboard.as_mut() {
-                    if let Err(e) = cb.request_format(format) {
+                let events = match self.clipboard.as_mut() {
+                    Some(cb) => cb.request_format(format).unwrap_or_else(|e| {
                         log::warn!("clipboard: requesting format {format:#x} failed: {e:#}");
+                        Vec::new()
+                    }),
+                    None => Vec::new(),
+                };
+                for event in events {
+                    if let Err(e) = self.on_clipboard_event(event) {
+                        log::warn!("clipboard: {e:#}");
                     }
                 }
             }
@@ -1602,6 +1606,25 @@ impl Core {
 
         let outcome = self.transfers.poll();
         self.apply_transfer_outcome(outcome);
+
+        // A selection owner that has wedged sends nothing, and an idle desktop
+        // produces no other X events either, so `handle_event` never runs and
+        // the conversion deadline never comes up. That is precisely the state a
+        // session is in while its user waits on a paste, which is why the
+        // clipboard needs a clock of its own rather than a ride on X traffic.
+        let clipboard_events = match self.clipboard.as_mut() {
+            Some(cb) => cb.tick().unwrap_or_else(|e| {
+                log::warn!("clipboard: {e:#}");
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
+        for event in clipboard_events {
+            if let Err(e) = self.on_clipboard_event(event) {
+                log::warn!("clipboard: {e:#}");
+            }
+        }
+
         let now = Instant::now();
         let mut drop_reason: Option<String> = None;
         if let Some(c) = self.client.as_mut() {

@@ -672,6 +672,34 @@ fn clipboard_roundtrip() {
     }
 }
 
+/// A format the session cannot produce has to come back as *something*.
+///
+/// `ClipboardRequest` has no failure reply, and the client keeps no record of
+/// having asked, so a request the session silently drops leaves the user's
+/// clipboard holding whatever it held before and their next paste quietly
+/// stale. The session answers with a `Notice` instead -- the message that
+/// already exists for telling a person something -- and this pins that a
+/// request for a format nothing has offered produces one.
+#[test]
+fn a_clipboard_format_the_session_cannot_produce_is_reported() {
+    require_xvfb!();
+    let s = Session::start(320, 240, "none", &[]);
+    let mut c = s.connect(None);
+    // Nothing in the session has copied an image, so no PNG is on offer and
+    // no X selection owner can be asked for one.
+    c.send(&lynxrdp_proto::Message::ClipboardRequest {
+        format: lynxrdp_proto::message::clipboard_format::PNG,
+    })
+    .unwrap();
+    assert!(
+        wait_for(&mut c, Duration::from_secs(5), |ev, _| matches!(
+            ev,
+            ClientEvent::Notice(text) if text.contains("image")
+        )),
+        "an unavailable clipboard format must be reported, not dropped"
+    );
+}
+
 /// A small PNG for clipboard tests.
 fn sample_png(w: usize, h: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(w * h * 4);
