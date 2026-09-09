@@ -353,11 +353,12 @@ Logging out of the remote desktop automatically closes its viewer window.
 Temporary connection failures keep the viewer open so it can reconnect.
 
 On macOS, the connection manager, session viewers, and SSH prompts belong to one
-application with one Dock icon. **Cmd+`** cycles windows; **Cmd+Shift+`** cycles
-backward. **Cmd+W** closes the current window and **Cmd+Q** quits the application.
-Closing the manager while viewers are open keeps those viewers running; cycling
-windows brings the manager back. Quitting disconnects viewers without logging
-out of the remote desktops. The manager shows live connecting and session counts.
+application with one Dock icon. **Cmd+W** closes the current window and
+**Cmd+Q** quits the application. Closing the manager while viewers are open
+keeps those viewers running; the Dock icon, Mission Control, or Cmd+Tab bring it
+back, and a fullscreen session sits on its own Space you can swipe away from.
+Quitting disconnects viewers without logging out of the remote desktops. The
+manager shows live connecting and session counts.
 
 ```sh
 lynxrdp send user@host report.pdf

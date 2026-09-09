@@ -163,38 +163,6 @@ impl Desktop {
             }
         }
     }
-
-    fn windows(&self) -> Vec<&Window> {
-        self.manager
-            .iter()
-            .map(|m| m.window.as_ref())
-            .chain(
-                self.viewers
-                    .iter()
-                    .filter_map(|v| v.gfx.as_ref().map(|g| g.window.as_ref())),
-            )
-            .collect()
-    }
-
-    fn cycle(&self, from: WindowId, backwards: bool) {
-        let windows = self.windows();
-        let current = windows.iter().position(|w| w.id() == from).unwrap_or(0);
-        if let Some(next) = cycle_index(current, windows.len(), backwards) {
-            windows[next].set_visible(true);
-            windows[next].set_minimized(false);
-            windows[next].focus_window();
-        }
-    }
-}
-
-fn cycle_index(current: usize, count: usize, backwards: bool) -> Option<usize> {
-    (count != 0).then(|| {
-        if backwards {
-            (current + count - 1) % count
-        } else {
-            (current + 1) % count
-        }
-    })
 }
 
 fn connect_profile(
@@ -279,13 +247,6 @@ impl ApplicationHandler<Wake> for Desktop {
                 return;
             }
             if self.modifiers.super_key() && key.state == ElementState::Pressed {
-                if key.physical_key == PhysicalKey::Code(KeyCode::Backquote) {
-                    if !self.swallowed.contains(&key.physical_key) {
-                        self.swallowed.push(key.physical_key);
-                    }
-                    self.cycle(id, self.modifiers.shift_key());
-                    return;
-                }
                 if key.physical_key == PhysicalKey::Code(KeyCode::KeyQ) {
                     event_loop.exit();
                     return;
@@ -495,11 +456,13 @@ impl ManagerWindow {
     }
 }
 
-#[cfg(test)]
+// The one test left here drives a real X11 display, so the whole module is
+// gated the same way the test is rather than leaving an import with nothing to
+// bring in on the platform this host actually ships on.
+#[cfg(all(test, unix, not(target_os = "macos")))]
 mod tests {
     use super::*;
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     #[ignore = "requires an isolated X11 display (run under Xvfb)"]
     fn shared_host_closes_one_viewer_without_exiting_the_application() {
@@ -535,11 +498,11 @@ mod tests {
                     app.init_window(event_loop).unwrap();
                     self.0.viewers.push(app);
                 }
-                assert_eq!(self.0.windows().len(), 3);
+                assert!(self.0.manager.is_some());
+                assert_eq!(self.0.viewers.len(), 2);
                 let first = self.0.viewers[0].gfx.as_ref().unwrap().window.id();
                 let second = self.0.viewers[1].gfx.as_ref().unwrap().window.id();
                 assert_ne!(first, second);
-                self.0.cycle(first, false);
                 self.0
                     .window_event(event_loop, first, WindowEvent::CloseRequested);
                 self.0.poll(event_loop);
@@ -562,14 +525,5 @@ mod tests {
             fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
         }
         event_loop.run_app(&mut Check(desktop)).unwrap();
-    }
-
-    #[test]
-    fn window_cycling_wraps_in_both_directions() {
-        assert_eq!(cycle_index(0, 0, false), None);
-        assert_eq!(cycle_index(0, 1, true), Some(0));
-        assert_eq!(cycle_index(0, 3, false), Some(1));
-        assert_eq!(cycle_index(2, 3, false), Some(0));
-        assert_eq!(cycle_index(0, 3, true), Some(2));
     }
 }
