@@ -654,9 +654,6 @@ impl App {
             .with_title(self.title())
             .with_inner_size(PhysicalSize::new(w * self.scale, h * self.scale))
             .with_resizable(true);
-        if self.fullscreen {
-            attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
-        }
         // The same WM_CLASS the launcher uses, so a session window groups
         // with it and picks up the .desktop entry's icon and name.
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -674,6 +671,24 @@ impl App {
             );
         }
         let window = Arc::new(event_loop.create_window(attrs).context("creating window")?);
+        // Fullscreen is asked for here rather than as a creation attribute, and
+        // on macOS that is not a matter of taste. A window born fullscreen goes
+        // straight into a Space of its own and takes the rest of the
+        // application with it: the connection manager, a separate window that
+        // asked for nothing, is resized the instant such a viewer is created --
+        // before AppKit has even begun the transition -- and is left stretched
+        // across the screen when the session ends. A viewer opened windowed and
+        // then sent fullscreen leaves it alone.
+        //
+        // It also keeps winit's own record straight, which the attribute path
+        // does not: `with_fullscreen` sets an internal `initial_fullscreen`
+        // flag and never writes the `fullscreen` ivar, so `Window::fullscreen()`
+        // reads `None` for the whole life of a window plainly occupying a
+        // Space, and anything comparing against it -- `set_fullscreen(None)` on
+        // the way out above all -- quietly does nothing.
+        if self.fullscreen {
+            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        }
         // The window may not have opened on the monitor that was guessed at.
         if !self.scale_pinned {
             let actual = display_scale(window.scale_factor());
