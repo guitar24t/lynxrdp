@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use lynxrdp_server::session::desktop::Desktop;
+use lynxrdp_server::session::desktop::{describe_wait_status, Desktop};
 use lynxrdp_server::session::engine::{Core, Exit};
 use lynxrdp_server::session::listener::{spawn_control_listener, spawn_tcp_listener};
 use lynxrdp_server::session::xserver::{default_runtime_dir, XServer, XServerConfig};
@@ -318,7 +318,11 @@ fn run() -> Result<i32> {
                     // SAFETY: waitpid on our child with WNOHANG.
                     let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
                     if r == pid as i32 {
-                        let _ = tx.send(CoreEvent::DesktopExited(format!("status {status}")));
+                        // The raw word rather than a description is how the
+                        // commonest misconfiguration there is -- a `startwm`
+                        // script that does not exist -- reached the log as
+                        // "status 32512" instead of naming the missing command.
+                        let _ = tx.send(CoreEvent::DesktopExited(describe_wait_status(status)));
                         break;
                     }
                     if r < 0 {

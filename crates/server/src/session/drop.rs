@@ -53,7 +53,7 @@ impl Drops {
         self.jobs.push_back(Job {
             id,
             target,
-            batch: ClipBatch::with_paths(dir, paths),
+            batch: ClipBatch::with_paths(paths),
             roots,
         });
         Ok(())

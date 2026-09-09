@@ -120,7 +120,6 @@ pub fn unique_name(taken: &mut HashSet<String>, name: &str) -> String {
 /// when there is nothing left outstanding. What did not arrive is simply
 /// missing from the published list.
 pub struct ClipBatch {
-    dir: PathBuf,
     /// Not yet requested: (remote path, local destination, slot).
     queued: VecDeque<(String, PathBuf, usize)>,
     /// Requested and unresolved: transfer id to slot.
@@ -143,7 +142,6 @@ impl ClipBatch {
             queued.push_back((f.path.clone(), dir.join(name), slot));
         }
         Self {
-            dir,
             queued,
             live: HashMap::new(),
             slots: vec![None; files.len()],
@@ -151,10 +149,13 @@ impl ClipBatch {
     }
 
     /// Build a batch with caller-validated destinations, preserving directory trees.
-    pub fn with_paths(dir: PathBuf, files: Vec<(String, PathBuf)>) -> Self {
+    ///
+    /// No staging directory is passed, unlike [`ClipBatch::new`]: the caller has
+    /// already resolved every destination against one, so a second copy here
+    /// would be a parameter the batch stores and never consults.
+    pub fn with_paths(files: Vec<(String, PathBuf)>) -> Self {
         let count = files.len();
         Self {
-            dir,
             queued: files
                 .into_iter()
                 .enumerate()
@@ -163,11 +164,6 @@ impl ClipBatch {
             live: HashMap::new(),
             slots: vec![None; count],
         }
-    }
-
-    /// Where this batch is staged.
-    pub fn dir(&self) -> &Path {
-        &self.dir
     }
 
     /// How many files the session offered.
@@ -198,11 +194,6 @@ impl ClipBatch {
             self.slots[slot] = Some(p);
         }
         true
-    }
-
-    /// Transfers still in flight, for cancelling a superseded copy.
-    pub fn live_ids(&self) -> Vec<u64> {
-        self.live.keys().copied().collect()
     }
 
     /// Whether every file has arrived, failed or been given up on.
