@@ -476,6 +476,8 @@ pub struct App {
 
 /// Shared application host used by macOS, also built on other platforms for tests.
 pub mod desktop;
+#[cfg(any(target_os = "macos", test))]
+mod native_chrome;
 
 impl App {
     /// Wrap a connected client.
@@ -794,9 +796,9 @@ impl App {
         // darkens frame by frame. That means the rectangle has to be in the
         // list *before* the blit, which is why it is predicted here rather
         // than taken from what `Overlay::draw` returns. The prediction is
-        // exact: the bar is always the full window width and a fixed height.
-        let bar_now = (self.overlay.visible())
-            .then(|| Rect::new(0, 0, size.width, overlay::bar_height(bar_s)));
+        // exact: the bar is the full window width and a fixed height, offset
+        // below native fullscreen chrome where it would otherwise be covered.
+        let bar_now = self.overlay.bounds(size.width, size.height, bar_s);
         // A resize invalidates every buffer the surface holds, and
         // softbuffer's Wayland backend reallocates the mapping without
         // resetting `age`, so this check has to be ours rather than the
@@ -1575,6 +1577,17 @@ impl App {
             self.notice_shown = notice;
             self.full_redraw = true;
             self.request_redraw();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let chrome = self.gfx.as_ref().map_or_else(Default::default, |g| {
+                native_chrome::poll(&g.window).unwrap_or_default()
+            });
+            let hovered = chrome.hovered && !self.remote_drag() && !self.ui_press;
+            if self.overlay.set_native_chrome(hovered, chrome.top_inset) {
+                self.full_redraw = true;
+                self.request_redraw();
+            }
         }
         if self.overlay.tick(now) {
             // The bar covers remote pixels, so both showing and hiding it are

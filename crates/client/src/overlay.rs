@@ -510,6 +510,11 @@ pub struct Overlay {
     /// a bar that hid out from under the pointer aiming at its buttons would
     /// be unusable.
     on_bar: bool,
+    /// Native fullscreen chrome is outside the view's mouse tracking area.
+    /// It reveals the bar without claiming a pointer event or arming a button.
+    native_hover: bool,
+    /// Physical pixels covered by a revealed native title bar.
+    top_inset: u32,
     /// When the pointer entered the hot zone, or `None` when it is outside.
     /// The bar comes up once this is [`REVEAL_DELAY`] old.
     in_zone_since: Option<Instant>,
@@ -559,6 +564,28 @@ impl Overlay {
         self.flash_until = Some(now + FLASH);
     }
 
+    /// Follow native fullscreen chrome. Returns whether the bar moved.
+    pub fn set_native_chrome(&mut self, hovered: bool, top_inset: u32) -> bool {
+        self.native_hover = hovered;
+        // macOS retracts its title bar as the pointer moves down onto ours.
+        // Keep our buttons still while the user is reaching for them.
+        if self.top_inset == top_inset || (top_inset < self.top_inset && self.on_bar) {
+            return false;
+        }
+        self.top_inset = top_inset;
+        self.on_bar = false;
+        self.in_zone_since = None;
+        self.hover = None;
+        self.armed = None;
+        true
+    }
+
+    /// The absolute presentation rectangle, including native title-bar space.
+    pub fn bounds(&self, width: u32, height: u32, s: u32) -> Option<Rect> {
+        (self.visible && width > 0 && self.top_inset < height)
+            .then(|| Rect::new(0, self.top_inset, width, bar_height(s)))
+    }
+
     /// Window focus changed. An unfocused window does not raise the bar on
     /// hover: the pointer is probably only crossing it on its way somewhere.
     pub fn set_focused(&mut self, focused: bool) {
@@ -572,6 +599,7 @@ impl Overlay {
         // bar, so the clock starts when the window is the user's again and
         // they move in the strip, not before.
         self.on_bar = false;
+        self.native_hover = false;
         self.in_zone_since = None;
         self.hover = None;
         self.armed = None;
@@ -594,6 +622,7 @@ impl Overlay {
     /// after the button comes up.
     pub fn pointer_taken(&mut self) {
         self.on_bar = false;
+        self.native_hover = false;
         self.in_zone_since = None;
     }
 
@@ -605,8 +634,9 @@ impl Overlay {
     /// crossing it may be seen exactly once, and starting the clock a tick
     /// late would make [`REVEAL_DELAY`] mean anything up to a tick more.
     pub fn track(&mut self, x: u32, y: u32, s: u32, now: Instant) -> bool {
-        self.on_bar = self.visible && y < bar_height(s);
-        if self.on_bar || y < hot_zone_height(s) {
+        let y = y.checked_sub(self.top_inset);
+        self.on_bar = self.visible && y.is_some_and(|y| y < bar_height(s));
+        if self.on_bar || y.is_some_and(|y| y < hot_zone_height(s)) {
             // Re-entering restarts the dwell; staying does not, so the timer
             // survives movement along the strip.
             self.in_zone_since.get_or_insert(now);
@@ -614,7 +644,9 @@ impl Overlay {
             self.in_zone_since = None;
         }
         self.hover = if self.on_bar {
-            self.layout.as_ref().and_then(|l| l.button_at(x, y))
+            self.layout
+                .as_ref()
+                .and_then(|l| y.and_then(|y| l.button_at(x, y)))
         } else {
             None
         };
@@ -664,7 +696,7 @@ impl Overlay {
         let dwelt = self
             .in_zone_since
             .is_some_and(|t| now.saturating_duration_since(t) >= REVEAL_DELAY);
-        let pointed = self.focused && (self.on_bar || dwelt);
+        let pointed = self.focused && (self.native_hover || self.on_bar || dwelt);
         if pointed {
             self.hide_at = None;
         } else if self.was_pointed {
@@ -703,13 +735,23 @@ impl Overlay {
         status: &Status,
     ) -> (Option<Rect>, Option<Rect>) {
         let was = self.painted.take();
-        if !self.visible || dst_w == 0 || dst_h == 0 {
+        let Some(bar) = self.bounds(dst_w, dst_h, s) else {
             self.layout = None;
             return (None, was);
-        }
+        };
         let layout = bar_layout(dst_w, s, status);
-        paint(dst, dst_w, dst_h, &layout, self.hover, self.armed);
-        let bar = layout.bar;
+        // Keep layout/hit-testing bar-relative. Only the presentation slice
+        // moves; no decoded remote pixels or remote input coordinates do.
+        if let Some(dst) = dst.get_mut(self.top_inset as usize * dst_w as usize..) {
+            paint(
+                dst,
+                dst_w,
+                dst_h - self.top_inset,
+                &layout,
+                self.hover,
+                self.armed,
+            );
+        }
         self.layout = Some(layout);
         self.painted = Some(bar);
         (Some(bar), was)
@@ -923,6 +965,110 @@ mod tests {
         now = entered + REVEAL_DELAY;
         assert!(o.tick(now));
         assert!(o.visible());
+    }
+
+    #[test]
+    fn native_chrome_reveals_immediately_and_leaving_keeps_the_grace_period() {
+        let mut now = Instant::now();
+        let mut o = Overlay::new(now);
+        o.set_focused(true);
+        now += FLASH;
+        o.tick(now);
+        assert!(!o.visible());
+        o.pointer_left(); // macOS took the pointer out of the content view.
+        o.set_native_chrome(true, 64);
+        assert!(o.tick(now));
+        assert!(o.visible(), "native chrome must not add a second dwell");
+        o.press();
+        assert_eq!(o.release(), None, "native hover must not arm a control");
+        now += FLASH * 2;
+        o.tick(now);
+        assert!(o.visible(), "stay up as long as native chrome is hovered");
+        o.set_native_chrome(false, 0);
+        o.tick(now);
+        assert!(o.visible());
+        now += HIDE_DELAY;
+        assert!(o.tick(now));
+        assert!(!o.visible());
+    }
+
+    #[test]
+    fn native_chrome_respects_focus_and_remote_drags() {
+        let mut now = Instant::now();
+        let mut o = Overlay::new(now);
+        now += FLASH;
+        o.tick(now);
+        o.set_native_chrome(true, 0);
+        assert!(!o.tick(now));
+        o.set_focused(true);
+        assert!(!o.tick(now), "focus discards stale native hover");
+        o.set_native_chrome(true, 0);
+        o.pointer_taken();
+        assert!(!o.tick(now), "a remote drag cancels native reveal too");
+    }
+
+    #[test]
+    fn an_inset_bar_paints_and_hit_tests_at_the_same_offset() {
+        let now = Instant::now();
+        let mut o = Overlay::new(now);
+        o.set_focused(true);
+        o.set_native_chrome(true, 32);
+        o.tick(now);
+        let (w, h, s) = (1600, 160, 2);
+        let mut plain = vec![0x123456; (w * h) as usize];
+        let mut inset = plain.clone();
+        let layout = bar_layout(w, s, &status());
+        paint(&mut plain, w, h, &layout, None, None);
+        let (drawn, old) = o.draw(&mut inset, w, h, s, &status());
+        assert_eq!(drawn, Some(Rect::new(0, 32, w, bar_height(s))));
+        assert_eq!(drawn, o.bounds(w, h, s));
+        assert_eq!(old, None);
+        assert!(inset[..(32 * w) as usize].iter().all(|p| *p == 0x123456));
+        assert_eq!(
+            &inset[(32 * w) as usize..((32 + bar_height(s)) * w) as usize],
+            &plain[..(bar_height(s) * w) as usize]
+        );
+        let button = &layout.buttons[0];
+        let (x, y) = (button.rect.x + 2, button.rect.y + 2);
+        assert!(!o.track(x, y, s, now), "the native title bar isn't ours");
+        assert!(o.track(x, y + 32, s, now));
+        o.press();
+        // macOS retracts its row when moving onto our buttons; don't move a
+        // target out from under the pointer while completing the click.
+        assert!(!o.set_native_chrome(false, 0));
+        assert_eq!(o.release(), Some(button.action));
+        o.track(x, 150, s, now);
+        assert!(o.set_native_chrome(false, 0));
+        let (drawn, old) = o.draw(&mut inset, w, h, s, &status());
+        assert_eq!(drawn, Some(Rect::new(0, 0, w, bar_height(s))));
+        assert_eq!(old, Some(Rect::new(0, 32, w, bar_height(s))));
+    }
+
+    #[test]
+    fn moving_or_hiding_an_inset_bar_retires_its_old_damage_and_click_target() {
+        let now = Instant::now();
+        let mut o = Overlay::new(now);
+        o.set_focused(true);
+        o.tick(now);
+        let mut pixels = vec![0; 1600 * 100];
+        o.draw(&mut pixels, 1600, 100, 2, &status());
+        let button = &bar_layout(1600, 2, &status()).buttons[0];
+        o.track(button.rect.x + 2, button.rect.y + 2, 2, now);
+        o.press();
+        o.set_native_chrome(true, 32);
+        assert_eq!(o.release(), None, "moving geometry cancels an armed click");
+        let (_, was) = o.draw(&mut pixels, 1600, 100, 2, &status());
+        assert_eq!(was, Some(Rect::new(0, 0, 1600, 48)));
+        o.set_native_chrome(false, 32);
+        o.tick(now + FLASH + HIDE_DELAY);
+        let (drawn, was) = o.draw(&mut pixels, 1600, 100, 2, &status());
+        assert_eq!(drawn, None);
+        assert_eq!(was, Some(Rect::new(0, 32, 1600, 48)));
+        o.toggle_pin();
+        o.tick(now + FLASH + HIDE_DELAY);
+        o.set_native_chrome(false, 100);
+        assert_eq!(o.bounds(1600, 100, 2), None);
+        assert_eq!(o.draw(&mut pixels, 1600, 100, 2, &status()).0, None);
     }
 
     #[test]

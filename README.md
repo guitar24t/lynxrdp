@@ -357,6 +357,8 @@ application with one Dock icon. **Cmd+W** closes the current window and
 **Cmd+Q** quits the application. Closing the manager while viewers are open
 keeps those viewers running; the Dock icon, Mission Control, or Cmd+Tab bring it
 back, and a fullscreen session sits on its own Space you can swipe away from.
+Reaching the screen's top edge also reveals the connection bar below macOS's
+title bar, without needing a second hover inside the remote desktop.
 Quitting disconnects viewers without logging out of the remote desktops. The
 manager shows live connecting and session counts.
 
