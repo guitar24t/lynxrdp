@@ -40,6 +40,11 @@ cannot reach anybody else's session:
 * Each session's X server is started with a private, randomly generated
   MIT-MAGIC-COOKIE-1 in an authority file readable only by that user. Xvfb
   would otherwise accept any local connection.
+  With the standard logind runtime, that file is a unique
+  `/run/user/<uid>/xauth_lynxrdp-*`, which desktop Snaps may read under their
+  existing X11 policy. The parent must be private and owned by the session
+  user; the file stays mode 0600 and is removed on shutdown or startup failure.
+  Custom runtime directories retain their authority file inside that directory.
 * The session process verifies the uid in every handoff it receives and
   that the handoff comes from root or itself.
 

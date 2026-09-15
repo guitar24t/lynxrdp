@@ -20,10 +20,10 @@ cycle.
 The CI workflow (`.github/workflows/ci.yml`) is the source of truth. The first
 two of these are steps of it verbatim; the third is a stand-in, not an
 equivalent — CI runs `--lib --bins`, `--doc` and the three integration suites
-as separate steps, and then two things a plain `cargo test` never reaches at
+as separate steps, and then three things a plain `cargo test` never reaches at
 all: a graphical input check that lives outside cargo
 (`python3 tools/check-session-ui.py`), and the two `#[ignore]`d client tests
-that need a display.
+that need a display, plus the ignored X-server authorization/lifecycle tests.
 
 ```bash
 cargo fmt --all --check
@@ -78,6 +78,15 @@ ordinary user and the variable turns a correct skip into a failure, which
 ```bash
 cargo test -p lynxrdp-server --test privdrop   # needs root; skips cleanly otherwise
 cargo test -p lynxrdp-server --test tunnel_e2e # needs sshd; CI runs it now
+```
+
+The X-server authorization tests also exercise the default Snap-compatible
+authority path, its permissions, refusal of unauthenticated X11 connections,
+and cleanup. They need `Xvfb`, `xdpyinfo`, and an existing private
+`/run/user/<your uid>` directory; CI supplies that directory if logind has not.
+
+```bash
+cargo test -p lynxrdp-server --lib session::xserver::tests:: -- --include-ignored --test-threads=1
 ```
 
 Two dependencies are easy to miss because nothing else in the tree needs them.

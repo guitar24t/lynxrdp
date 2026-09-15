@@ -74,6 +74,15 @@ jobs:
         run: cargo test --workspace --doc
       - name: Graphical session input (Xvfb)
         run: python3 tools/check-session-ui.py
+      - name: X server authorization and lifecycle (Xvfb)
+        # Hosted runners need not have opened a logind session. Supply its
+        # private runtime location so the real default-path test cannot skip.
+        run: |
+          lynxrdp_test_runtime="/run/user/$(id -u)"
+          if [ ! -e "$lynxrdp_test_runtime" ]; then
+            sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "$lynxrdp_test_runtime"
+          fi
+          cargo test -p lynxrdp-server --lib session::xserver::tests:: -- --include-ignored --test-threads=1
       - name: Native file clipboard (Xvfb)
         run: xvfb-run -a cargo test -p lynxrdp-client --lib x11_file_copy -- --ignored --test-threads=1
       - name: Shared application window lifecycle (Xvfb)

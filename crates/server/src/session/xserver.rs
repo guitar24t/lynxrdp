@@ -51,7 +51,7 @@ pub struct XServerConfig {
 pub struct XServer {
     child: Child,
     display_num: u32,
-    xauth_path: PathBuf,
+    xauth_path: tempfile::TempPath,
     /// Program name, repeated here so post-mortem messages can name it.
     program: String,
     /// The last few lines the server wrote to stderr.
@@ -68,9 +68,24 @@ impl XServer {
     pub fn spawn(cfg: &XServerConfig) -> Result<Self> {
         ensure_private_dir(&cfg.runtime_dir)?;
         let cookie = xauth::random_cookie()?;
-        let xauth_path = cfg
-            .runtime_dir
-            .join(format!("Xauthority-{}", std::process::id()));
+        let uid = crate::peer::own_uid();
+        let user_runtime = PathBuf::from(format!("/run/user/{uid}"));
+        let auth_dir = authority_dir(&cfg.runtime_dir, &user_runtime, uid)?;
+        // Snap's desktop interface permits /run/user/<uid>/xauth_* but not
+        // our nested runtime directory. A unique file avoids replacing a
+        // console's cookie or another X server's, and TempPath retires it on
+        // every startup error as well as normal shutdown. Explicit runtime
+        // directories keep their authority file inside the configured path.
+        let prefix = if auth_dir != cfg.runtime_dir {
+            "xauth_lynxrdp-"
+        } else {
+            "Xauthority-"
+        };
+        let xauth_path = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempfile_in(auth_dir)
+            .context("creating the private Xauthority file")?
+            .into_temp_path();
         // Placeholder display number; rewritten once known. The X server only
         // reads the cookie from the file, not the display number.
         xauth::write_file(&xauth_path, 0, &cookie)?;
@@ -490,6 +505,24 @@ pub fn ensure_private_dir(dir: &Path) -> Result<()> {
     ensure_owned_dir(dir, LooseMode::Tighten)
 }
 
+/// Only the standard default may place its cookie outside its own directory.
+/// Validate the user runtime without creating it or changing permissions on a
+/// directory managed by logind. Custom paths and the /tmp fallback stay local.
+fn authority_dir(runtime_dir: &Path, user_runtime: &Path, uid: u32) -> Result<PathBuf> {
+    if runtime_dir != user_runtime.join("lynxrdp") {
+        return Ok(runtime_dir.to_path_buf());
+    }
+    let meta = fs::symlink_metadata(user_runtime)
+        .with_context(|| format!("inspecting {} for Xauthority", user_runtime.display()))?;
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        bail!(
+            "{} must be a private, non-symlink directory owned by uid {uid} for Xauthority",
+            user_runtime.display()
+        );
+    }
+    Ok(user_runtime.to_path_buf())
+}
+
 /// Per-user private runtime directory for session files.
 pub fn default_runtime_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
@@ -504,6 +537,82 @@ pub fn default_runtime_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_authority_is_directly_in_the_private_user_runtime() {
+        let user_runtime = tempfile::tempdir().unwrap();
+        ensure_private_dir(user_runtime.path()).unwrap();
+        let runtime = user_runtime.path().join("lynxrdp");
+        // Snap's desktop policy permits xauth_* directly in the user runtime,
+        // not in an application subdirectory, even when the cookie is 0600.
+        assert_eq!(
+            authority_dir(&runtime, user_runtime.path(), crate::peer::own_uid()).unwrap(),
+            user_runtime.path()
+        );
+    }
+
+    #[test]
+    fn an_explicit_runtime_does_not_use_an_unrelated_user_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("custom");
+        assert_eq!(
+            authority_dir(
+                &runtime,
+                &tmp.path().join("missing"),
+                crate::peer::own_uid()
+            )
+            .unwrap(),
+            runtime
+        );
+    }
+
+    #[test]
+    fn authority_placement_refuses_another_users_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        ensure_private_dir(tmp.path()).unwrap();
+        let runtime = tmp.path().join("lynxrdp");
+        assert!(authority_dir(&runtime, tmp.path(), crate::peer::own_uid() + 1).is_err());
+    }
+
+    #[test]
+    fn authority_placement_refuses_a_symlinked_user_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        ensure_private_dir(tmp.path()).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
+        assert!(authority_dir(&link.join("lynxrdp"), &link, crate::peer::own_uid()).is_err());
+    }
+
+    #[test]
+    fn authority_placement_refuses_a_shared_runtime_without_changing_its_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        for mode in [0o750, 0o755, 0o770, 0o777] {
+            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode)).unwrap();
+            assert!(authority_dir(
+                &tmp.path().join("lynxrdp"),
+                tmp.path(),
+                crate::peer::own_uid()
+            )
+            .is_err());
+            assert_eq!(fs::metadata(tmp.path()).unwrap().mode() & 0o777, mode);
+        }
+    }
+
+    #[test]
+    fn a_missing_xserver_executable_does_not_leave_a_cookie() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("rt");
+        let cfg = XServerConfig {
+            program: tmp.path().join("missing-xserver").display().to_string(),
+            extra_args: vec![],
+            max_width: 640,
+            max_height: 480,
+            dpi: 96,
+            runtime_dir: runtime.clone(),
+        };
+        assert!(XServer::spawn(&cfg).is_err());
+        assert_eq!(fs::read_dir(runtime).unwrap().count(), 0);
+    }
 
     #[test]
     fn private_dir_is_created_and_checked() {
@@ -604,10 +713,62 @@ mod tests {
         let mut xs = XServer::spawn(&cfg).unwrap();
         assert!(xs.is_running());
         assert!(xs.xauth_path().exists());
+        assert_eq!(fs::metadata(xs.xauth_path()).unwrap().mode() & 0o777, 0o600);
+        let mut other = XServer::spawn(&cfg).unwrap();
+        assert_ne!(xs.xauth_path(), other.xauth_path());
         let d = xs.display();
         assert!(d.starts_with(':'));
         xs.shutdown();
         assert!(!xs.xauth_path().exists());
+        assert!(other.xauth_path().exists());
+        other.shutdown();
+        assert!(!other.xauth_path().exists());
+    }
+
+    #[test]
+    #[ignore = "needs Xvfb, xdpyinfo and a private /run/user/<uid> directory"]
+    fn desktop_sandbox_authority_paths_authenticate_and_are_removed() {
+        let user_runtime = PathBuf::from(format!("/run/user/{}", crate::peer::own_uid()));
+        assert!(user_runtime.is_dir(), "needs a logind user runtime");
+        for (runtime_dir, prefix) in [
+            (user_runtime.join("lynxrdp"), "xauth_lynxrdp-"),
+            (user_runtime.clone(), "Xauthority-"),
+        ] {
+            let cfg = XServerConfig {
+                program: "Xvfb".into(),
+                extra_args: vec![],
+                max_width: 640,
+                max_height: 480,
+                dpi: 96,
+                runtime_dir,
+            };
+            let mut xs = XServer::spawn(&cfg).unwrap();
+            let auth = xs.xauth_path().to_path_buf();
+            assert_eq!(auth.parent(), Some(user_runtime.as_path()));
+            assert!(auth
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(prefix));
+            assert_eq!(fs::metadata(&auth).unwrap().mode() & 0o777, 0o600);
+            // Exercise the file Xvfb actually received, not just the helper's
+            // path calculation. The uncredentialed connection must fail too.
+            for (path, allowed) in [
+                (auth.clone(), true),
+                (user_runtime.join("lynxrdp-no-such-cookie"), false),
+            ] {
+                let status = Command::new("xdpyinfo")
+                    .env("DISPLAY", xs.display())
+                    .env("XAUTHORITY", path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap();
+                assert_eq!(status.success(), allowed);
+            }
+            xs.shutdown();
+            assert!(!auth.exists());
+        }
     }
 
     #[test]
