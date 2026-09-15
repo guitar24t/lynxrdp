@@ -14,9 +14,10 @@
 //! `SHA256SUMS` file published beside the assets in the same release. The
 //! checksum is what catches a truncated or corrupted download; it is *not* a
 //! second opinion about who published the release, because it arrives from
-//! the same place over the same connection. There is no code signature on
-//! any of this -- see "The installers are not signed" in the README -- so the
-//! honest summary is: this trusts GitHub, and nothing else is checked.
+//! the same place over the same connection. The macOS bundle's ad-hoc code
+//! signature does not authenticate its publisher -- see the installer notes
+//! in the README -- so the honest summary is: this trusts GitHub, and no
+//! independent publisher identity is checked.
 //! [`verify`] is deliberately the only door the downloaded bytes come
 //! through, so a signature check has one place to go if the project ever has
 //! a key to check against.

@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+mod stderr;
+
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
@@ -108,6 +110,10 @@ pub struct TunnelConfig {
     /// leak into anything else this process starts, and because a session
     /// started from a terminal must keep prompting on that terminal.
     pub env: Vec<(String, String)>,
+    /// Keep a bounded in-memory stderr tail for connection errors. GUI callers
+    /// use the default; terminal callers disable this to inherit stderr and
+    /// preserve OpenSSH's interactive terminal behaviour unchanged.
+    pub capture_stderr: bool,
 }
 
 impl Default for TunnelConfig {
@@ -122,6 +128,7 @@ impl Default for TunnelConfig {
             ssh_program: "ssh".to_string(),
             extra_args: Vec::new(),
             env: Vec::new(),
+            capture_stderr: true,
         }
     }
 }
@@ -552,6 +559,7 @@ fn create_socket_dir_in(bases: &[PathBuf]) -> Result<SocketDir> {
 /// A running SSH tunnel; killed on drop.
 pub struct Tunnel {
     child: Child,
+    stderr: Option<stderr::Capture>,
     local: LocalAddr,
     /// The connection the readiness check made, kept for the real client to
     /// use rather than thrown away. See `take_stream`.
@@ -592,22 +600,43 @@ impl Tunnel {
             .args(&args)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stderr(if cfg.capture_stderr {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            });
         for (k, v) in &cfg.env {
             command.env(k, v);
         }
-        let mut child = command.spawn().with_context(|| {
+        let child = command.spawn().with_context(|| {
             format!(
                 "could not run '{}'; is an OpenSSH client installed?",
                 cfg.ssh_program
             )
         })?;
+        // Own the child before anything else can fail, so every error path
+        // kills and reaps it before removing its private socket directory.
+        let mut tunnel = Self {
+            child,
+            stderr: None,
+            local,
+            probe: None,
+            #[cfg(unix)]
+            _socket_dir,
+        };
+        if let Some(pipe) = tunnel.child.stderr.take() {
+            tunnel.stderr =
+                Some(stderr::Capture::start(pipe).context("capturing SSH diagnostics")?);
+        }
         let deadline = Instant::now() + timeout;
         let probe = loop {
-            if let Some(status) = child.try_wait()? {
-                bail!("ssh exited before the tunnel came up ({status})");
+            if let Some(status) = tunnel.child.try_wait()? {
+                bail!(
+                    "ssh exited before the tunnel came up ({status}){}",
+                    tunnel.diagnostic()
+                );
             }
-            if let Ok(stream) = connect_local(&local) {
+            if let Ok(stream) = connect_local(&tunnel.local) {
                 // A successful connect means ssh has bound the forward, which
                 // it only does after authentication succeeded.
                 //
@@ -623,19 +652,26 @@ impl Tunnel {
                 break Some(stream);
             }
             if Instant::now() > deadline {
-                let _ = child.kill();
-                bail!("timed out waiting for the SSH tunnel");
+                tunnel.stop_process();
+                bail!(
+                    "timed out waiting for the SSH tunnel{}",
+                    tunnel.diagnostic()
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        log::info!("tunnel ready on {local}");
-        Ok(Self {
-            child,
-            local,
-            probe,
-            #[cfg(unix)]
-            _socket_dir,
-        })
+        log::info!("tunnel ready on {}", tunnel.local);
+        tunnel.probe = probe;
+        Ok(tunnel)
+    }
+
+    fn diagnostic(&mut self) -> String {
+        let text = self.stderr.as_mut().map(|s| s.finish()).unwrap_or_default();
+        if text.is_empty() {
+            String::new()
+        } else {
+            format!(": {text}")
+        }
     }
 
     /// Take the connection the readiness check already established.
@@ -692,6 +728,13 @@ impl Tunnel {
 
     /// Stop the tunnel.
     pub fn close(&mut self) {
+        self.stop_process();
+        // Drop joins the bounded reader even when a ProxyCommand descendant
+        // still holds its write end and the caller retains this Tunnel.
+        self.stderr = None;
+    }
+
+    fn stop_process(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -1192,6 +1235,154 @@ mod tests {
         };
         let err = Tunnel::open(&cfg, Duration::from_secs(5)).unwrap_err();
         assert!(err.to_string().contains("exited"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_failure_includes_the_actual_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_ssh(
+            dir.path(),
+            "printf 'ssh: connect to host test port 22: No route to host\\n' >&2\nexit 255",
+        );
+        let cfg = TunnelConfig {
+            destination: "test".into(),
+            ssh_program: script.display().to_string(),
+            ..Default::default()
+        };
+        let err = Tunnel::open(&cfg, Duration::from_secs(5))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("255"), "{err}");
+        assert!(err.contains("No route to host"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verbose_ssh_keeps_a_bounded_tail_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_ssh(
+            dir.path(),
+            "printf 'discard-this-prefix\\n' >&2\nhead -c 1048576 /dev/zero | tr '\\000' x >&2\nprintf '\\000\\nPermission denied (publickey).\\n' >&2\nexit 255",
+        );
+        let cfg = TunnelConfig {
+            destination: "test".into(),
+            ssh_program: script.display().to_string(),
+            ..Default::default()
+        };
+        let err = Tunnel::open(&cfg, Duration::from_secs(5))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Permission denied (publickey)."), "{err}");
+        assert!(!err.contains("discard-this-prefix"));
+        assert!(
+            err.len() < 10_000,
+            "unbounded SSH error: {} bytes",
+            err.len()
+        );
+        assert!(!err.contains('\0'), "control bytes reached the dialog");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_timeout_preserves_diagnostics_and_reaps_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = fake_ssh(
+            dir.path(),
+            &format!(
+                "echo $$ > '{}'\nprintf 'Waiting for authentication\\n' >&2\nexec sleep 30",
+                pid_file.display()
+            ),
+        );
+        let cfg = TunnelConfig {
+            destination: "test".into(),
+            ssh_program: script.display().to_string(),
+            ..Default::default()
+        };
+        let err = Tunnel::open(&cfg, Duration::from_millis(500))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("Waiting for authentication"), "{err}");
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let status = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "SSH child survived the timeout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inherited_stderr_pipe_does_not_delay_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_ssh(
+            dir.path(),
+            "sleep 3 &\nprintf 'Proxy failed\\n' >&2\nexit 255",
+        );
+        let cfg = TunnelConfig {
+            destination: "test".into(),
+            ssh_program: script.display().to_string(),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let err = Tunnel::open(&cfg, Duration::from_secs(5))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Proxy failed"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_retained_tunnel_releases_the_stderr_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let release = dir.path().join("release");
+        let result = dir.path().join("result");
+        // dd reports a failed pipe write in its exit status; macOS printf
+        // can exit successfully after a failed buffered flush.
+        let script = fake_ssh(
+            dir.path(),
+            &format!(
+                "(trap '' PIPE; while [ ! -f '{}' ]; do [ -d '{}' ] || exit 0; sleep 0.05; done; if /bin/dd if=/dev/zero bs=1 count=1 >&2 2>/dev/null; then echo open; else echo closed; fi > '{}') &\ntouch '{}'\nexec sleep 30",
+                release.display(), dir.path().display(), result.display(), ready.display()
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = TunnelConfig {
+            destination: "test".into(),
+            ssh_program: script.display().to_string(),
+            local_port: listener.local_addr().unwrap().port(),
+            ..Default::default()
+        };
+        let mut tunnel = Tunnel::open(&cfg, Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "SSH fixture did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tunnel.close();
+        std::fs::write(release, "go").unwrap();
+        let outcome = loop {
+            if let Ok(text) = std::fs::read_to_string(&result) {
+                if !text.is_empty() {
+                    break text;
+                }
+            }
+            assert!(Instant::now() < deadline, "stderr writer did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            outcome.trim(),
+            "closed",
+            "closed tunnel still drains stderr"
+        );
+        // Deliberately retain the Tunnel through the assertion: Drop must not
+        // be required to release a reader after the public close operation.
+        drop(tunnel);
     }
 
     /// A fake ssh that records its arguments and then stays alive.

@@ -140,9 +140,9 @@ mod keys {
 /// Written once and shown next to the Install button rather than left to the
 /// README, because this is the moment a user is deciding whether to let the
 /// application replace itself, and "we checked the checksum" and "nobody
-/// signed this" are both true and both theirs to weigh.
+/// verified the publisher" are both true and both theirs to weigh.
 const UPDATE_TRUST: &str = "The download is checked against the SHA256SUMS published with the \
-     release. Nothing here is code signed, so your system may still warn about an unknown \
+     release. These releases have no verified publisher signature, so your system may still warn about an unknown \
      publisher.";
 
 /// What Help > Check for Updates does, said before it is chosen.
@@ -3710,7 +3710,7 @@ mod tests {
         assert!(painted.has_text("Published 2026-09-04"));
         // The two things a user is weighing, both said.
         assert!(painted.has_text("SHA256SUMS"));
-        assert!(painted.has_text("not code signed") || painted.has_text("code signed"));
+        assert!(painted.has_text("no verified publisher signature"));
     }
 
     #[test]

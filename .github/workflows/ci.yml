@@ -152,6 +152,9 @@ jobs:
           packaging/make-app-bundle.sh \
             "target/${{ matrix.target }}/release/lynxrdp" stage
           packaging/make-dmg.sh stage/LynxRDP.app dist "${{ matrix.name }}"
+      - name: Verify macOS archive and disk-image bundles
+        if: startsWith(matrix.name, 'macos-')
+        run: python3 tools/check-macos-packaging.py "target/${{ matrix.target }}/release/lynxrdp"
       - uses: actions/upload-artifact@v7
         with:
           name: lynxrdp-client-${{ matrix.name }}

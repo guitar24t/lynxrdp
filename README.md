@@ -163,6 +163,19 @@ certificate behind this project, so both systems will object the first time:
 Every release also publishes `SHA256SUMS`, which is the check that actually
 tells you the download is intact.
 
+The macOS application has an **ad-hoc bundle signature**, verified during
+packaging for both the archive and disk image. It seals the executable,
+Info.plist and resources so macOS can identify the application responsible
+for SSH connections; it does **not** authenticate the publisher or provide
+Developer ID signing or notarisation. The Gatekeeper instructions above
+still apply. When prompted for **Local Network** access, allow LynxRDP to
+connect to servers on your LAN. You can review that permission in System
+Settings → Privacy & Security → Local Network.
+
+Apple recommends an Apple-issued signing identity for reliable Local Network
+permission tracking across updates; ad-hoc signing is not a substitute for
+that. See [Apple's Local Network privacy notes](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy).
+
 ### Keeping the client up to date
 
 The connection manager can update itself. Once a day it asks

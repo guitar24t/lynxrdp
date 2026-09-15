@@ -194,6 +194,7 @@ fn tunnel_config(args: &Args, destination: &str) -> Result<TunnelConfig> {
         // Empty unless the connection manager started us, so a session typed
         // at a terminal keeps prompting there.
         env: askpass::ssh_env(),
+        capture_stderr: askpass::wanted(),
     })
 }
 

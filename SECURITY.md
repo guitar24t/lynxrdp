@@ -257,9 +257,11 @@ replace itself with it. Three things are worth stating plainly.
   against the `SHA256SUMS` published in the same release, which catches a
   truncated or corrupted file. That file arrives from the same host over the
   same connection as the asset, so it is not a second opinion about who
-  published the release. Nothing here is code signed. The trust anchor is the
-  TLS connection to GitHub and GitHub's own control of the repository — the
-  same anchor as downloading the release by hand, and no more.
+  published the release. The macOS bundle's ad-hoc code signature seals its
+  contents for macOS but authenticates no publisher; releases are not
+  Developer ID-signed or notarised, nor Windows publisher-signed. The trust
+  anchor is the TLS connection to GitHub and GitHub's own control of the
+  repository — the same anchor as downloading the release by hand, and no more.
 
   Where a stronger claim is wanted, the shape of the code allows it:
   `update::verify` is the only door the downloaded bytes come through, and a

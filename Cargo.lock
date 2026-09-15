@@ -1698,6 +1698,7 @@ dependencies = [
  "egui-winit",
  "env_logger",
  "flate2",
+ "libc",
  "log",
  "lynxrdp-filecopy",
  "lynxrdp-proto",
