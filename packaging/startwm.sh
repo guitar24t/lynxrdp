@@ -44,6 +44,24 @@ if [ -n "$LYNXRDP_DESKTOP" ]; then
     run /bin/sh -c "$LYNXRDP_DESKTOP"
 fi
 
+# Match GNOME's system data search path without letting spaces or glob
+# characters in a directory change the lookup. A subshell keeps IFS and
+# globbing unchanged for the desktop we ultimately exec.
+has_ubuntu_session() (
+    IFS=:
+    set -f
+    for session_data_dir in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+        case "$session_data_dir" in
+            /*)
+                if [ -r "$session_data_dir/gnome-session/sessions/ubuntu.session" ]; then
+                    return 0
+                fi
+                ;;
+        esac
+    done
+    return 1
+)
+
 for candidate in \
     "startxfce4" \
     "xfce4-session" \
@@ -61,7 +79,18 @@ for candidate in \
     "fluxbox"; do
     if command -v "$candidate" >/dev/null 2>&1; then
         case "$candidate" in
-            gnome-session) export XDG_SESSION_DESKTOP=gnome XDG_CURRENT_DESKTOP=GNOME ;;
+            gnome-session)
+                # Ubuntu's defaults (including its installed wallpapers) are
+                # keyed to ubuntu:GNOME. Generic GNOME selects Adwaita images
+                # Ubuntu need not install. Use its own Xorg session identity
+                # only where that session exists; RHEL keeps generic GNOME.
+                if has_ubuntu_session; then
+                    export XDG_SESSION_DESKTOP=ubuntu XDG_CURRENT_DESKTOP=ubuntu:GNOME
+                    export GNOME_SHELL_SESSION_MODE=ubuntu
+                    run gnome-session --session=ubuntu
+                fi
+                export XDG_SESSION_DESKTOP=gnome XDG_CURRENT_DESKTOP=GNOME
+                ;;
             startxfce4|xfce4-session) export XDG_SESSION_DESKTOP=xfce XDG_CURRENT_DESKTOP=XFCE ;;
             startplasma-x11) export XDG_SESSION_DESKTOP=plasma XDG_CURRENT_DESKTOP=KDE ;;
             mate-session) export XDG_SESSION_DESKTOP=mate XDG_CURRENT_DESKTOP=MATE ;;

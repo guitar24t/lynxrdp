@@ -20,10 +20,10 @@ cycle.
 The CI workflow (`.github/workflows/ci.yml`) is the source of truth. The first
 two of these are steps of it verbatim; the third is a stand-in, not an
 equivalent — CI runs `--lib --bins`, `--doc` and the three integration suites
-as separate steps, and then three things a plain `cargo test` never reaches at
-all: a graphical input check that lives outside cargo
-(`python3 tools/check-session-ui.py`), and the two `#[ignore]`d client tests
-that need a display, plus the ignored X-server authorization/lifecycle tests.
+as separate steps. It also runs desktop-selection and graphical input/resize
+checks outside cargo (`python3 tools/check-startwm.py` and
+`python3 tools/check-session-ui.py`), plus the ignored display-dependent client
+and X-server authorization/lifecycle tests that plain `cargo test` skips.
 
 ```bash
 cargo fmt --all --check
@@ -165,6 +165,12 @@ DISPLAY=:77 scrot -o /tmp/shot.png     # then read the PNG back
 
 Every script is runnable locally; none needs the platform it targets except
 where noted.
+
+`python3 tools/check-startwm.py` tests the real session launcher with isolated
+profiles and stand-in desktop executables. It needs no display or third-party
+Python packages, runs on macOS and Linux, and checks Ubuntu/GNOME selection,
+generic GNOME (RHEL), desktop priority, and user overrides. CI runs it on Ubuntu
+and inside the AlmaLinux 9 packaging container.
 
 ```bash
 packaging/package-server.sh amd64                    # .deb + .rpm (needs nfpm)

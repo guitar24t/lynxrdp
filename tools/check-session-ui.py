@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Check graphical session input on isolated Xvfb displays.
+"""Check graphical session input and resizing on isolated Xvfb displays.
 
-Build the workspace first. Requires Xvfb, xterm, xdpyinfo, and xdotool.
+Build the workspace first. Requires Xvfb, xterm, xdpyinfo, xdotool, and xrandr.
 Clipboard synchronization is disabled; typing targets only the test shell.
 On WSL, use a mount namespace with a writable /tmp/.X11-unix.
 """
@@ -41,6 +41,13 @@ def find_window(class_name, env):
     return run(args, env).splitlines()[0]
 
 
+def window_size(window, env):
+    fields = dict(line.split("=", 1) for line in run(
+        ["xdotool", "getwindowgeometry", "--shell", window], env
+    ).splitlines())
+    return int(fields["WIDTH"]), int(fields["HEIGHT"])
+
+
 def check(bin_dir):
     children = []
     with tempfile.TemporaryDirectory(prefix="lynxrdp-gui-live-") as tmp:
@@ -68,6 +75,7 @@ def check(bin_dir):
                 server = subprocess.Popen(
                     [str(bin_dir / "lynxrdp-session"), "--listen", f"127.0.0.1:{port}",
                      "--width", "1000", "--height", "700",
+                     "--max-width", "1600", "--max-height", "1200",
                      "--startwm", "xterm -geometry 120x36+0+0",
                      "--runtime-dir", tmp + "/session", "--upload-dir", tmp + "/uploads",
                      "--print-display"],
@@ -111,6 +119,55 @@ def check(bin_dir):
                 )
                 assert client.poll() is None, "Client exited during graphical interaction"
                 print("PASS: remote typing and dragging work with the graphical Transfers window open.")
+                # GNOME changes RANDR after the initial handshake. An automatic
+                # resize viewer must keep its viewport and restore the remote
+                # size even after the earlier request completed. Repeat after
+                # the fullscreen shortcut; bare Xvfb has no window manager,
+                # so actual fullscreen monitor geometry needs a native check.
+                for after_fullscreen_shortcut in [False, True]:
+                    if after_fullscreen_shortcut:
+                        run(["xdotool", "key", "ctrl+alt+Return"], local_env)
+                        time.sleep(0.5)
+                    want = window_size(window, local_env)
+                    run(["xrandr", "--output", "screen", "--mode", "1600x1200"], remote_env)
+                    wait_for(
+                        lambda: window_size(window, local_env) == want
+                        and tuple(map(int, run(["xdotool", "getdisplaygeometry"], remote_env).split())) == want,
+                        f"remote resize follows the viewport (after fullscreen shortcut={after_fullscreen_shortcut})",
+                    )
+                print("PASS: late remote resizes preserve the viewport before and after the fullscreen shortcut.")
+                client.terminate()
+                client.wait(timeout=5)
+                run(["xrandr", "--output", "screen", "--mode", "1600x1200"], remote_env)
+                client = subprocess.Popen(
+                    [str(bin_dir / "lynxrdp"), "--connect", f"127.0.0.1:{port}",
+                     "--no-clipboard", "--scale", "1"],
+                    env=local_env, stdout=log, stderr=log,
+                )
+                children.append(client)
+                window = find_window("lynxrdp", local_env)
+                wait_for(
+                    lambda: window_size(window, local_env) == (1200, 900)
+                    and run(["xdotool", "getdisplaygeometry"], remote_env) == "1200 900",
+                    "an initially oversized desktop fits the local monitor",
+                )
+                print("PASS: an oversized initial desktop is bounded by the local display.")
+                client.terminate()
+                client.wait(timeout=5)
+                client = subprocess.Popen(
+                    [str(bin_dir / "lynxrdp"), "--connect", f"127.0.0.1:{port}",
+                     "--no-clipboard", "--scale", "1", "--size", "800x600", "--no-dynamic-resize"],
+                    env=local_env, stdout=log, stderr=log,
+                )
+                children.append(client)
+                window = find_window("lynxrdp", local_env)
+                wait_for(lambda: window_size(window, local_env) == (800, 600), "fixed viewer")
+                run(["xrandr", "--output", "screen", "--mode", "1600x1200"], remote_env)
+                wait_for(
+                    lambda: window_size(window, local_env) == (1600, 1200),
+                    "fixed-resolution viewer still follows manual server resizing",
+                )
+                print("PASS: fixed-resolution mode preserves server-controlled window sizing.")
             except Exception:
                 log.flush()
                 print(Path(tmp + "/test.log").read_text()[-6000:])

@@ -39,7 +39,9 @@ your SSH credentials.
   1–8 bit indices, and payloads are compressed with whichever of LZ4 or
   Zstd is smaller. An idle screen costs zero bytes.
 * **Dynamic resolution.** Resize the window and the remote screen follows;
-  no scaling, no blurry text.
+  no scaling, no blurry text. Automatic-resize windows start within the local display
+  and keep control when the remote desktop changes resolution during startup.
+  `--no-dynamic-resize` preserves fixed-resolution behavior.
 * **Clipboard sync** in both directions: text, images (as lossless PNG,
   fetched only when the other side asks, so copying an image you never
   paste costs nothing), and files copied in the session — those paste into
@@ -107,6 +109,10 @@ sudo dnf groupinstall "Xfce"                         # RHEL 9 (EPEL)
 `startwm.sh` picks the first desktop it finds (XFCE, KDE Plasma, MATE,
 Cinnamon, GNOME, LXQt, ...). Users can override it with `~/.lynxrdp/session`
 or `~/.xsession`.
+When GNOME is selected and Ubuntu's session is installed, the launcher uses
+Ubuntu's session identity and shell mode so its wallpaper and theme defaults
+apply. Generic GNOME installations, including RHEL 9, keep the generic session.
+User session overrides and saved desktop settings are not rewritten.
 
 Check the daemon:
 

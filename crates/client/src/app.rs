@@ -346,8 +346,7 @@ pub struct App {
     drop_deadline: Option<Instant>,
     modifiers: ModifiersState,
     focused: bool,
-    last_resize_event: Option<Instant>,
-    pending_size: Option<(u32, u32)>,
+    resize: resize::ResizeSync,
     clipboard: Option<arboard::Clipboard>,
     last_clipboard: Option<String>,
     /// File selections already offered, including files received from the host.
@@ -478,6 +477,7 @@ pub struct App {
 pub mod desktop;
 #[cfg(any(target_os = "macos", test))]
 mod native_chrome;
+mod resize;
 
 impl App {
     /// Wrap a connected client.
@@ -511,8 +511,7 @@ impl App {
             drop_deadline: None,
             modifiers: ModifiersState::empty(),
             focused: false,
-            last_resize_event: None,
-            pending_size: None,
+            resize: resize::ResizeSync::default(),
             clipboard,
             last_clipboard: None,
             last_file_revision: None,
@@ -639,8 +638,15 @@ impl App {
         Some((remaining, (self.upload_done as u64 * 100 + live) / total))
     }
 
+    fn automatic_resize(&self) -> bool {
+        self.opts.dynamic_resize && self.client.info().features & features::RESIZE != 0
+    }
+
     fn init_window(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let (w, h) = self.client.size();
+        let monitor = event_loop
+            .primary_monitor()
+            .or_else(|| event_loop.available_monitors().next());
         // There is no window yet to ask which display it will open on, so the
         // primary monitor stands in and the answer is checked below. Getting
         // it right the first time matters more than it looks: the window is
@@ -648,13 +654,21 @@ impl App {
         // window created at half the size it wanted is one the user has to
         // resize by hand.
         if !self.scale_pinned {
-            self.scale = event_loop
-                .primary_monitor()
+            self.scale = monitor
+                .as_ref()
                 .map_or(1, |m| display_scale(m.scale_factor()));
         }
+        // A desktop left at a larger monitor's resolution must not create a
+        // window extending beyond this display before resize events arrive.
+        let initial = resize::initial_window_size(
+            (w, h),
+            self.scale,
+            monitor.as_ref().map(|m| m.size()),
+            self.automatic_resize(),
+        );
         let mut attrs = Window::default_attributes()
             .with_title(self.title())
-            .with_inner_size(PhysicalSize::new(w * self.scale, h * self.scale))
+            .with_inner_size(initial)
             .with_resizable(true);
         // The same WM_CLASS the launcher uses, so a session window groups
         // with it and picks up the .desktop entry's icon and name.
@@ -688,16 +702,30 @@ impl App {
         // reads `None` for the whole life of a window plainly occupying a
         // Space, and anything comparing against it -- `set_fullscreen(None)` on
         // the way out above all -- quietly does nothing.
+        // The window may not have opened on the monitor that was guessed at.
+        let old_scale = self.scale;
+        if !self.scale_pinned {
+            self.scale = display_scale(window.scale_factor());
+        }
+        let inner = window.inner_size();
+        let (base, scale) = if self.scale != old_scale {
+            ((w, h), self.scale)
+        } else {
+            // Keep a smaller size the window manager already chose; only
+            // shrink if its actual monitor is smaller than our first guess.
+            ((inner.width, inner.height), 1)
+        };
+        let size = resize::initial_window_size(
+            base,
+            scale,
+            window.current_monitor().map(|m| m.size()),
+            self.automatic_resize(),
+        );
+        if size != inner {
+            let _ = window.request_inner_size(size);
+        }
         if self.fullscreen {
             window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        }
-        // The window may not have opened on the monitor that was guessed at.
-        if !self.scale_pinned {
-            let actual = display_scale(window.scale_factor());
-            if actual != self.scale {
-                self.scale = actual;
-                let _ = window.request_inner_size(PhysicalSize::new(w * actual, h * actual));
-            }
         }
         let context = softbuffer::Context::new(window.clone())
             .map_err(|e| anyhow::anyhow!("softbuffer context: {e}"))?;
@@ -710,6 +738,14 @@ impl App {
             surface,
             gui,
         });
+        if self.automatic_resize() {
+            if let Some(g) = &self.gfx {
+                self.resize.viewport_changed(
+                    remote_size_for(g.window.inner_size(), self.scale),
+                    Instant::now(),
+                );
+            }
+        }
         self.full_redraw = true;
         Ok(())
     }
@@ -1094,7 +1130,7 @@ impl App {
                     ClientEvent::Resized { width, height } => {
                         log::info!("remote screen is now {width}x{height}");
                         self.full_redraw = true;
-                        self.match_window_to_remote(width, height);
+                        self.sync_remote_size(width, height);
                         self.update_title();
                         self.request_redraw();
                     }
@@ -1175,10 +1211,24 @@ impl App {
     }
 
     /// Size the window to a remote screen of `width` by `height`.
-    fn match_window_to_remote(&mut self, width: u32, height: u32) {
-        let (Some(g), false) = (self.gfx.as_ref(), self.fullscreen) else {
+    fn sync_remote_size(&mut self, width: u32, height: u32) {
+        let Some(g) = self.gfx.as_ref() else {
             return;
         };
+        if self.automatic_resize() {
+            // GNOME may change RANDR after our initial request completed.
+            // The viewport remains authoritative: growing the native window
+            // here clips windowed viewers and leaves fullscreen ones stale.
+            self.resize.remote_changed(
+                remote_size_for(g.window.inner_size(), self.scale),
+                (width, height),
+                Instant::now(),
+            );
+            return;
+        }
+        if self.fullscreen {
+            return;
+        }
         let want = (width * self.scale, height * self.scale);
         let cur = g.window.inner_size();
         if (cur.width, cur.height) != want {
@@ -1422,16 +1472,16 @@ impl App {
         self.full_redraw = true;
         self.resync_input();
         self.restore_cursor();
-        if self.opts.dynamic_resize && self.client.info().features & features::RESIZE != 0 {
+        if self.automatic_resize() {
             // The window may have been resized while the link was down, and
             // the session still has the size it had. Ask through the ordinary
             // debounced path rather than inventing a second one.
             if let Some(g) = &self.gfx {
-                self.pending_size = Some(remote_size_for(g.window.inner_size(), self.scale));
-                self.last_resize_event = Some(now);
+                self.resize
+                    .viewport_changed(remote_size_for(g.window.inner_size(), self.scale), now);
             }
         } else {
-            self.match_window_to_remote(w, h);
+            self.sync_remote_size(w, h);
         }
         self.overlay.flash(now);
         self.update_title();
@@ -1517,18 +1567,16 @@ impl App {
             self.request_redraw();
         }
         self.poll_reconnect(now);
-        if let (Some(t), Some((w, h))) = (self.last_resize_event, self.pending_size) {
-            if now.duration_since(t) >= RESIZE_DEBOUNCE {
-                self.last_resize_event = None;
-                self.pending_size = None;
-                if (w, h) != self.client.size() && w >= 64 && h >= 64 {
-                    log::debug!("requesting remote resize to {w}x{h}");
-                    self.send(&Message::ResizeRequest {
-                        width: w.min(u16::MAX as u32) as u16,
-                        height: h.min(u16::MAX as u32) as u16,
-                    });
-                }
+        if self.automatic_resize() && self.link_up() {
+            if let Some((w, h)) = self.resize.take_due(now, self.client.size()) {
+                log::debug!("requesting remote resize to {w}x{h}");
+                self.send(&Message::ResizeRequest {
+                    width: w as u16,
+                    height: h as u16,
+                });
             }
+        } else {
+            self.resize = resize::ResizeSync::default();
         }
         if self.link_up() && now.duration_since(self.last_ping) >= PING_INTERVAL {
             self.last_ping = now;
@@ -2224,7 +2272,7 @@ impl App {
         if let Some(gfx) = &self.gfx {
             d = d.min(gfx.gui.repaint_in());
         }
-        if self.pending_size.is_some() {
+        if self.resize.is_pending() {
             d = d.min(RESIZE_DEBOUNCE / 2);
         }
         // A dwell in progress is timed against the same 100 ms tick the bar's
@@ -2874,9 +2922,9 @@ impl ApplicationHandler<Wake> for App {
             }
             WindowEvent::Resized(size) => {
                 self.full_redraw = true;
-                if self.opts.dynamic_resize && self.client.info().features & features::RESIZE != 0 {
-                    self.pending_size = Some(remote_size_for(size, self.scale));
-                    self.last_resize_event = Some(Instant::now());
+                if self.automatic_resize() {
+                    self.resize
+                        .viewport_changed(remote_size_for(size, self.scale), Instant::now());
                 }
                 self.request_redraw();
             }
@@ -2892,6 +2940,14 @@ impl ApplicationHandler<Wake> for App {
                     if want != self.scale {
                         log::info!("display scale is now {scale_factor}; magnifying {want}x");
                         self.scale = want;
+                    }
+                }
+                if self.automatic_resize() {
+                    if let Some(g) = &self.gfx {
+                        self.resize.viewport_changed(
+                            remote_size_for(g.window.inner_size(), self.scale),
+                            Instant::now(),
+                        );
                     }
                 }
                 self.full_redraw = true;
@@ -4503,6 +4559,45 @@ mod tests {
                 waker: make_waker().1,
             },
         )
+    }
+
+    #[test]
+    fn pending_resizes_require_both_automatic_mode_and_a_capable_peer() {
+        for (automatic, peer_features, expected) in [
+            (false, features::RESIZE, false),
+            (true, 0, false),
+            (true, features::RESIZE, true),
+        ] {
+            let (addr, seen) = fake_session_with_features(1, peer_features);
+            let mut app = test_app(addr, None);
+            app.opts.dynamic_resize = automatic;
+            // A queued request can outlive the transport that supported it.
+            app.resize
+                .viewport_changed((800, 600), Instant::now() - RESIZE_DEBOUNCE);
+            app.housekeeping();
+            app.client.send(&Message::Ping { nonce: 98765 }).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let messages = seen.lock().unwrap();
+                if messages
+                    .iter()
+                    .any(|m| matches!(m, Message::Ping { nonce: 98765 }))
+                {
+                    let resized = messages
+                        .iter()
+                        .any(|m| matches!(m, Message::ResizeRequest { .. }));
+                    drop(messages);
+                    assert_eq!(resized, expected);
+                    break;
+                }
+                drop(messages);
+                assert!(
+                    Instant::now() < deadline,
+                    "writer did not reach the ordering marker"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 
     #[test]

@@ -40,6 +40,8 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q xvfb xterm xfonts-base xdotool xclip python3-gi gir1.2-gtk-3.0 xdg-user-dirs fuse3 x11-utils x11-xserver-utils libxkbcommon-x11-0 libxkbcommon0 openssh-server openssh-client
+      - name: Desktop session selection
+        run: python3 tools/check-startwm.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets
@@ -218,7 +220,9 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/src" -w /src -e CARGO_TERM_COLOR=always \
             almalinux:9 bash -euo pipefail -c '
-              dnf -y install gcc >/dev/null
+              dnf -y install gcc python3 >/dev/null
+              # Check the launcher with the RHEL 9 shell and Python too.
+              python3 tools/check-startwm.py
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
                 | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null
               . "$HOME/.cargo/env"
