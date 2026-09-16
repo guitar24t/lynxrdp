@@ -77,17 +77,22 @@ mkdir -p "$SITE"
 
 # ---- APT ------------------------------------------------------------------
 # A conventional pool so several versions of a package can sit side by side;
-# --multiversion below lists them all, and apt picks the highest.
+# --multiversion below lists them all, and apt picks the highest. Files are
+# named from the package's own metadata rather than from what they were
+# called on arrival: GitHub rewrites a release asset's name, turning the
+# tilde in 0.1.0~rc.26 into a dot, and the repository should not inherit
+# that.
 apt="$SITE/apt"
 mkdir -p "$apt/dists/stable/main"
 declare -A deb_arches=()
 for deb in "${debs[@]}"; do
     name="$(dpkg-deb -f "$deb" Package)"
+    version="$(dpkg-deb -f "$deb" Version)"
     arch="$(dpkg-deb -f "$deb" Architecture)"
     deb_arches["$arch"]=1
     dir="$apt/pool/main/${name:0:1}/$name"
     mkdir -p "$dir"
-    cp "$deb" "$dir/"
+    cp "$deb" "$dir/${name}_${version}_${arch}.deb"
 done
 for arch in "${!deb_arches[@]}"; do
     mkdir -p "$apt/dists/stable/main/binary-$arch"
@@ -117,10 +122,11 @@ gpg_sign --detach-sign --armor --output "$apt/dists/stable/Release.gpg" "$apt/di
 # (release assets) are left as they were published.
 for rpm in "${rpms[@]}"; do
     arch="$(rpm -qp --qf '%{ARCH}' "$rpm" 2>/dev/null)"
+    canonical="$(rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}.rpm' "$rpm" 2>/dev/null)"
     dir="$SITE/rpm/el9/$arch"
     mkdir -p "$dir"
-    cp "$rpm" "$dir/"
-    sign_rpm "$dir/$(basename "$rpm")" >/dev/null
+    cp "$rpm" "$dir/$canonical"
+    sign_rpm "$dir/$canonical" >/dev/null
 done
 for dir in "$SITE"/rpm/el9/*/; do
     createrepo_c --quiet "$dir"

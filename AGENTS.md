@@ -201,6 +201,16 @@ Both run on Ubuntu; the RHEL side is verified by installing from the result
 in an AlmaLinux container, which is what the CI step does with a throwaway
 key.
 
+Two settings live in the repository's GitHub configuration rather than in
+the tree, and the job fails before its first step without them: Pages must
+be enabled with "GitHub Actions" as the source, and the `github-pages`
+environment that enabling it creates must allow deployments from `v*` tags
+(its default rule admits only `main`; a tag-triggered release is rejected
+with "not allowed to deploy to github-pages due to environment protection
+rules"). GitHub also renames release assets, turning the tilde in
+`0.1.0~rc.26` into a dot, which is why `build-repo.sh` names the files it
+serves from the package metadata instead.
+
 The server's maintainer scripts (`packaging/scripts/`) tell an upgrade from a
 removal by what the package manager passes them -- dpkg's second argument to
 `postinst configure`, rpm's instance count -- and the two paths differ on

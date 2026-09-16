@@ -133,10 +133,14 @@ repository is a one-time manual step, after which updates flow normally:
 
 ```sh
 # Debian / Ubuntu
-sudo apt install --allow-downgrades ./lynxrdp-server_0.1.0~rc.26-1_amd64.deb
+sudo apt install --allow-downgrades ./lynxrdp-server_*_amd64.deb
 # RHEL / Fedora
-sudo dnf downgrade ./lynxrdp-server-0.1.0~rc.26-1.x86_64.rpm
+sudo dnf downgrade ./lynxrdp-server-*.x86_64.rpm
 ```
+
+(The downloaded file is named `lynxrdp-server_0.1.0.rc.26-1_amd64.deb` with a
+dot where the version has a tilde: GitHub rewrites release asset names. The
+package inside carries the tilde.)
 
 Both server packages also install
 `/usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules` to suppress the
