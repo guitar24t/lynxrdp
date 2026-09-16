@@ -296,6 +296,36 @@ replace itself with it. Three things are worth stating plainly.
 An update is offered but never applied on its own: downloading and replacing
 happen on a click, and the replaced build is only running after a restart.
 
+## Package repositories
+
+The server packages install a package repository, served from GitHub Pages
+at `https://guitar24t.github.io/lynxrdp/`, so that `apt` and `dnf` can update
+the server. What its signatures do and do not prove:
+
+* **One key signs everything.** The APT `InRelease`, the RPM `repomd.xml`
+  and every `.rpm` are signed with a key whose private half is an Actions
+  secret of this repository and whose public half ships inside the packages
+  (`/usr/share/keyrings/lynxrdp-archive-keyring.gpg` and
+  `/etc/pki/rpm-gpg/RPM-GPG-KEY-lynxrdp`). `gpgcheck` and `repo_gpgcheck`
+  are on, and the apt source is pinned to that keyring with `Signed-By`.
+* **The trust anchor is the first install.** The package downloaded from the
+  releases page over TLS is what brings the key in; nothing signs that first
+  package itself. That is the same anchor the client updater has (TLS to
+  GitHub and GitHub's control of the repository), extended so that every
+  later update is checked against a key the host already holds rather than
+  against the transport alone.
+* **The key is as safe as the repository's secrets.** Anyone who can write
+  this repository's Actions secrets, or run its workflows with them, can
+  sign a package. A compromised key is rotated by shipping a release, still
+  signed with the old key, whose packages install the new public key, then
+  switching the secret; hosts that skipped that release reinstall from the
+  releases page.
+* **Nothing is downgraded by accident.** Package versions derive from the
+  release tag as `0.1.0~rc.N`, which both package managers rank below the
+  final `0.1.0`, and the repository serves only releases from the first one
+  built that way (`REPO_FIRST_TAG` in the release workflow), because the
+  earlier ones all carried `0.1.0-1` and would rank above every candidate.
+
 ## Hardening tips
 
 * Keep `PermitOpen` in `sshd_config` at its default or restrict it to

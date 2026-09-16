@@ -188,6 +188,19 @@ assets/generate-icons.sh                             # only when the SVG changes
 installers fine. Generated icons are committed, so a normal build rasterises
 nothing.
 
+The APT and RPM repositories are a static site the `publish-repo` job of
+`release.yml` deploys to GitHub Pages after every release, rebuilt whole from
+the server packages of the newest five releases:
+
+```bash
+packaging/collect-repo-packages.sh packages v0.1.0-rc.26 5   # needs gh
+packaging/build-repo.sh packages site --key <fingerprint>    # needs dpkg-dev, apt-utils, createrepo-c, rpm, gnupg
+```
+
+Both run on Ubuntu; the RHEL side is verified by installing from the result
+in an AlmaLinux container, which is what the CI step does with a throwaway
+key.
+
 The server's maintainer scripts (`packaging/scripts/`) tell an upgrade from a
 removal by what the package manager passes them -- dpkg's second argument to
 `postinst configure`, rpm's instance count -- and the two paths differ on
@@ -314,6 +327,25 @@ not a style question.
   its own floor to 1.85. Lift both together or neither; with `resolver = "2"`
   the version choice is not MSRV-aware, so a bare `"3"` silently breaks the
   promise the manifest makes.
+- **Package versions come from the release tag.** `package-server.sh` turns
+  `v0.1.0-rc.26` into nfpm's `version 0.1.0` plus `prerelease rc.26`, so the
+  package is `0.1.0~rc.26-1`; dpkg and rpm both rank the tilde below the bare
+  version, which is what lets the repository offer each candidate over the
+  last and the final release over all of them. A tag whose base disagrees
+  with `Cargo.toml` fails the build. Every release before v0.1.0-rc.26
+  shipped `0.1.0-1`, which sorts *above* every candidate, so `REPO_FIRST_TAG`
+  in `release.yml` keeps those out of the repository; never lower it.
+- **The package repositories are signed with one key, and the packages
+  install its public half.** The private key is the
+  `LYNXRDP_PACKAGE_SIGNING_KEY` Actions secret; `packaging/keys/lynxrdp-packages.asc`
+  is the public half, installed by the server packages as the apt keyring
+  and the RPM key, and `build-repo.sh` refuses a signing key whose
+  fingerprint differs from that file. CI builds the repositories with a
+  throwaway pair and installs from them, so the layout is checked on every
+  run without the secret. To rotate: ship one release still signed with the
+  old key whose packages carry the new public file, then replace the
+  secret; a server that skipped that release reinstalls from the releases
+  page.
 
 ## Platform traps
 

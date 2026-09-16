@@ -1,0 +1,8 @@
+# Installed by the lynxrdp-server package so that apt can update it from the
+# repository the release workflow publishes. The keyring beside it is the
+# public half of the key every release signs with; see SECURITY.md.
+Types: deb
+URIs: https://guitar24t.github.io/lynxrdp/apt
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/lynxrdp-archive-keyring.gpg

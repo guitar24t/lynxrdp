@@ -1,0 +1,10 @@
+# Installed by the lynxrdp-server package so that dnf can update it from the
+# repository the release workflow publishes. Packages and metadata are both
+# signed with the key beside it; see SECURITY.md.
+[lynxrdp]
+name=LynxRDP
+baseurl=https://guitar24t.github.io/lynxrdp/rpm/el9/$basearch
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-lynxrdp

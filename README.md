@@ -92,6 +92,40 @@ are. Removing it ends them, since nothing could reach them again afterwards.
 deletes them; `dnf remove` removes the PAM file if you never edited it,
 otherwise keeps it as `lynxrdp.rpmsave`, and leaves the logs.
 
+### Keeping the server up to date
+
+The package you installed also set up a package repository, served from
+<https://guitar24t.github.io/lynxrdp/> and signed with the key it installed
+alongside, so from then on the package manager updates the server the way it
+updates everything else:
+
+```sh
+# Debian / Ubuntu
+sudo apt update && sudo apt install lynxrdp-server
+# RHEL / Fedora
+sudo dnf upgrade lynxrdp-server
+```
+
+Release candidates are versioned `0.1.0~rc.N` and the final release `0.1.0`;
+both package managers rank the tilde below the bare version, so a candidate
+never shadows a release. To skip the download and start from the repository:
+
+```sh
+# Debian / Ubuntu
+curl -fsSL https://guitar24t.github.io/lynxrdp/lynxrdp-packages.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/lynxrdp-archive-keyring.gpg
+sudo curl -fsSL -o /etc/apt/sources.list.d/lynxrdp.sources \
+  https://guitar24t.github.io/lynxrdp/lynxrdp.sources
+sudo apt update && sudo apt install lynxrdp-server
+# RHEL / Fedora
+sudo dnf config-manager --add-repo https://guitar24t.github.io/lynxrdp/lynxrdp.repo
+sudo dnf install lynxrdp-server
+```
+
+The signing key's fingerprint is `26F8 5CC7 2E5F FF1C 64C7 8973 9B33 01E9
+6C9B CF7F`; see [SECURITY.md](SECURITY.md#package-repositories) for what the
+signatures do and do not prove.
+
 Both server packages also install
 `/usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules` to suppress the
 "Authentication is required to create a color managed device" prompt when a

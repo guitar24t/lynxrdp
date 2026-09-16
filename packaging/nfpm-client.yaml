@@ -3,6 +3,8 @@ name: lynxrdp-client
 arch: "${ARCH}"
 platform: linux
 version: "${VERSION}"
+# Same tag-derived prerelease as the server package; see package-server.sh.
+prerelease: "${PRERELEASE}"
 release: "1"
 section: x11
 priority: optional

@@ -23,6 +23,11 @@ env:
   # call the newer release a downgrade. Empty everywhere else, which is how a
   # build that is not a release refuses to replace itself.
   LYNXRDP_RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  # The oldest release whose packages the repository serves. Everything
+  # before it shipped packages versioned 0.1.0-1, which apt and dnf rank
+  # above every 0.1.0~rc.N-1; serving those would "upgrade" a server back to
+  # an old build. Never lower it.
+  REPO_FIRST_TAG: v0.1.0-rc.26
 
 jobs:
   build-client:
@@ -149,7 +154,58 @@ jobs:
           draft: false
           tag_name: ${{ inputs.tag || github.ref_name }}
           # Semver: a hyphen in the tag means a prerelease, so v0.1.0-rc.1 is
-          # marked as one and v0.1.0 is not. The packages themselves keep the
-          # Cargo.toml version, because an RPM Version field cannot contain a
-          # hyphen and nfpm would have to mangle it.
+          # marked as one and v0.1.0 is not. The packages carry the same
+          # distinction as a tilde (0.1.0~rc.1-1), which is how dpkg and rpm
+          # spell "before 0.1.0"; package-server.sh derives it from the tag.
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+
+  # The APT and RPM repositories on GitHub Pages, rebuilt whole from the
+  # release assets of the newest releases each time, so they have no state
+  # of their own to drift. A server package installs the definitions and
+  # the public key, which is what lets apt and dnf update the server after
+  # the first install. The key is the LYNXRDP_PACKAGE_SIGNING_KEY secret;
+  # build-repo.sh checks it against the committed public key.
+  publish-repo:
+    name: Publish package repositories
+    needs: release
+    runs-on: ubuntu-24.04
+    # Pages deployments authenticate with an OIDC token rather than the
+    # contents scope the other jobs use.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Repository tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q dpkg-dev apt-utils createrepo-c rpm gnupg
+      - name: Import the signing key
+        env:
+          SIGNING_KEY: ${{ secrets.LYNXRDP_PACKAGE_SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::the LYNXRDP_PACKAGE_SIGNING_KEY secret is not set; see AGENTS.md"
+            exit 1
+          fi
+          printf '%s\n' "$SIGNING_KEY" | gpg --batch --import
+      - name: Collect the packages the repository serves
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: packaging/collect-repo-packages.sh packages "$REPO_FIRST_TAG" 5
+      - name: Build the repositories
+        run: |
+          key="$(gpg --batch --show-keys --with-colons packaging/keys/lynxrdp-packages.asc \
+            | awk -F: '/^fpr/ { print $10; exit }')"
+          packaging/build-repo.sh packages site --key "$key"
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

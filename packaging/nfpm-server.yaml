@@ -4,6 +4,9 @@ name: lynxrdp-server
 arch: "${ARCH}"
 platform: linux
 version: "${VERSION}"
+# Empty for a final release; "rc.26" for v0.1.0-rc.26, rendered as
+# 0.1.0~rc.26-1. See package-server.sh for why.
+prerelease: "${PRERELEASE}"
 release: "1"
 section: x11
 priority: optional
@@ -70,6 +73,33 @@ contents:
       mode: 0644
   - src: README.md
     dst: /usr/share/doc/lynxrdp-server/README.md
+    file_info:
+      mode: 0644
+  # The repository the release workflow publishes, so that from the first
+  # install on the package manager can update the server itself. Each
+  # format gets its own definition and the public signing key in the form
+  # its tools read. The definitions are configuration so an administrator's
+  # edit (a mirror, a disabled entry) survives an upgrade.
+  - src: packaging/repo/lynxrdp.sources
+    dst: /etc/apt/sources.list.d/lynxrdp.sources
+    type: config
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: target/packaging/lynxrdp-archive-keyring.gpg
+    dst: /usr/share/keyrings/lynxrdp-archive-keyring.gpg
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: packaging/repo/lynxrdp.repo
+    dst: /etc/yum.repos.d/lynxrdp.repo
+    type: config|noreplace
+    packager: rpm
+    file_info:
+      mode: 0644
+  - src: packaging/keys/lynxrdp-packages.asc
+    dst: /etc/pki/rpm-gpg/RPM-GPG-KEY-lynxrdp
+    packager: rpm
     file_info:
       mode: 0644
 
