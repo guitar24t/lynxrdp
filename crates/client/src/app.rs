@@ -4839,11 +4839,14 @@ mod tests {
             }
             assert!(app.on_clipboard_files(2, Ok(Some(vec![file.clone()]))));
             assert!(!app.transfer_panel.visible());
+            // What goes on the wire is the slash-separated form, which on
+            // Windows is not the native spelling of `file`.
+            let wire = crate::connection::wire_path(&file).unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 if seen.lock().unwrap().iter().any(|m| {
                     matches!(m, Message::FileList { files, .. }
-                        if files.len() == 1 && files[0].path == file.to_string_lossy())
+                        if files.len() == 1 && files[0].path == wire)
                 }) {
                     break;
                 }

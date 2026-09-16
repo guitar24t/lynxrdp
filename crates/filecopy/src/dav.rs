@@ -771,23 +771,33 @@ mod tests {
             .unwrap();
         let started = Instant::now();
         // Every byte lands well inside a per-read timeout; only a budget
-        // measured from the accept can end this.
+        // measured from the accept can end this. The trickle is bounded by
+        // time rather than by a byte count so a slow runner cannot stretch
+        // it into the read timeout below, which is the outcome being ruled
+        // out.
         let mut closed = false;
-        for _ in 0..25 {
+        while started.elapsed() < Duration::from_secs(2) {
             if socket.write_all(b"G").is_err() {
                 closed = true;
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
         }
         let mut response = String::new();
         let read = socket.read_to_string(&mut response);
+        // A server that had not closed the connection would leave this read
+        // to hit its own 5 s timeout, which is the one error kind not
+        // accepted here.
+        let timed_out = matches!(
+            &read,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+        );
         assert!(
-            closed || matches!(read, Ok(0)) || read.is_err(),
+            closed || matches!(read, Ok(0)) || (read.is_err() && !timed_out),
             "connection should have been closed: {read:?} {response:?}"
         );
         let elapsed = started.elapsed();
         assert!(elapsed >= deadline, "{elapsed:?}");
-        assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     }
 }
