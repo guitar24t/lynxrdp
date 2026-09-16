@@ -258,7 +258,49 @@ fn arm_read_timeout(stream: &TcpStream, deadline: Instant) -> Result<()> {
     Ok(())
 }
 
-/// Drains a bounded body within what is left of the request's budget.
+/// Reads the request head, one socket read at a time, with the budget
+/// re-armed before each. A line-oriented read would only return at a
+/// newline, so a client trickling bytes without one could hold a worker for
+/// as long as every byte beat the per-read timeout, which is exactly the
+/// budget's job to prevent. Whatever follows the head stays buffered for
+/// [`drain`].
+fn read_head(
+    stream: &TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    const HEAD_LIMIT: usize = 16 * 1024;
+    let mut data = Vec::new();
+    loop {
+        arm_read_timeout(stream, deadline)?;
+        let available = reader.fill_buf()?;
+        anyhow::ensure!(!available.is_empty(), "Invalid HTTP headers");
+        let take = available.len().min(HEAD_LIMIT - data.len());
+        // The terminator may straddle two reads, so the search restarts a
+        // few bytes before the new data.
+        let from = data.len().saturating_sub(3);
+        data.extend_from_slice(&available[..take]);
+        let end = data[from..]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| from + i + 4);
+        match end {
+            Some(end) => {
+                let body = data.len() - end;
+                data.truncate(end);
+                reader.consume(take - body);
+                return Ok(data);
+            }
+            None => {
+                reader.consume(take);
+                anyhow::ensure!(data.len() < HEAD_LIMIT, "Invalid HTTP headers");
+            }
+        }
+    }
+}
+
+/// Drains a bounded body within what is left of the request's budget, with
+/// the same per-read re-arming as [`read_head`] and for the same reason.
 /// Leaving unread socket data can reset the response on macOS's HTTP client.
 fn drain(
     stream: &TcpStream,
@@ -266,9 +308,15 @@ fn drain(
     deadline: Instant,
     length: u64,
 ) -> Result<()> {
-    arm_read_timeout(stream, deadline)?;
-    let consumed = std::io::copy(&mut reader.take(length), &mut std::io::sink())?;
-    anyhow::ensure!(consumed == length, "Incomplete HTTP body");
+    let mut left = length;
+    while left > 0 {
+        arm_read_timeout(stream, deadline)?;
+        let available = reader.fill_buf()?;
+        anyhow::ensure!(!available.is_empty(), "Incomplete HTTP body");
+        let take = (available.len() as u64).min(left) as usize;
+        reader.consume(take);
+        left -= take as u64;
+    }
     Ok(())
 }
 
@@ -287,21 +335,7 @@ fn serve(mut stream: TcpStream, accepted: Instant, endpoint: &Endpoint) -> Resul
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut data = Vec::new();
-    loop {
-        arm_read_timeout(&stream, deadline)?;
-        let before = data.len();
-        (&mut reader)
-            .take((16 * 1024 - data.len()) as u64)
-            .read_until(b'\n', &mut data)?;
-        anyhow::ensure!(
-            data.len() > before && data.len() < 16 * 1024,
-            "Invalid HTTP headers"
-        );
-        if data.ends_with(b"\r\n\r\n") {
-            break;
-        }
-    }
+    let data = read_head(&stream, &mut reader, deadline)?;
     let text = std::str::from_utf8(&data)?;
     let mut lines = text.split("\r\n");
     let mut request = lines.next().context("Missing request")?.split_whitespace();
