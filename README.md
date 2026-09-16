@@ -126,6 +126,18 @@ The signing key's fingerprint is `26F8 5CC7 2E5F FF1C 64C7 8973 9B33 01E9
 6C9B CF7F`; see [SECURITY.md](SECURITY.md#package-repositories) for what the
 signatures do and do not prove.
 
+A server installed from v0.1.0-rc.25 or earlier carries the package version
+`0.1.0-1`, from before versions came from the tag, and the package manager
+ranks that above every `0.1.0~rc.N`. Moving such a server onto the
+repository is a one-time manual step, after which updates flow normally:
+
+```sh
+# Debian / Ubuntu
+sudo apt install --allow-downgrades ./lynxrdp-server_0.1.0~rc.26-1_amd64.deb
+# RHEL / Fedora
+sudo dnf downgrade ./lynxrdp-server-0.1.0~rc.26-1.x86_64.rpm
+```
+
 Both server packages also install
 `/usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules` to suppress the
 "Authentication is required to create a color managed device" prompt when a
