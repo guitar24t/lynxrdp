@@ -30,13 +30,14 @@ def run(args, env):
     ).strip()
 
 
-def find_window(class_name, env):
+def find_window(class_name, env, timeout=15):
     args = ["xdotool", "search", "--onlyvisible", "--class", class_name]
     wait_for(
         lambda: subprocess.run(
             args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         ).returncode == 0,
         "window " + class_name,
+        timeout,
     )
     return run(args, env).splitlines()[0]
 
@@ -96,7 +97,10 @@ def check(bin_dir):
                     env=local_env, stdout=log, stderr=log,
                 )
                 children.append(client)
-                window = find_window("lynxrdp", local_env)
+                # A cold start of the client on a loaded runner has been seen
+                # to take longer than the usual fifteen seconds; the window's
+                # absence is not what this check is about.
+                window = find_window("lynxrdp", local_env, timeout=60)
                 run(["xdotool", "windowfocus", window], local_env)
                 run(["xdotool", "key", "ctrl+alt+t"], local_env)
                 time.sleep(0.5)  # Let egui position and paint the details window.
@@ -108,7 +112,10 @@ def check(bin_dir):
                      f"printf GUI_OK > {marker}"], local_env)
                 run(["xdotool", "key", "Return"], local_env)
                 wait_for(lambda: Path(marker).exists(), "remote typing with details open")
-                assert Path(marker).read_text() == "GUI_OK"
+                # The message is the diagnosis: which character was dropped,
+                # doubled or lost its shift is what a failure here has to say.
+                typed = Path(marker).read_text()
+                assert typed == "GUI_OK", f"remote typing produced {typed!r}, expected 'GUI_OK'"
                 # A drag started remotely must continue when it crosses the panel.
                 run(["xdotool", "mousemove", "--window", window, "100", "200",
                      "mousedown", "1", "mousemove", "--window", window, "800", "200",
