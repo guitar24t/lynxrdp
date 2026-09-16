@@ -13,9 +13,10 @@
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 mod stderr;
 
@@ -391,18 +392,19 @@ const SOCKET_NAME: &str = "sock";
 #[cfg(unix)]
 const NAME_ATTEMPTS: u32 = 8;
 
-/// A private directory holding the tunnel's local socket.
+/// A private directory holding one Unix socket: the tunnel's local end, or
+/// the askpass broker's relay socket, which has the same needs.
 ///
-/// Created `0700` and owned by this user, so the socket inside it -- which is
-/// the whole session, in the clear -- cannot be opened by anyone else on the
-/// machine. Both go on drop: ssh unlinks the socket when it exits cleanly and
-/// does not when we kill it, and either way the empty directory is ours to
-/// remove.
+/// Created `0700` and owned by this user, so the socket inside it -- the
+/// whole session in the clear, or a passphrase in transit -- cannot be opened
+/// by anyone else on the machine. Both go on drop: ssh unlinks the socket
+/// when it exits cleanly and does not when we kill it, and either way the
+/// empty directory is ours to remove.
 #[cfg(unix)]
 #[derive(Debug)]
-struct SocketDir {
-    dir: PathBuf,
-    socket: PathBuf,
+pub(crate) struct SocketDir {
+    pub(crate) dir: PathBuf,
+    pub(crate) socket: PathBuf,
 }
 
 #[cfg(unix)]
@@ -431,7 +433,7 @@ impl Drop for SocketDir {
 /// is four bytes tighter on macOS -- which is also the platform whose
 /// temporary directory is 49 characters before we add anything.
 #[cfg(unix)]
-fn socket_path_problem(path: &Path) -> Option<String> {
+pub(crate) fn socket_path_problem(path: &Path) -> Option<String> {
     let Some(text) = path.to_str() else {
         // The path reaches ssh as an argument we build from a `String`.
         return Some("the path is not valid UTF-8".into());
@@ -493,14 +495,25 @@ fn unique_suffix() -> String {
     format!("{:06x}", (nanos ^ (n << 20)) & 0xff_ffff)
 }
 
-/// Create a `0700` directory for the tunnel's socket.
+/// Create a `0700` directory for a socket, in the first base that can hold one.
 ///
 /// `create` rather than `create_dir_all`: `mkdir(2)` fails if anything is
 /// already at the name, symlink included, so a unique name plus this call is
 /// atomic against someone in `/tmp` trying to point it somewhere else.
 #[cfg(unix)]
-fn create_socket_dir() -> Result<SocketDir> {
+pub(crate) fn create_socket_dir() -> Result<SocketDir> {
     create_socket_dir_in(&socket_bases())
+}
+
+/// The tunnel's way out of a machine where no base fits, attached at the one
+/// place a tunnel chooses a socket -- the askpass broker shares the directory
+/// code and has no port to fall back to.
+#[cfg(unix)]
+fn with_port_fallback_hint(e: anyhow::Error) -> anyhow::Error {
+    anyhow!(
+        "{e:#}; --local-port <port> falls back to a loopback TCP port, which every \
+         other process on this machine can also reach"
+    )
 }
 
 /// The half of [`create_socket_dir`] that does not read the environment.
@@ -547,18 +560,160 @@ fn create_socket_dir_in(bases: &[PathBuf]) -> Result<SocketDir> {
         ));
     }
     bail!(
-        "could not create a private directory for the tunnel's socket ({}); \
-         --local-port <port> falls back to a loopback TCP port, which every \
-         other process on this machine can also reach",
+        "could not create a private directory for a socket ({})",
         refused.join("; ")
     )
+}
+
+// ---- stopping a tunnel from outside ----------------------------------
+
+/// A way to stop a tunnel from a thread that does not own it.
+///
+/// [`Tunnel::open`] blocks for as long as ssh takes to authenticate -- as
+/// long as a user takes to answer a prompt -- so both GUI hosts run it on a
+/// worker and keep their event loop turning. An exit during that wait finds
+/// the worker asleep in the readiness loop holding the only reference to the
+/// child, and a process that exits does not unwind its threads: ssh went on
+/// forwarding with no window behind it, and its `0700` socket directory
+/// stayed behind. Waiting for the worker is no answer either, because what
+/// it is waiting on may be a passphrase prompt nobody is going to answer.
+///
+/// So the child is shared with this handle from the moment it is spawned,
+/// and the exiting path kills through it -- the process first, then the
+/// directory the process would otherwise recreate the socket in -- and only
+/// then waits a moment for the worker to notice and return. One handle serves
+/// every tunnel an [`Endpoint`] opens over its life, which is why it registers
+/// the current child rather than being made for one.
+#[derive(Clone, Debug, Default)]
+pub struct KillHandle(Arc<Mutex<KillState>>);
+
+#[derive(Debug, Default)]
+struct KillState {
+    /// Set by `kill`, so a tunnel that registers afterwards -- the worker was
+    /// between spawning and registering -- is stopped on arrival rather than
+    /// surviving a request that came a moment early.
+    killed: bool,
+    child: Option<Arc<Mutex<Child>>>,
+    /// The socket and its directory, removed once the child is gone. Always
+    /// `None` where the local end is a port.
+    socket: Option<(PathBuf, PathBuf)>,
+}
+
+impl KillHandle {
+    /// Kill the registered ssh, if there is one, and remove its socket
+    /// directory. A tunnel registered later is killed as it arrives.
+    pub fn kill(&self) {
+        let mut state = lock(&self.0);
+        state.killed = true;
+        Self::stop_registered(&mut state);
+    }
+
+    fn register(&self, child: &Arc<Mutex<Child>>, socket: Option<(PathBuf, PathBuf)>) {
+        let mut state = lock(&self.0);
+        state.child = Some(child.clone());
+        state.socket = socket;
+        if state.killed {
+            Self::stop_registered(&mut state);
+        }
+    }
+
+    fn stop_registered(state: &mut KillState) {
+        if let Some(child) = state.child.take() {
+            stop(&mut lock(&child));
+        }
+        if let Some((socket, dir)) = state.socket.take() {
+            let _ = std::fs::remove_file(socket);
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
+/// Lock, poisoned or not: nothing guarded here is left half-changed by a
+/// panic, and a poisoned tunnel at exit must still be killable.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Kill and reap. Both are best effort: a child already reaped, by the
+/// tunnel or by the handle, answers with an error that means "done".
+fn stop(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Start ssh.
+///
+/// On Linux the child is also armed to die with this process
+/// (`PR_SET_PDEATHSIG`), so a crash cannot leave it forwarding a port with
+/// nothing behind it. The trap in that flag is what the kernel means by
+/// "parent": the *thread* that forked, not the process. Armed from a connect
+/// worker, ssh would be killed the moment the worker returned -- which is the
+/// moment the tunnel came up -- so every ssh is forked from one thread that
+/// never exits, and the signal means what it reads as.
+#[cfg(target_os = "linux")]
+fn spawn_ssh(mut command: Command) -> std::io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+    use std::sync::OnceLock;
+
+    type Job = (Command, crossbeam_channel::Sender<std::io::Result<Child>>);
+    static SPAWNER: OnceLock<Option<crossbeam_channel::Sender<Job>>> = OnceLock::new();
+
+    let spawner = SPAWNER.get_or_init(|| {
+        let (jobs, queue) = crossbeam_channel::unbounded::<Job>();
+        let started = std::thread::Builder::new()
+            .name("ssh-spawner".into())
+            .spawn(move || {
+                for (mut command, reply) in queue {
+                    let _ = reply.send(command.spawn());
+                }
+            });
+        match started {
+            Ok(_) => Some(jobs),
+            Err(e) => {
+                log::warn!("ssh will not be tied to this process's lifetime: {e}");
+                None
+            }
+        }
+    });
+    let Some(spawner) = spawner else {
+        return command.spawn();
+    };
+    let parent = std::process::id();
+    // SAFETY: prctl and getppid are async-signal-safe and touch nothing the
+    // parent's other threads could be holding across the fork.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Armed only from here on: a parent that died in between never
+            // sends it, so the child checks that it still has one.
+            if libc::getppid() as u32 != parent {
+                return Err(std::io::Error::other(
+                    "the client exited before ssh started",
+                ));
+            }
+            Ok(())
+        });
+    }
+    let gone = || std::io::Error::other("the ssh spawner thread is gone");
+    let (reply, spawned) = crossbeam_channel::bounded(1);
+    spawner.send((command, reply)).map_err(|_| gone())?;
+    spawned.recv().map_err(|_| gone())?
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_ssh(mut command: Command) -> std::io::Result<Child> {
+    command.spawn()
 }
 
 // ---- the tunnel ------------------------------------------------------
 
 /// A running SSH tunnel; killed on drop.
 pub struct Tunnel {
-    child: Child,
+    /// Shared with the [`KillHandle`] it was opened with, if any, so an exit
+    /// can reach it while `open` still holds this `Tunnel` on a worker.
+    child: Arc<Mutex<Child>>,
     stderr: Option<stderr::Capture>,
     local: LocalAddr,
     /// The connection the readiness check made, kept for the real client to
@@ -575,7 +730,7 @@ pub struct Tunnel {
 
 impl std::fmt::Debug for Tunnel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Tunnel(pid {}, {})", self.child.id(), self.local)
+        write!(f, "Tunnel(pid {}, {})", self.child().id(), self.local)
     }
 }
 
@@ -587,6 +742,17 @@ impl Tunnel {
     /// the connection manager -- so `timeout` is generous and bounds the whole
     /// wait rather than one attempt.
     pub fn open(cfg: &TunnelConfig, timeout: Duration) -> Result<Self> {
+        Self::start(cfg, timeout, None)
+    }
+
+    /// [`Tunnel::open`], with the child registered on `kill` as soon as it
+    /// exists, so a caller that has moved this call onto a worker can still
+    /// stop it -- see [`KillHandle`].
+    pub fn open_with(cfg: &TunnelConfig, timeout: Duration, kill: &KillHandle) -> Result<Self> {
+        Self::start(cfg, timeout, Some(kill))
+    }
+
+    fn start(cfg: &TunnelConfig, timeout: Duration, kill: Option<&KillHandle>) -> Result<Self> {
         if cfg.destination.is_empty() {
             bail!("no SSH destination given");
         }
@@ -608,12 +774,22 @@ impl Tunnel {
         for (k, v) in &cfg.env {
             command.env(k, v);
         }
-        let child = command.spawn().with_context(|| {
+        let child = spawn_ssh(command).with_context(|| {
             format!(
                 "could not run '{}'; is an OpenSSH client installed?",
                 cfg.ssh_program
             )
         })?;
+        let child = Arc::new(Mutex::new(child));
+        if let Some(kill) = kill {
+            #[cfg(unix)]
+            let socket = _socket_dir
+                .as_ref()
+                .map(|d| (d.socket.clone(), d.dir.clone()));
+            #[cfg(not(unix))]
+            let socket = None;
+            kill.register(&child, socket);
+        }
         // Own the child before anything else can fail, so every error path
         // kills and reaps it before removing its private socket directory.
         let mut tunnel = Self {
@@ -624,13 +800,18 @@ impl Tunnel {
             #[cfg(unix)]
             _socket_dir,
         };
-        if let Some(pipe) = tunnel.child.stderr.take() {
+        // Each guard is dropped on its own line: held across `diagnostic`
+        // or the capture it would deadlock the kill handle and, on the
+        // readiness loop below, block an exit for the whole authentication.
+        let pipe = tunnel.child().stderr.take();
+        if let Some(pipe) = pipe {
             tunnel.stderr =
                 Some(stderr::Capture::start(pipe).context("capturing SSH diagnostics")?);
         }
         let deadline = Instant::now() + timeout;
         let probe = loop {
-            if let Some(status) = tunnel.child.try_wait()? {
+            let exited = tunnel.child().try_wait()?;
+            if let Some(status) = exited {
                 bail!(
                     "ssh exited before the tunnel came up ({status}){}",
                     tunnel.diagnostic()
@@ -702,9 +883,13 @@ impl Tunnel {
         }
     }
 
+    fn child(&self) -> MutexGuard<'_, Child> {
+        lock(&self.child)
+    }
+
     /// Whether `ssh` is still running.
     pub fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        matches!(self.child().try_wait(), Ok(None))
     }
 
     /// Open another connection to a tunnel that is already up.
@@ -735,8 +920,7 @@ impl Tunnel {
     }
 
     fn stop_process(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        stop(&mut self.child());
     }
 }
 
@@ -777,6 +961,9 @@ pub struct SshEndpoint {
     tunnel: Option<Tunnel>,
     cfg: TunnelConfig,
     timeout: Duration,
+    /// Every tunnel this endpoint opens registers here, so whoever holds a
+    /// clone can stop one while `connect` is out on a worker.
+    kill: KillHandle,
 }
 
 impl Endpoint {
@@ -787,7 +974,30 @@ impl Endpoint {
             tunnel: None,
             cfg,
             timeout,
+            kill: KillHandle::default(),
         }))
+    }
+
+    /// A handle that stops this endpoint's ssh from another thread.
+    ///
+    /// Taken before the endpoint is moved onto a connect worker, because
+    /// afterwards there is no other way to reach it. For a direct endpoint
+    /// there is nothing to stop and the handle does nothing.
+    pub fn kill_handle(&self) -> KillHandle {
+        match self {
+            Self::Direct(_) => KillHandle::default(),
+            Self::Ssh(e) => e.kill.clone(),
+        }
+    }
+
+    /// Stop the tunnel, if one is up, and forget it.
+    ///
+    /// For the exit paths that end the process without dropping what holds
+    /// this endpoint; a later `connect` would start ssh afresh.
+    pub fn close(&mut self) {
+        if let Self::Ssh(e) = self {
+            e.tunnel = None;
+        }
     }
 
     /// Reach an address that is already tunnelled.
@@ -820,7 +1030,7 @@ impl Endpoint {
                 if let Some(t) = e.tunnel.as_mut() {
                     return t.redial();
                 }
-                let mut t = Tunnel::open(&e.cfg, e.timeout)?;
+                let mut t = Tunnel::open_with(&e.cfg, e.timeout, &e.kill)?;
                 // The readiness check's own connection, handed on rather than
                 // dropped -- dropping it is a client connecting and leaving,
                 // which evicts whoever else is attached to the session.
@@ -854,7 +1064,7 @@ fn choose_local_end(cfg: &TunnelConfig) -> Result<(LocalAddr, Option<SocketDirOp
     #[cfg(unix)]
     {
         if cfg.local_port == 0 {
-            let dir = create_socket_dir()?;
+            let dir = create_socket_dir().map_err(with_port_fallback_hint)?;
             let path = dir.socket.clone();
             return Ok((LocalAddr::Socket(path), Some(dir)));
         }
@@ -1124,9 +1334,11 @@ mod tests {
         assert!(dir.dir.starts_with("/tmp"), "{:?}", dir.dir);
         drop(dir);
 
-        // With no usable base left it is an error -- and one that names the
-        // only way a user has to get a working tunnel out of this machine.
+        // With no usable base left it is an error -- and, with the tunnel's
+        // hint attached, one that names the only way a user has to get a
+        // working tunnel out of this machine.
         let err = create_socket_dir_in(&[too_long, missing])
+            .map_err(with_port_fallback_hint)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--local-port"), "{err}");
@@ -1647,6 +1859,123 @@ mod tests {
         // And it is still not ready, so a caller retrying knows it will be
         // starting ssh again rather than dialling something that is up.
         assert!(!e.is_ready());
+    }
+
+    /// The exit case: `open` is out on a worker, ssh is "authenticating"
+    /// (a fake that never brings the forward up), and the process wants to
+    /// leave. The kill goes through the handle, from this thread, and must
+    /// leave neither the process nor its directory behind -- before the
+    /// worker has been heard from, because at a real exit it may not be.
+    #[cfg(unix)]
+    #[test]
+    fn a_kill_handle_stops_an_ssh_that_is_still_authenticating() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("argv");
+        let pid_file = dir.path().join("pid");
+        let script = fake_ssh(
+            dir.path(),
+            &format!(
+                "echo \"$@\" > {}\necho $$ > {}\nexec sleep 30",
+                record.display(),
+                pid_file.display()
+            ),
+        );
+        let cfg = TunnelConfig {
+            destination: "x".into(),
+            ssh_program: script.display().to_string(),
+            ..Default::default()
+        };
+        let kill = KillHandle::default();
+        let worker = {
+            let kill = kill.clone();
+            std::thread::spawn(move || Tunnel::open_with(&cfg, Duration::from_secs(30), &kill))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (socket, pid) = loop {
+            let argv = std::fs::read_to_string(&record).unwrap_or_default();
+            let pid = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            match listen_path_of(&argv) {
+                Some(path) if !pid.trim().is_empty() => break (path, pid.trim().to_string()),
+                _ if Instant::now() > deadline => panic!("the fake ssh never started"),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        let parent = socket.parent().unwrap().to_path_buf();
+        assert!(parent.is_dir(), "{}", parent.display());
+
+        kill.kill();
+        // Both gone by the time `kill` returns, with no help from the worker.
+        assert!(!parent.exists(), "the socket directory was left behind");
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "ssh survived the kill handle");
+        // And the worker comes back promptly with an error, rather than
+        // sitting out the rest of its timeout on a process that is gone.
+        let started = Instant::now();
+        assert!(worker.join().unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A handle killed before the worker got as far as spawning stops the
+    /// ssh on arrival: the exit does not wait, so the order is not chosen.
+    #[cfg(unix)]
+    #[test]
+    fn a_kill_that_comes_first_still_stops_the_ssh() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_ssh(dir.path(), "exec sleep 30");
+        let cfg = TunnelConfig {
+            destination: "x".into(),
+            ssh_program: script.display().to_string(),
+            ..Default::default()
+        };
+        let kill = KillHandle::default();
+        kill.kill();
+        let started = Instant::now();
+        let err = Tunnel::open_with(&cfg, Duration::from_secs(30), &kill)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exited"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The parent-death signal names the forking *thread* as the parent, and
+    /// both GUI hosts open tunnels on workers that return the moment the
+    /// tunnel is up. A tunnel that died with its worker would be a client
+    /// that connects and is cut off at once, on Linux only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tunnel_outlives_the_thread_that_opened_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_ssh(dir.path(), "exec sleep 30");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+                std::mem::forget(stream);
+            }
+        });
+        let cfg = TunnelConfig {
+            destination: "x".into(),
+            ssh_program: script.display().to_string(),
+            local_port: port,
+            ..Default::default()
+        };
+        let mut tunnel = std::thread::spawn(move || Tunnel::open(&cfg, Duration::from_secs(30)))
+            .join()
+            .unwrap()
+            .unwrap();
+        // The signal, if it were coming, would have been delivered when the
+        // thread above ended; give the kernel a moment to prove it was not.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(tunnel.is_alive(), "ssh died with the thread that opened it");
+        tunnel.close();
     }
 
     /// The listen half of the `-L` argument in a recorded command line.

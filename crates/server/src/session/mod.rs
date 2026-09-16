@@ -127,4 +127,8 @@ pub enum CoreEvent {
     FileOpened(Box<fileio::FileOpened>),
     /// The file worker can make more transfer progress.
     FileReady,
+    /// A paste in the session is reading a client-copied file whose contents
+    /// have not been fetched yet. Carries nothing: the fetch itself waits on
+    /// the clipboard batch's own queue, this only wakes the core to drain it.
+    ClipboardFetch,
 }

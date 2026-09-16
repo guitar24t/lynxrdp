@@ -12,7 +12,9 @@ use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 
 const MAX_MESSAGES: usize = 256;
-const MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Visible to the connection's tests, which fail the writer by overfilling it
+/// -- the one way to do so that does not depend on a socket's timing.
+pub(crate) const MAX_BYTES: usize = 8 * 1024 * 1024;
 const CLOSE_GRACE: Duration = Duration::from_millis(100);
 
 pub(crate) struct Outbound {

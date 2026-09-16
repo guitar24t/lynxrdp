@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use x11rb::connection::{Connection, RequestConnection};
-use x11rb::protocol::xproto::{self, ConnectionExt as _, ImageOrder};
+use x11rb::protocol::xproto::{self, ConnectionExt as _, ImageOrder, VisualClass};
 use x11rb::protocol::{damage, randr, shm, xfixes, xtest};
 use x11rb::rust_connection::RustConnection;
 
@@ -74,6 +74,12 @@ impl XDisplay {
         if depth != 24 && depth != 32 {
             bail!("unsupported root depth {depth}; LynxRDP needs a 24-bit TrueColor screen");
         }
+        check_pixel_format(
+            depth,
+            &setup.pixmap_formats,
+            screen.root_visual,
+            &screen.allowed_depths,
+        )?;
         let msb_first = setup.image_byte_order == ImageOrder::MSB_FIRST;
         let size = (
             u32::from(screen.width_in_pixels),
@@ -116,9 +122,14 @@ impl XDisplay {
             let v = randr::query_version(&conn, 1, 4)?
                 .reply()
                 .context("randr version")?;
-            if (v.major_version, v.minor_version) < (1, 2) {
+            // 1.3, not 1.2: `resize::resize_screen` opens with
+            // GetScreenResourcesCurrent, which 1.3 added. A 1.2 server
+            // answers that with BadRequest, so admitting it here would turn
+            // every client resize into a failure report instead of the
+            // honest "unsupported" this produces.
+            if (v.major_version, v.minor_version) < (1, 3) {
                 log::warn!(
-                    "RANDR {}.{} too old; resizing disabled",
+                    "RANDR {}.{} too old (1.3 needed); resizing disabled",
                     v.major_version,
                     v.minor_version
                 );
@@ -224,5 +235,119 @@ impl XDisplay {
     /// Intern an atom.
     pub fn atom(&self, name: &str) -> Result<xproto::Atom> {
         Ok(self.conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
+    }
+}
+
+/// Refuse a screen whose pixels are not laid out the way capture reads them.
+///
+/// The root depth alone does not fix the bytes GetImage returns. `capture`
+/// reads 32-bit ZPixmap words with red in bits 16-23, which is what every
+/// Xvfb and stock Xorg produce for a depth-24 root -- but an Xorg started
+/// with `-fbbpp 24` packs three bytes per pixel, and a BGR TrueColor visual
+/// keeps the word size and swaps two channels. Neither is reachable through
+/// the daemon, which starts Xvfb itself; both are through `--display`. The
+/// packed case used to surface as an "unexpected shm image size" on the
+/// first frame, which ends the whole desktop, and the swapped one as a
+/// desktop with its colours wrong, so both are refused here at connect.
+fn check_pixel_format(
+    depth: u8,
+    formats: &[xproto::Format],
+    root_visual: xproto::Visualid,
+    depths: &[xproto::Depth],
+) -> Result<()> {
+    let bpp = formats
+        .iter()
+        .find(|f| f.depth == depth)
+        .map(|f| f.bits_per_pixel);
+    if bpp != Some(32) {
+        bail!(
+            "unsupported pixel format: depth {depth} is {} bits per pixel; LynxRDP needs 32",
+            bpp.map_or("an unlisted number of".to_string(), |b| b.to_string())
+        );
+    }
+    let visual = depths
+        .iter()
+        .flat_map(|d| d.visuals.iter())
+        .find(|v| v.visual_id == root_visual)
+        .ok_or_else(|| anyhow!("root visual {root_visual:#x} is not among the screen's visuals"))?;
+    let masks = (visual.red_mask, visual.green_mask, visual.blue_mask);
+    if visual.class != VisualClass::TRUE_COLOR || masks != (0xff_0000, 0xff00, 0xff) {
+        bail!(
+            "unsupported root visual: class {:?} with masks r={:#x} g={:#x} b={:#x}; \
+             LynxRDP needs TrueColor with 0xff0000/0xff00/0xff",
+            visual.class,
+            masks.0,
+            masks.1,
+            masks.2
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn visual(class: VisualClass, red: u32, green: u32, blue: u32) -> xproto::Visualtype {
+        xproto::Visualtype {
+            visual_id: 0x21,
+            class,
+            bits_per_rgb_value: 8,
+            colormap_entries: 256,
+            red_mask: red,
+            green_mask: green,
+            blue_mask: blue,
+        }
+    }
+
+    fn format(depth: u8, bits_per_pixel: u8) -> xproto::Format {
+        xproto::Format {
+            depth,
+            bits_per_pixel,
+            scanline_pad: 32,
+        }
+    }
+
+    fn depths(v: xproto::Visualtype) -> Vec<xproto::Depth> {
+        vec![
+            xproto::Depth {
+                depth: 1,
+                visuals: vec![],
+            },
+            xproto::Depth {
+                depth: 24,
+                visuals: vec![v],
+            },
+        ]
+    }
+
+    /// What Xvfb advertises for `-screen 0 WxHx24`.
+    #[test]
+    fn xvfb_default_screen_is_accepted() {
+        let formats = [format(1, 1), format(24, 32), format(32, 32)];
+        let v = visual(VisualClass::TRUE_COLOR, 0xff_0000, 0xff00, 0xff);
+        check_pixel_format(24, &formats, 0x21, &depths(v)).unwrap();
+    }
+
+    /// An Xorg started with `-fbbpp 24` packs pixels into three bytes; the
+    /// capture path cannot read that, so it must be refused before the first
+    /// frame rather than by it.
+    #[test]
+    fn packed_24_bit_pixels_are_refused() {
+        let formats = [format(24, 24)];
+        let v = visual(VisualClass::TRUE_COLOR, 0xff_0000, 0xff00, 0xff);
+        let err = check_pixel_format(24, &formats, 0x21, &depths(v)).unwrap_err();
+        assert!(err.to_string().contains("24 bits per pixel"), "{err}");
+    }
+
+    #[test]
+    fn swapped_or_indexed_visuals_are_refused() {
+        let formats = [format(24, 32)];
+        let bgr = visual(VisualClass::TRUE_COLOR, 0xff, 0xff00, 0xff_0000);
+        assert!(check_pixel_format(24, &formats, 0x21, &depths(bgr)).is_err());
+        let indexed = visual(VisualClass::PSEUDO_COLOR, 0, 0, 0);
+        assert!(check_pixel_format(24, &formats, 0x21, &depths(indexed)).is_err());
+        let rgb = visual(VisualClass::TRUE_COLOR, 0xff_0000, 0xff00, 0xff);
+        assert!(check_pixel_format(24, &formats, 0x99, &depths(rgb)).is_err());
     }
 }

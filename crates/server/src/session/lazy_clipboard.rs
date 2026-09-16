@@ -1,1 +1,1 @@
-pub use lynxrdp_filecopy::Files;
+pub use lynxrdp_filecopy::{FetchReply, Files};

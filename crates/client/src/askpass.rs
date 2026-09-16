@@ -183,15 +183,32 @@ pub fn ssh_env() -> Vec<(String, String)> {
     if !wanted() {
         return Vec::new();
     }
-    let Ok(exe) = std::env::current_exe() else {
+    // The path captured at startup rather than `current_exe`: after an
+    // in-place update the latter names an unlinked file, and ssh would be
+    // told to run a helper that no longer exists.
+    let Some(exe) = crate::exe_path() else {
         log::warn!("cannot find this executable, so ssh's prompts have nowhere to go");
         return Vec::new();
     };
-    ssh_env_from(
-        &exe,
+    #[allow(unused_mut)]
+    let mut env = ssh_env_from(
+        exe,
         std::env::var_os("SSH_ASKPASS").as_deref(),
         std::env::var_os("SSH_ASKPASS_REQUIRE").as_deref(),
-    )
+    );
+    // Where a broker is running -- macOS, where one process hosts the manager
+    // and every session -- the helper relays to it rather than opening a
+    // window of its own, and it finds the socket in the environment ssh
+    // hands it. Added here, on the way every ssh this process starts goes
+    // through, so the Running Desktops window's ssh gets it as well as a
+    // desktop connection's; it used to be pushed at one call site only, and
+    // the other prompted from a second application. Only with our own
+    // helper, though: a user's chosen askpass has no use for it.
+    #[cfg(unix)]
+    if env.iter().any(|(key, _)| key == HELPER_MARKER) {
+        env.extend(broker::env());
+    }
+    env
 }
 
 /// The pure half of [`ssh_env`].
@@ -275,7 +292,8 @@ fn ask(prompt: &str) -> Option<String> {
             // its "persistence" feature is on, which it is not today -- but
             // the thing it would write is `egui::Memory`, and egui keeps a
             // `TextEditState` per field there, undo history included. That
-            // history is the passphrase. Someone turning the feature on later
+            // history is the passphrase, for as long as the field is open
+            // (`finish` clears it). Someone turning the feature on later
             // to remember the launcher's window size would be writing
             // credentials to disk as a side effect, in a file nobody would
             // think to look in, and this module's whole promise would be gone
@@ -320,6 +338,28 @@ fn height_for(prompt: &str, kind: Kind) -> f32 {
 #[cfg(unix)]
 pub(crate) mod broker;
 
+/// The secret field's id, fixed so that its state can be found afterwards.
+fn secret_field() -> egui::Id {
+    egui::Id::new("lynxrdp-askpass-secret")
+}
+
+/// Drop the undo history egui kept for the secret field.
+///
+/// `TextEdit` records a copy of the text at every undo point, in the
+/// `TextEditState` it stores in the `Context` for as long as the `Context`
+/// lives. For the standalone helper that is until the process exits a moment
+/// later; for the broker it is the connection manager's own context, which
+/// lives for hours, and SECURITY.md promises the passphrase is zeroed once it
+/// has been passed on. Clearing the undoer drops those copies. It cannot zero
+/// them first -- the history is egui's, behind its own types -- so this is
+/// the same best effort as `Ask::drop`, with the same limits.
+fn forget_history(ctx: &egui::Context) {
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, secret_field()) {
+        state.clear_undoer();
+        egui::TextEdit::store_state(ctx, secret_field(), state);
+    }
+}
+
 struct Ask {
     embedded: bool,
     completed: bool,
@@ -351,6 +391,7 @@ impl Ask {
             *slot = answer;
         }
         self.completed = true;
+        forget_history(ctx);
         if !self.embedded {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -416,6 +457,7 @@ impl Ask {
                     let field = ui.add_sized(
                         [ui.available_width(), theme::CONTROL_HEIGHT],
                         egui::TextEdit::singleline(&mut self.secret)
+                            .id(secret_field())
                             .password(true)
                             .font(egui::TextStyle::Monospace),
                     );
@@ -507,6 +549,45 @@ mod tests {
             "Duo two-factor login for alice\nPasscode or option (1-3): ",
         ] {
             assert_eq!(classify(prompt), Kind::Secret, "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn finishing_forgets_the_secret_fields_undo_history() {
+        // The field's history holds a copy of the text at every undo point,
+        // in the `Context`. In the broker that context is the manager
+        // window's and outlives the prompt by hours, so "zeroed once passed
+        // on" is not true unless the history goes when the answer does.
+        use egui::text::CCursorRange;
+        use egui::widgets::text_edit::TextEditState;
+        let ctx = egui::Context::default();
+        let typed = (CCursorRange::default(), "hunter2".to_string());
+        let mut state = TextEditState::default();
+        let mut history = state.undoer();
+        history.add_undo(&(CCursorRange::default(), "hunter".to_string()));
+        history.add_undo(&typed);
+        state.set_undoer(history);
+        state.store(&ctx, secret_field());
+        assert!(egui::TextEdit::load_state(&ctx, secret_field())
+            .unwrap()
+            .undoer()
+            .has_undo(&typed));
+        for answer in [Some("hunter2".to_string()), None] {
+            let mut ask = Ask {
+                embedded: true,
+                completed: false,
+                prompt: "Password: ".into(),
+                kind: Kind::Secret,
+                secret: "hunter2".into(),
+                focused: true,
+                answer: Default::default(),
+            };
+            ask.finish(&ctx, answer);
+            let undoer = egui::TextEdit::load_state(&ctx, secret_field())
+                .unwrap()
+                .undoer();
+            assert!(!undoer.has_undo(&typed));
+            assert!(!undoer.has_undo(&(CCursorRange::default(), String::new())));
         }
     }
 

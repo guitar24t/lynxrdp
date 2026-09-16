@@ -211,37 +211,71 @@ pub fn asset_suffix(platform: &str, flavour: Flavour) -> String {
     }
 }
 
+/// Whether `name` is the `flavour` download for `platform`.
+///
+/// One test for the check, which picks an asset by it, and the install,
+/// which holds the asset it was handed to it before running or unpacking
+/// anything.
+pub fn is_asset(name: &str, platform: &str, flavour: Flavour) -> bool {
+    name.starts_with("lynxrdp-") && name.ends_with(&asset_suffix(platform, flavour))
+}
+
 /// The asset for this platform, if the release has one.
 pub fn asset_for<'a>(release: &'a Release, platform: &str, flavour: Flavour) -> Option<&'a Asset> {
-    let suffix = asset_suffix(platform, flavour);
     release
         .assets
         .iter()
-        .find(|a| a.name.starts_with("lynxrdp-") && a.name.ends_with(&suffix))
+        .find(|a| is_asset(&a.name, platform, flavour))
 }
 
-/// The newest release worth offering, or `None` when there is not one.
+/// Every release newer than `current` that may be offered, with its version.
 ///
 /// Draft releases are never offered: they are not published, and their assets
 /// may not exist yet. A prerelease is offered only when asked for -- see
 /// [`wants_prereleases`] for how that question answers itself.
+fn candidates<'a>(
+    releases: &'a [Release],
+    current: &Version,
+    prereleases: bool,
+) -> impl Iterator<Item = (Version, &'a Release)> + 'a {
+    let current = current.clone();
+    releases
+        .iter()
+        .filter(|r| !r.draft)
+        .filter(move |r| prereleases || !r.prerelease)
+        .filter_map(|r| parse_tag(&r.tag_name).map(|v| (v, r)))
+        .filter(move |(v, _)| *v > current)
+}
+
+/// The newest release worth offering, or `None` when there is not one.
 pub fn pick<'a>(
     releases: &'a [Release],
     current: &Version,
     prereleases: bool,
     platform: &str,
 ) -> Option<&'a Release> {
-    releases
-        .iter()
-        .filter(|r| !r.draft)
-        .filter(|r| prereleases || !r.prerelease)
+    candidates(releases, current, prereleases)
         // A release with nothing for this platform is not an update; offering
         // it would produce a button that can only fail.
-        .filter(|r| asset_for(r, platform, Flavour::Archive).is_some())
-        .filter_map(|r| parse_tag(&r.tag_name).map(|v| (v, r)))
-        .filter(|(v, _)| v > current)
+        .filter(|(_, r)| asset_for(r, platform, Flavour::Archive).is_some())
         .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, r)| r)
+}
+
+/// The newest release newer than `current`, with nothing asked about
+/// downloads.
+///
+/// What a machine with no published build is told about: the newest release
+/// there is, carrying [`Blocker::NoDownload`], rather than silence. The
+/// prerelease choice applies here as everywhere -- the checkbox is in the
+/// same menu on those machines, and a stable-only user told about a release
+/// candidate would be told wrongly.
+pub fn newest<'a>(
+    releases: &'a [Release],
+    current: &Version,
+    prereleases: bool,
+) -> Option<(Version, &'a Release)> {
+    candidates(releases, current, prereleases).max_by(|(a, _), (b, _)| a.cmp(b))
 }
 
 /// Whether to offer prereleases, given what the user asked for and what they
@@ -312,6 +346,9 @@ pub enum Blocker {
     PackageManaged(PathBuf),
     /// No download is published for this machine.
     NoDownload,
+    /// The release has no Windows installer, and this copy sits in Program
+    /// Files, where only the installer can replace it.
+    NoInstaller,
     /// The application is somewhere this user cannot write, and on this
     /// platform there is no installer to hand the job to.
     ReadOnly(PathBuf),
@@ -334,6 +371,10 @@ impl Blocker {
                 std::env::consts::ARCH,
                 std::env::consts::OS
             ),
+            Self::NoInstaller => "This release has no Windows installer, and a copy in Program \
+                 Files can only be replaced by one. Install it by hand from the releases page, or \
+                 wait for a release that ships the installer."
+                .into(),
             Self::ReadOnly(path) => format!(
                 "{} cannot be written by this user. Reinstall over it, or run the update as \
                  someone who can.",
@@ -435,6 +476,35 @@ pub fn flavour_for(plan: &Plan) -> Flavour {
     }
 }
 
+/// Which of a release's files to show for `plan`, and whether it may be
+/// installed.
+///
+/// The asset follows the plan -- a Windows install in Program Files needs the
+/// installer, everything else the plain archive -- and only that flavour
+/// will do. The client cannot elevate, so a copy in Program Files can be
+/// replaced by nothing but the installer, and a release that lacks one is a
+/// release this installation cannot take. That is said as a blocker rather
+/// than papered over with the `.zip`, which the worker would otherwise have
+/// copied to `%TEMP%` and asked the shell to run as if it were `setup.exe`.
+/// The archive is still the file named, because it is the download that
+/// exists.
+pub fn offer_for<'a>(
+    release: &'a Release,
+    platform: &str,
+    plan: Result<Plan, Blocker>,
+) -> Result<(&'a Asset, Option<Blocker>)> {
+    let archive = asset_for(release, platform, Flavour::Archive)
+        .context("the release has no download for this platform")?;
+    let flavour = plan.as_ref().map(flavour_for).unwrap_or(Flavour::Archive);
+    Ok(match flavour {
+        Flavour::Archive => (archive, plan.err()),
+        Flavour::Installer => match asset_for(release, platform, Flavour::Installer) {
+            Some(installer) => (installer, plan.err()),
+            None => (archive, Some(Blocker::NoInstaller)),
+        },
+    })
+}
+
 // ------------------------------------------------------------------ timing
 
 /// Seconds since the epoch, for the last-checked stamp.
@@ -478,6 +548,16 @@ impl Found {
     /// Whether the Install button does anything.
     pub fn installable(&self) -> bool {
         self.blocker.is_none()
+    }
+
+    /// Whether Install would hand the job to the Windows installer.
+    ///
+    /// The installer writes over `lynxrdp.exe`, which every running session
+    /// has mapped, so the launcher has to know this before it offers the
+    /// button. By the asset's name, which [`offer_for`] guarantees is the
+    /// plan's own flavour.
+    pub fn via_installer(&self) -> bool {
+        self.asset.name.ends_with("-setup.exe")
     }
 }
 
@@ -677,70 +757,80 @@ mod worker {
         let repo = repo().context("this build has no GitHub repository to ask about")?;
         let platform = platform();
         let current = current_version();
+        let allow_pre = wants_prereleases(prereleases, &current);
         let json = fetch::releases(&repo, RELEASE_PAGE)?;
         let releases = parse_releases(&json)?;
         // With no platform key there is no asset to look for, so there is
         // nothing to offer even when a newer release exists. Said as a
         // blocker on the newest release we can name, rather than as silence.
         let Some(platform) = platform else {
-            let newest = releases
-                .iter()
-                .filter(|r| !r.draft)
-                .filter_map(|r| parse_tag(&r.tag_name).map(|v| (v, r)))
-                .filter(|(v, _)| *v > current)
-                .max_by(|(a, _), (b, _)| a.cmp(b));
-            return Ok(newest.map(|(version, r)| Found {
-                tag: r.tag_name.clone(),
-                version,
-                notes_url: r.html_url.clone(),
-                published: r.published_at.clone(),
-                asset: Asset {
-                    name: String::new(),
-                    browser_download_url: String::new(),
-                    size: 0,
-                },
-                blocker: Some(Blocker::NoDownload),
-            }));
+            return Ok(
+                newest(&releases, &current, allow_pre).map(|(version, r)| Found {
+                    tag: r.tag_name.clone(),
+                    version,
+                    notes_url: r.html_url.clone(),
+                    published: r.published_at.clone(),
+                    asset: Asset {
+                        name: String::new(),
+                        browser_download_url: String::new(),
+                        size: 0,
+                    },
+                    blocker: Some(Blocker::NoDownload),
+                }),
+            );
         };
-        let allow_pre = wants_prereleases(prereleases, &current);
         let Some(release) = pick(&releases, &current, allow_pre, platform) else {
             return Ok(None);
         };
         let version = parse_tag(&release.tag_name).context("the chosen release has no version")?;
-        let exe = std::env::current_exe().context("finding this executable")?;
+        // The path captured at startup: on macOS the tarball starts the
+        // application through a symlink, and a plan made from that path
+        // would replace the symlink rather than the bundle behind it.
+        let exe = crate::exe_path().context("finding this executable")?;
         let plan = plan_for(
-            &exe,
+            exe,
             std::env::consts::OS,
             current_tag().is_some(),
-            install::can_write(&exe),
+            install::can_write(exe),
         );
-        // The asset follows the plan: a Windows install in Program Files
-        // needs the installer, everything else the plain archive.
-        let flavour = plan.as_ref().map(flavour_for).unwrap_or(Flavour::Archive);
-        let asset = asset_for(release, platform, flavour)
-            .or_else(|| asset_for(release, platform, Flavour::Archive))
-            .context("the release has no download for this platform")?;
+        let (asset, blocker) = offer_for(release, platform, plan)?;
         Ok(Some(Found {
             tag: release.tag_name.clone(),
             version,
             notes_url: release.html_url.clone(),
             published: release.published_at.clone(),
             asset: asset.clone(),
-            blocker: plan.err(),
+            blocker,
         }))
     }
 
     /// Download, verify, and put in place.
     pub fn install(found: &Found, progress: &dyn Fn(u64, Option<u64>)) -> Result<Outcome> {
         let repo = repo().context("this build has no GitHub repository to ask about")?;
-        let exe = std::env::current_exe().context("finding this executable")?;
+        let platform = platform().context("no download is published for this platform")?;
+        let exe = crate::exe_path().context("finding this executable")?;
         let plan = plan_for(
-            &exe,
+            exe,
             std::env::consts::OS,
             current_tag().is_some(),
-            install::can_write(&exe),
+            install::can_write(exe),
         )
         .map_err(|b| anyhow::anyhow!("{}", b.explain()))?;
+        // The plan is remade here rather than trusted from the check, and
+        // the asset is held to it: what is run as an installer or unpacked
+        // as an archive has to be the flavour this installation needs, not
+        // whatever the check happened to be holding.
+        let flavour = flavour_for(&plan);
+        if !is_asset(&found.asset.name, platform, flavour) {
+            bail!(
+                "{} is not the {} this installation needs",
+                found.asset.name,
+                match flavour {
+                    Flavour::Installer => "Windows installer",
+                    Flavour::Archive => "archive",
+                }
+            );
+        }
 
         // Somewhere to put the download that is not the directory being
         // replaced: the staging for the swap itself has to be on the target's
@@ -788,13 +878,16 @@ mod worker {
 /// build. Running sessions are separate processes and are left alone, which
 /// is the same promise closing the window already makes.
 pub fn restart() -> Result<()> {
-    let exe = std::env::current_exe().context("finding this executable")?;
+    // The path captured at startup, not what the kernel says now: on Linux
+    // the new build was renamed over the old one, so `current_exe` names an
+    // unlinked file while this path names the build to start.
+    let exe = crate::exe_path().context("finding this executable")?;
     // The executable rather than the bundle, on macOS as everywhere else:
     // starting `LynxRDP.app/Contents/MacOS/lynxrdp` *is* starting the
     // application -- macOS reads the Info.plist beside it -- and it does not
     // need `open`, which would go through Launch Services and hand us a
     // failure we could not explain.
-    std::process::Command::new(&exe)
+    std::process::Command::new(exe)
         .spawn()
         .with_context(|| format!("restarting {}", exe.display()))?;
     Ok(())
@@ -905,6 +998,77 @@ mod tests {
         // An explicit choice is obeyed in both directions.
         assert!(!wants_prereleases(Some(false), &rc));
         assert!(wants_prereleases(Some(true), &stable));
+    }
+
+    #[test]
+    fn a_machine_with_no_download_still_hears_only_the_releases_it_asked_for() {
+        // The no-platform answer used to skip the prerelease filter, so an
+        // Intel Mac on a stable build was told about every candidate.
+        let releases = vec![
+            release("v0.1.0", false, &every_asset()),
+            release("v0.2.0-rc.1", true, &every_asset()),
+        ];
+        let current = parse_tag("v0.0.9").unwrap();
+        assert_eq!(
+            newest(&releases, &current, false).unwrap().1.tag_name,
+            "v0.1.0"
+        );
+        assert_eq!(
+            newest(&releases, &current, true).unwrap().1.tag_name,
+            "v0.2.0-rc.1"
+        );
+        let mut draft = release("v9.9.9", false, &[]);
+        draft.draft = true;
+        assert!(newest(&[draft], &current, true).is_none());
+        assert!(newest(&releases, &parse_tag("v0.2.0").unwrap(), true).is_none());
+    }
+
+    #[test]
+    fn a_release_without_an_installer_is_not_offered_to_a_program_files_install() {
+        // The check used to fall back to the .zip, which the install then
+        // copied to %TEMP% and asked the shell to run as the installer.
+        let zip_only = release("v0.2.0", false, &["lynxrdp-0.2.0-windows-x86_64.zip"]);
+        let (asset, blocker) =
+            offer_for(&zip_only, "windows-x86_64", Ok(Plan::WindowsInstaller)).unwrap();
+        assert!(
+            asset.name.ends_with(".zip"),
+            "the download that exists is named"
+        );
+        assert_eq!(blocker, Some(Blocker::NoInstaller));
+
+        let full = release("v0.2.0", false, &every_asset());
+        let (asset, blocker) =
+            offer_for(&full, "windows-x86_64", Ok(Plan::WindowsInstaller)).unwrap();
+        assert!(asset.name.ends_with("-setup.exe"));
+        assert_eq!(blocker, None);
+        // A portable copy takes the archive, and a blocked plan shows it.
+        let portable = Plan::WindowsExe {
+            target: PathBuf::from(r"C:\u\lynxrdp.exe"),
+        };
+        let (asset, blocker) = offer_for(&full, "windows-x86_64", Ok(portable)).unwrap();
+        assert!(asset.name.ends_with(".zip"));
+        assert_eq!(blocker, None);
+        let (asset, blocker) = offer_for(&full, "linux-x86_64", Err(Blocker::NotARelease)).unwrap();
+        assert!(asset.name.ends_with(".tar.gz"));
+        assert_eq!(blocker, Some(Blocker::NotARelease));
+
+        // And at install time the asset is held to the plan's flavour, so
+        // nothing but setup.exe is ever run as setup.exe.
+        assert!(!is_asset(
+            "lynxrdp-0.2.0-windows-x86_64.zip",
+            "windows-x86_64",
+            Flavour::Installer
+        ));
+        assert!(is_asset(
+            "lynxrdp-0.2.0-windows-x86_64-setup.exe",
+            "windows-x86_64",
+            Flavour::Installer
+        ));
+        assert!(!is_asset(
+            "lynxrdp-0.2.0-windows-x86_64-setup.exe",
+            "windows-x86_64",
+            Flavour::Archive
+        ));
     }
 
     #[test]
@@ -1175,6 +1339,7 @@ not a checksum line
             Blocker::NotARelease,
             Blocker::PackageManaged("/usr/bin/lynxrdp".into()),
             Blocker::NoDownload,
+            Blocker::NoInstaller,
             Blocker::ReadOnly("/opt/lynxrdp".into()),
         ] {
             let text = blocker.explain();

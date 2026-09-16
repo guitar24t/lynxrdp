@@ -39,6 +39,15 @@ pub const MAX_FIELD: usize = 255;
 /// framebuffer a session has to hold grows faster than the window it fills.
 pub const MAX_SCALE: u8 = 4;
 
+/// Smallest screen side a profile may ask for, in pixels.
+///
+/// One constant for the launcher's editor and the command line's own
+/// parser, because the launcher re-invokes this binary with `--size`: a
+/// floor that lived in only one of the two would let a 32x32 profile save
+/// cleanly and then fail with a usage error in a child that has no console
+/// to print it on.
+pub const MIN_SCREEN_SIDE: u16 = 64;
+
 /// How many rejected copies of the connections file we will keep before
 /// refusing to make another. A hundred `.bad` files means something is wrong
 /// that moving a hundred and first aside will not fix.
@@ -51,6 +60,11 @@ pub const MAX_ASIDE: u32 = 100;
 /// unset fields buries the two or three lines that actually say anything.
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// What an absent opt-out switch means, for `serde(default)`.
+fn default_true() -> bool {
+    true
 }
 
 /// One saved connection.
@@ -92,8 +106,17 @@ pub struct Profile {
     #[serde(skip_serializing_if = "is_false")]
     pub fullscreen: bool,
     /// Let the remote screen follow the window size.
+    ///
+    /// On when the key is absent, as is `clipboard`. The launcher writes
+    /// both keys every time, but the file is documented as hand-editable,
+    /// and an entry someone adds with only a name and a host should get the
+    /// session a new connection in the editor gets -- not one with both
+    /// conveniences silently off, which is what the struct's own `Default`
+    /// would give it.
+    #[serde(default = "default_true")]
     pub dynamic_resize: bool,
     /// Synchronise the clipboard.
+    #[serde(default = "default_true")]
     pub clipboard: bool,
 }
 
@@ -150,12 +173,26 @@ impl Profile {
         if self.user.contains('@') || self.user.split_whitespace().count() > 1 {
             return Some("The user must not contain '@' or spaces.".into());
         }
+        // For the same reason as the host: each of these is the argument
+        // after `--identity` or `--ssh-option` on the child's command line,
+        // and clap refuses a value that starts with a dash. `-o Key=value`
+        // is the shape the README's command-line example invites, so it is
+        // named rather than left as a usage error nobody can see.
+        if self
+            .identity
+            .as_ref()
+            .is_some_and(|p| p.to_string_lossy().starts_with('-'))
+        {
+            return Some("The identity file must not start with '-'.".into());
+        }
         if self.ssh_port == Some(0) || self.remote_port == Some(0) {
             return Some("Ports must be between 1 and 65535.".into());
         }
         if let Some((w, h)) = self.size {
-            if w == 0 || h == 0 {
-                return Some("The screen size must be positive.".into());
+            if w < MIN_SCREEN_SIDE || h < MIN_SCREEN_SIDE {
+                return Some(format!(
+                    "The screen size must be at least {MIN_SCREEN_SIDE}x{MIN_SCREEN_SIDE}."
+                ));
             }
         }
         if let Some(scale) = self.scale {
@@ -166,6 +203,11 @@ impl Profile {
         for option in &self.ssh_options {
             if option.trim().is_empty() {
                 return Some("An SSH option is blank.".into());
+            }
+            if option.starts_with('-') {
+                return Some(format!(
+                    "SSH option {option:?} should be written without the -o, like ProxyJump=bastion."
+                ));
             }
             if !option.contains('=') {
                 return Some(format!("SSH option {option:?} should look like Key=value."));
@@ -248,6 +290,16 @@ impl Profiles {
     }
 
     /// Parse, rejecting a file that would make the launcher unusable.
+    ///
+    /// Two entries with one name are told apart here rather than refused.
+    /// The name is the key everywhere else -- [`Self::upsert`],
+    /// [`Self::remove`], the editor's clash check -- so a duplicate that got
+    /// through would make Delete on the second entry remove the first, and
+    /// an edit of the second overwrite it, both saved to disk before anyone
+    /// could notice. A copied-and-pasted entry whose name was not changed is
+    /// the ordinary way a hand-edited file comes to have one, and renaming
+    /// it is what the user would have done next; import does the same to an
+    /// incoming clash.
     pub fn from_toml(text: &str) -> Result<Self> {
         let parsed: Self = toml::from_str(text).context("parsing connections")?;
         if parsed.items.len() > MAX_PROFILES {
@@ -256,7 +308,14 @@ impl Profiles {
                 parsed.items.len()
             );
         }
-        Ok(parsed)
+        let mut unique = Self::default();
+        for mut profile in parsed.items {
+            if unique.position(&profile.name).is_some() {
+                profile.name = unique.unique_name(&profile.name);
+            }
+            unique.items.push(profile);
+        }
+        Ok(unique)
     }
 
     /// Serialise.
@@ -273,6 +332,16 @@ impl Profiles {
     /// on disk before the rename. `temp_path` and `write_durably` say what
     /// goes wrong without each.
     pub fn save(&self, path: &Path) -> Result<()> {
+        // The reader refuses a file with more entries than this, so writing
+        // one would turn the next start into the read-only state, with no
+        // way back but moving the file aside. Everything that adds an entry
+        // checks before it does; this is the backstop behind them.
+        if self.items.len() > MAX_PROFILES {
+            bail!(
+                "{} connections is more than the {MAX_PROFILES} supported",
+                self.items.len()
+            );
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -377,7 +446,9 @@ impl Profiles {
 /// the mixture. A pid is enough to separate them -- a single process only
 /// ever saves from its own UI thread -- and it keeps the leftover, if a save
 /// dies outright, identifiable rather than anonymous.
-fn temp_path(path: &Path) -> PathBuf {
+///
+/// Shared with the settings file, which stages its writes the same way.
+pub(crate) fn temp_path(path: &Path) -> PathBuf {
     with_suffix(path, &format!(".{}.new", std::process::id()))
 }
 
@@ -389,7 +460,7 @@ fn temp_path(path: &Path) -> PathBuf {
 /// points at, so a crash in the wrong second leaves `connections.toml`
 /// present, renamed, and empty -- every saved connection gone, with no
 /// broken file to hint that anything was lost.
-fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
     file.write_all(bytes)?;
     file.sync_all()
@@ -617,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_ports_and_sizes_are_refused() {
+    fn zero_ports_and_undersized_screens_are_refused() {
         let mut p = sample();
         p.ssh_port = Some(0);
         assert!(p.problem().is_some());
@@ -627,6 +698,79 @@ mod tests {
         let mut p = sample();
         p.size = Some((0, 1080));
         assert!(p.problem().is_some());
+        // The command line's floor, not merely "positive": a size the editor
+        // accepts is a size the session it starts must accept too.
+        p.size = Some((MIN_SCREEN_SIDE - 1, 1080));
+        assert!(p.problem().unwrap().contains("at least"));
+        p.size = Some((MIN_SCREEN_SIDE, MIN_SCREEN_SIDE));
+        assert_eq!(p.problem(), None);
+    }
+
+    #[test]
+    fn an_identity_or_option_that_reads_as_a_flag_is_refused() {
+        // Each is the argument after `--identity` or `--ssh-option` when the
+        // launcher re-invokes the binary, and clap refuses a value that
+        // starts with a dash -- in a child with no console to say so on.
+        let mut p = sample();
+        p.identity = Some(PathBuf::from("-k"));
+        assert!(p.problem().unwrap().contains("identity"));
+        let mut p = sample();
+        p.ssh_options = vec!["-o ProxyJump=bastion".into()];
+        let problem = p.problem().unwrap();
+        // Named, because it is the shape the command line's own `-o` invites.
+        assert!(problem.contains("-o"), "{problem}");
+        assert!(problem.contains("ProxyJump=bastion"), "{problem}");
+    }
+
+    #[test]
+    fn an_entry_that_omits_the_switches_gets_the_editor_defaults() {
+        // The file is hand-editable, and an entry typed with only a name and
+        // a host must not come up with the clipboard and resizing off.
+        let text = "[[connection]]\nname = \"terse\"\nhost = \"h\"\n";
+        let store = Profiles::from_toml(text).unwrap();
+        assert!(store.items[0].dynamic_resize);
+        assert!(store.items[0].clipboard);
+        // Saying so explicitly still works both ways.
+        let text = "[[connection]]\nname = \"off\"\nhost = \"h\"\nclipboard = false\n";
+        let store = Profiles::from_toml(text).unwrap();
+        assert!(!store.items[0].clipboard);
+        assert!(store.items[0].dynamic_resize);
+    }
+
+    #[test]
+    fn duplicate_names_in_a_file_are_told_apart_rather_than_merged() {
+        // The name is the key: with two entries called "work", Delete on the
+        // second would remove the first and an edit of the second would
+        // overwrite it. Renaming the second is what import does with a clash
+        // and what the user would have done next.
+        let text = "[[connection]]\nname = \"work\"\nhost = \"a.example\"\n\
+                    [[connection]]\nname = \"work\"\nhost = \"b.example\"\n\
+                    [[connection]]\nname = \"work\"\nhost = \"c.example\"\n";
+        let store = Profiles::from_toml(text).unwrap();
+        let names: Vec<_> = store.items.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["work", "work 2", "work 3"]);
+        // In file order, with every host still there.
+        let hosts: Vec<_> = store.items.iter().map(|p| p.host.as_str()).collect();
+        assert_eq!(hosts, vec!["a.example", "b.example", "c.example"]);
+        assert!(!store.name_taken("work 4", None));
+    }
+
+    #[test]
+    fn a_list_over_the_limit_is_refused_by_save_as_well_as_by_load() {
+        // Writing a 501-entry file would make the next start unreadable, and
+        // the launcher's read-only state is a poor reward for pressing New.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let mut store = Profiles::default();
+        for i in 0..=MAX_PROFILES {
+            store.items.push(Profile::new(format!("n{i}")));
+        }
+        let err = store.save(&path).unwrap_err().to_string();
+        assert!(err.contains(&MAX_PROFILES.to_string()), "{err}");
+        assert!(!path.exists(), "the file was written anyway");
+        store.items.pop();
+        store.save(&path).unwrap();
+        assert!(Profiles::load(&path).is_ok());
     }
 
     #[test]
@@ -916,8 +1060,10 @@ mod tests {
             let key = format!("\n{absent} =");
             assert!(!text.contains(&key), "{absent} should be omitted:\n{text}");
         }
-        // The two opt-out flags must always be written: they default to
-        // false, so leaving them out would quietly turn them off on reload.
+        // The two opt-out flags are still always written, even though an
+        // absent key now reads as on: an older client, whose absent-key
+        // default is off, would otherwise read the same file as a
+        // connection with both switched off.
         assert!(text.contains("dynamic_resize = true"), "{text}");
         assert!(text.contains("clipboard = true"), "{text}");
     }

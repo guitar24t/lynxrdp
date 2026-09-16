@@ -4,7 +4,10 @@
 //! injects them with the XTEST extension. Characters are converted with
 //! [`keysym_from_char`], which follows the X11 convention: Latin-1
 //! characters map to themselves and everything else to
-//! `0x0100_0000 | codepoint`.
+//! `0x0100_0000 | codepoint`. [`char_from_keysym`] reads that form back and
+//! also the legacy character keysyms (`aogonek`, `Cyrillic_ef`, `EuroSign`)
+//! that X keyboard layouts still use, so that a character can be recognised
+//! whichever way it was spelled.
 
 /// Space.
 pub const SPACE: u32 = 0x0020;
@@ -129,10 +132,32 @@ pub fn keysym_from_char(c: char) -> u32 {
 }
 
 /// Unicode character for a keysym, if it represents one.
+///
+/// A character reaches us in one of three spellings. Latin-1 keysyms are the
+/// character itself and the Unicode form is the character plus
+/// `0x0100_0000`; those two are all [`keysym_from_char`] produces, so they
+/// are all a client ever sends. X layouts, though, still spell most letters
+/// outside Latin-1 with the keysyms keysymdef.h assigned before Unicode
+/// existed -- `aogonek` 0x01b1 on the Polish map, `Cyrillic_ef` 0x06c6 on
+/// the Russian one, `EuroSign` 0x20ac -- and a keymap read back from the X
+/// server holds those, never the Unicode form. Decoding the legacy ranges is
+/// what lets the server match the character a client typed against the key
+/// its session layout has for it.
+///
+/// Function, keypad, dead and modifier keysyms are not characters here even
+/// where X gives them one (`KP_7`, `Return`): the server must keep them apart
+/// from the character keys that share the glyph. Control characters in the
+/// Unicode form are refused for the same reason.
 pub fn char_from_keysym(ks: u32) -> Option<char> {
     match ks {
         0x20..=0x7e | 0xa0..=0xff => char::from_u32(ks),
-        0x0100_0000..=0x0110_FFFF => char::from_u32(ks & 0x00FF_FFFF),
+        // The legacy character ranges end with Currency at 0x20ac; the ISO
+        // and dead keys at 0xfe00 and the function keys at 0xff00 are well
+        // clear of them, so the table is the only thing consulted here.
+        0x0100..=0x20ff => xkeysym::Keysym::new(ks)
+            .key_char()
+            .filter(|c| !c.is_control()),
+        0x0100_0000..=0x0110_FFFF => char::from_u32(ks & 0x00FF_FFFF).filter(|c| !c.is_control()),
         _ => None,
     }
 }
@@ -230,6 +255,49 @@ mod tests {
         assert_eq!(keysym_from_char('\t'), TAB);
         assert_eq!(keysym_from_char('\u{8}'), BACKSPACE);
         assert_eq!(char_from_keysym(RETURN), None);
+    }
+
+    /// Rows the X server exports for `setxkbmap pl` and `setxkbmap ru`:
+    /// `key <AC01> { [ a, A, aogonek, Aogonek ] }` and
+    /// `key <AC01> { [ Cyrillic_ef, Cyrillic_EF ] }`. The client sends the
+    /// Unicode form for the same letters, so both spellings must decode to
+    /// one character or the server never finds the key.
+    #[test]
+    fn legacy_layout_keysyms_decode_to_their_characters() {
+        assert_eq!(char_from_keysym(0x01b1), Some('ą'));
+        assert_eq!(char_from_keysym(0x01a1), Some('Ą'));
+        assert_eq!(char_from_keysym(0x06c6), Some('ф'));
+        assert_eq!(char_from_keysym(0x06e6), Some('Ф'));
+        assert_eq!(char_from_keysym(0x20ac), Some('€'));
+        assert_eq!(char_from_keysym(0x07e1), Some('α')); // Greek_alpha
+        assert_eq!(char_from_keysym(0x0ce0), Some('א')); // hebrew_aleph
+        assert_eq!(char_from_keysym(0x05ea), Some('ي')); // Arabic_yeh
+        assert_eq!(char_from_keysym(0x0da1), Some('ก')); // Thai_kokai
+        assert_eq!(keysym_from_char('ą'), 0x0100_0105);
+        assert_eq!(char_from_keysym(0x0100_0105), Some('ą'));
+        assert_eq!(char_from_keysym(0x0100_0444), Some('ф'));
+    }
+
+    /// Keys that only look like characters must stay distinct from the
+    /// character keys with the same glyph, or the server would type a
+    /// keypad 7 for a '7' and vice versa.
+    #[test]
+    fn non_character_keysyms_have_no_character() {
+        for ks in [
+            KP_0 + 7,
+            KP_ENTER,
+            KP_DECIMAL,
+            ISO_LEVEL3_SHIFT,
+            ISO_LEFT_TAB,
+            0xfe50, // dead_grave
+            F1,
+            SHIFT_L,
+            AUDIO_MUTE,
+            0x0100_0008, // BackSpace in the Unicode form
+            0x0100_d800, // a surrogate is not a character
+        ] {
+            assert_eq!(char_from_keysym(ks), None, "{ks:#x}");
+        }
     }
 
     #[test]

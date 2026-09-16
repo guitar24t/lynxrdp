@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use lynxrdp_client::app::{App, AppOptions, Session};
 use lynxrdp_client::connection::{Client, ConnectOptions};
-use lynxrdp_client::profiles::MAX_SCALE;
+use lynxrdp_client::profiles::{MAX_SCALE, MIN_SCREEN_SIDE};
 use lynxrdp_client::tunnel::{parse_destination, Endpoint, RemoteTarget, Tunnel, TunnelConfig};
 
 // Part of the binary rather than the library: it is an entry point, reached
@@ -143,20 +143,29 @@ fn parse_scale(s: &str) -> Result<u8, String> {
     Ok(n)
 }
 
+/// The floor is the profile's, as the scale's ceiling is: the launcher
+/// re-invokes this binary with `--size`, so a size its editor accepts has to
+/// be a size this parser accepts, or a saved connection fails with a usage
+/// error in a child that has no console to print it on.
 fn parse_size(s: &str) -> Result<(u16, u16), String> {
     let (w, h) = s
         .split_once('x')
         .ok_or_else(|| "expected WIDTHxHEIGHT".to_string())?;
     let w: u16 = w.parse().map_err(|_| "bad width".to_string())?;
     let h: u16 = h.parse().map_err(|_| "bad height".to_string())?;
-    if w < 64 || h < 64 {
-        return Err("size must be at least 64x64".into());
+    if w < MIN_SCREEN_SIDE || h < MIN_SCREEN_SIDE {
+        return Err(format!(
+            "size must be at least {MIN_SCREEN_SIDE}x{MIN_SCREEN_SIDE}"
+        ));
     }
     Ok((w, h))
 }
 
 fn main() {
-    // Before everything, including the standard handles. ssh runs this same
+    // First of all: the path is read once and kept, and it has to be read
+    // while it is still true -- see `exe_path` for what an update does to it.
+    let _ = lynxrdp_client::exe_path();
+    // Before everything else, including the standard handles. ssh runs this same
     // binary as its askpass helper and reads the answer from our stdout, so
     // `attach_to_parent` -- which points stdout at the terminal the launcher
     // was started from -- would send the answer somewhere ssh is not looking.
@@ -170,6 +179,9 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
+    // After the logger, so what it removes is on record; before any offer,
+    // which is what a stale root would collide with.
+    lynxrdp_client::app::sweep_stale_clipboard_staging();
     if let Err(e) = run() {
         eprintln!("lynxrdp: {e:#}");
         std::process::exit(1);

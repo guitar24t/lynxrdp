@@ -48,7 +48,44 @@ impl fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 /// Maximum length accepted for any single string or blob (32 MiB).
+///
+/// This bounds the payloads that are legitimately large -- a tile's pixels, a
+/// transfer chunk, clipboard text. A name, path, reason or message is bounded
+/// by [`MAX_TEXT_LEN`] instead.
 pub const MAX_BLOB_LEN: usize = 32 * 1024 * 1024;
+
+/// Maximum byte length of a free-text field: a name, path, reason or message
+/// (4 KiB).
+///
+/// Free text is the one kind of field the receiving side routinely puts back
+/// on the wire with something prepended -- a `FileRequest` path comes back in
+/// the `TransferEnd` that says why it could not be opened -- so a field that
+/// was allowed to fill [`MAX_BLOB_LEN`] exactly guaranteed that the echo could
+/// not be encoded, and the encoder's assert on that unwound the session's main
+/// thread. Capping free text well below the blob limit makes the echo always
+/// fit; 4096 is `PATH_MAX` on Linux, so no path the session could actually
+/// open is refused. [`Reader::text`] enforces it at decode and [`Writer::text`]
+/// truncates rather than fails at encode, so the limit cannot become a panic
+/// on either side.
+pub const MAX_TEXT_LEN: usize = 4096;
+
+/// The longest prefix of `s` that fits in `max` bytes and ends on a character
+/// boundary.
+///
+/// Truncation is logged rather than silent: it means a caller formatted a
+/// peer-supplied string into a field without bounding it first, which is worth
+/// knowing about, but a shortened message is the right degradation for that.
+fn truncated<'a>(s: &'a str, max: usize, what: &str) -> &'a str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    log::warn!("truncating a {} byte {what} field to {max} bytes", s.len());
+    &s[..cut]
+}
 
 /// Growable output buffer.
 #[derive(Default, Debug)]
@@ -130,15 +167,37 @@ impl Writer {
     }
 
     /// Write a length-prefixed blob.
+    ///
+    /// A blob over [`MAX_BLOB_LEN`] is cut to the limit and logged rather than
+    /// asserted on. Nothing in the protocol legitimately produces one -- a
+    /// chunk is `CHUNK_SIZE` and a tile is 64x64 pixels -- so the log line
+    /// reports a bug in the caller; the assert it replaces turned that bug
+    /// into an unwind of the session's main thread, reachable from the wire
+    /// through any string a peer could fill to the limit.
     pub fn bytes(&mut self, bytes: &[u8]) {
-        assert!(bytes.len() <= MAX_BLOB_LEN, "blob exceeds MAX_BLOB_LEN");
+        let bytes = if bytes.len() > MAX_BLOB_LEN {
+            log::error!(
+                "truncating a {} byte blob to MAX_BLOB_LEN ({MAX_BLOB_LEN})",
+                bytes.len()
+            );
+            &bytes[..MAX_BLOB_LEN]
+        } else {
+            bytes
+        };
         self.u32(bytes.len() as u32);
         self.buf.extend_from_slice(bytes);
     }
 
-    /// Write a length-prefixed UTF-8 string.
+    /// Write a length-prefixed UTF-8 string of up to [`MAX_BLOB_LEN`] bytes,
+    /// cut on a character boundary if it is longer.
     pub fn string(&mut self, s: &str) {
-        self.bytes(s.as_bytes());
+        self.bytes(truncated(s, MAX_BLOB_LEN, "string").as_bytes());
+    }
+
+    /// Write a free-text field: a string of up to [`MAX_TEXT_LEN`] bytes, cut
+    /// on a character boundary if it is longer.
+    pub fn text(&mut self, s: &str) {
+        self.bytes(truncated(s, MAX_TEXT_LEN, "text").as_bytes());
     }
 }
 
@@ -242,12 +301,25 @@ impl<'a> Reader<'a> {
         self.take(len)
     }
 
-    /// Read a length-prefixed UTF-8 string.
-    pub fn string(&mut self) -> Result<String, DecodeError> {
-        let b = self.bytes()?;
+    fn string_up_to(&mut self, max: usize) -> Result<String, DecodeError> {
+        let len = self.u32()? as usize;
+        if len > max {
+            return Err(DecodeError::LengthTooLarge(len));
+        }
+        let b = self.take(len)?;
         std::str::from_utf8(b)
             .map(|s| s.to_owned())
             .map_err(|_| DecodeError::InvalidUtf8)
+    }
+
+    /// Read a length-prefixed UTF-8 string of up to [`MAX_BLOB_LEN`] bytes.
+    pub fn string(&mut self) -> Result<String, DecodeError> {
+        self.string_up_to(MAX_BLOB_LEN)
+    }
+
+    /// Read a free-text field: a string of up to [`MAX_TEXT_LEN`] bytes.
+    pub fn text(&mut self) -> Result<String, DecodeError> {
+        self.string_up_to(MAX_TEXT_LEN)
     }
 }
 
@@ -315,5 +387,45 @@ mod tests {
     fn trailing_bytes_detected() {
         let r = Reader::new(&[1]);
         assert_eq!(r.finish(), Err(DecodeError::TrailingBytes(1)));
+    }
+
+    /// The assert this replaced was reachable from the wire: a peer could fill
+    /// a string to exactly `MAX_BLOB_LEN`, and any prefix this side added to
+    /// it before sending it back put the result over the limit.
+    #[test]
+    fn an_oversized_blob_is_cut_rather_than_asserted_on() {
+        let mut w = Writer::new();
+        w.bytes(&vec![7u8; MAX_BLOB_LEN + 1]);
+        assert_eq!(w.len(), 4 + MAX_BLOB_LEN);
+        let mut r = Reader::new(w.as_slice());
+        assert_eq!(r.bytes().unwrap().len(), MAX_BLOB_LEN);
+    }
+
+    #[test]
+    fn text_is_bounded_on_both_sides_and_cut_on_a_character_boundary() {
+        // Three-byte characters, so the limit itself is not a boundary and a
+        // byte-level cut would produce invalid UTF-8.
+        let s = "\u{20ac}".repeat(MAX_TEXT_LEN);
+        let mut w = Writer::new();
+        w.text(&s);
+        let back = Reader::new(w.as_slice()).text().unwrap();
+        assert_eq!(back.len(), MAX_TEXT_LEN - 1);
+        assert!(s.starts_with(&back));
+
+        // Exactly the limit passes; one byte more is refused by the reader...
+        let at_limit = "a".repeat(MAX_TEXT_LEN);
+        let mut w = Writer::new();
+        w.text(&at_limit);
+        assert_eq!(Reader::new(w.as_slice()).text().unwrap(), at_limit);
+        let mut w = Writer::new();
+        w.u32((MAX_TEXT_LEN + 1) as u32);
+        w.raw(&vec![b'a'; MAX_TEXT_LEN + 1]);
+        assert_eq!(
+            Reader::new(w.as_slice()).text(),
+            Err(DecodeError::LengthTooLarge(MAX_TEXT_LEN + 1))
+        );
+        // ...while `string` still admits it: clipboard text is legitimately
+        // larger than any name or path.
+        assert!(Reader::new(w.as_slice()).string().is_ok());
     }
 }

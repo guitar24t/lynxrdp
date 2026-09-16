@@ -4,16 +4,35 @@
 //! `lynxrdpd --supervise ...` so that it is a fresh single-threaded process.
 
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::os::unix::io::RawFd;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
 use super::pam::Pam;
 use super::users::group_ids;
+
+/// How long the session gets to leave after a stop signal before it is
+/// killed outright.
+///
+/// The session's own shutdown is bounded -- five seconds for the desktop and
+/// three for the X server, in `session::desktop` and `session::xserver` --
+/// and this covers that with room for a loaded host. It exists because the
+/// supervisor's only path to `pam_close_session` runs after the session has
+/// exited, so a session that would not go was a logind session, a
+/// `pam_mount` and a utmp entry that were never closed once the daemon lost
+/// patience with *us*: it SIGKILLs a supervisor that has not exited within
+/// its grace, and the wait for the session used to be unbounded.
+///
+/// `daemon::manager` sizes its own grace from this figure, which is what makes
+/// the close reachable: the supervisor is always finished, session killed if
+/// need be, before the daemon reaches for SIGKILL.
+pub const SESSION_STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// Everything the supervisor needs to know.
 #[derive(Clone, Debug)]
@@ -41,8 +60,11 @@ pub struct SupervisorArgs {
 }
 
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+/// Set by the handler, so the wait it interrupts knows to start the clock.
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn forward_signal(sig: libc::c_int) {
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
     let pid = CHILD_PID.load(Ordering::SeqCst);
     if pid > 0 {
         // SAFETY: kill is async-signal-safe.
@@ -170,11 +192,18 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    if std::path::Path::new(&args.home).is_dir() {
-        cmd.current_dir(&args.home);
-    } else {
-        cmd.current_dir("/");
-    }
+    // The change into the home directory is made in the child, after the
+    // credential switch, and so with paths resolved here: between fork and
+    // exec only async-signal-safe calls are allowed, and building a `CString`
+    // is not one. `Command::current_dir` is not used because std applies it
+    // before any `pre_exec` closure runs, which put root, not the user, into
+    // the home -- and a home root cannot enter (NFS with `root_squash` and a
+    // 0700 home is the ordinary case) failed the whole spawn with EACCES, for
+    // a user whose SSH login worked because sshd changes directory only after
+    // it has become them.
+    let home_dir = CString::new(args.home.as_bytes())
+        .with_context(|| format!("home directory {:?} contains a NUL", args.home))?;
+    let root_dir: &'static std::ffi::CStr = c"/";
     let (control_fd, log_fd) = (args.control_fd, args.log_fd);
     let (uid, gid) = (args.uid, args.gid);
     // Captured before the fork so the child can tell whether we are still here.
@@ -225,6 +254,12 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
                     return Err(std::io::Error::other("privilege drop failed"));
                 }
             }
+            // Into the home as the user -- see `home_dir` above. A home that
+            // cannot be entered even now is not fatal: the desktop starts in
+            // `/`, as a login shell would.
+            if libc::chdir(home_dir.as_ptr()) != 0 && libc::chdir(root_dir.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             // Die with the supervisor.
             //
             // This must come *after* the credential switch above: the kernel
@@ -249,7 +284,7 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
             Ok(())
         });
     }
-    let mut child = cmd
+    let child = cmd
         .spawn()
         .with_context(|| format!("starting {}", args.session_binary.display()))?;
     CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
@@ -268,14 +303,88 @@ pub fn run(args: SupervisorArgs) -> Result<i32> {
         libc::close(control_fd);
         libc::close(log_fd);
     }
-    log::info!("session for {} running as pid {}", args.user, child.id());
-    let status = child.wait().context("waiting for session")?;
+    let pid = child.id() as libc::pid_t;
+    log::info!("session for {} running as pid {pid}", args.user);
+    let status = wait_for_session(pid).context("waiting for session")?;
     CHILD_PID.store(0, Ordering::SeqCst);
     log::info!("session for {} ended: {status}", args.user);
     if let Some(mut s) = pam_session.take() {
         s.close();
     }
     Ok(status.code().unwrap_or(128))
+}
+
+/// Wait for the session to exit, and see it out if a stop signal arrives and
+/// it will not go.
+///
+/// Not `Child::wait`: std retries that through `EINTR`, so a forwarded stop
+/// signal would leave this waiting with nothing to bound the wait, which is
+/// how a desktop that took its time to exit cost the user their logind
+/// session. The handlers are installed without `SA_RESTART`, so a raw
+/// `waitpid` returns `EINTR` when one runs, and that is the cue to start the
+/// clock. A signal that lands in the few instructions between the check below
+/// and the syscall is missed, and the wait is then unbounded as it always was;
+/// the daemon's own SIGKILL still ends it, so that window costs nothing new.
+fn wait_for_session(pid: libc::pid_t) -> std::io::Result<ExitStatus> {
+    loop {
+        if STOP_REQUESTED.load(Ordering::SeqCst) {
+            return reap_within(pid, SESSION_STOP_GRACE);
+        }
+        let mut raw = 0;
+        // SAFETY: waiting on our own child; `raw` is a valid out-pointer.
+        let r = unsafe { libc::waitpid(pid, &mut raw, 0) };
+        if r == pid {
+            return Ok(ExitStatus::from_raw(raw));
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// Reap `pid`, sending SIGKILL once `grace` has passed without it exiting.
+///
+/// The stop signal itself has already been forwarded by the handler; this
+/// only bounds how long the session gets to act on it.
+fn reap_within(pid: libc::pid_t, grace: Duration) -> std::io::Result<ExitStatus> {
+    let deadline = Instant::now() + grace;
+    loop {
+        let mut raw = 0;
+        // SAFETY: as in `wait_for_session`.
+        let r = unsafe { libc::waitpid(pid, &mut raw, libc::WNOHANG) };
+        if r == pid {
+            return Ok(ExitStatus::from_raw(raw));
+        }
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    log::warn!("session pid {pid} has not exited {grace:?} after a stop signal; killing it");
+    // SAFETY: the pid is our own child and has not been reaped, so it cannot
+    // have been reused by another process.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    loop {
+        let mut raw = 0;
+        // SAFETY: as above.
+        let r = unsafe { libc::waitpid(pid, &mut raw, 0) };
+        if r == pid {
+            return Ok(ExitStatus::from_raw(raw));
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -325,5 +434,46 @@ mod tests {
         assert_eq!(env["XDG_SESSION_TYPE"], "x11");
         assert!(env["PATH"].contains("/usr/bin"));
         assert!(!env.contains_key("DISPLAY"));
+    }
+
+    // The lint wants the `Child` waited on; the point of the helper is that
+    // the code under test does that by pid instead, as `run` does.
+    #[allow(clippy::zombie_processes)]
+    fn sh(script: &str) -> libc::pid_t {
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn /bin/sh");
+        // The `Child` is dropped unreaped on purpose: the code under test
+        // owns the reaping, exactly as it does in `run`.
+        child.id() as libc::pid_t
+    }
+
+    /// A session that does not act on its stop signal is killed once the
+    /// grace has passed, so the wait ends and `pam_close_session` is reached.
+    /// Before this the wait was `Child::wait`, unbounded, and the daemon's
+    /// SIGKILL on the supervisor was what ended it -- with the PAM session
+    /// still open.
+    #[test]
+    fn a_session_that_will_not_stop_is_killed_after_the_grace() {
+        let pid = sh("exec sleep 30");
+        let started = Instant::now();
+        let status = reap_within(pid, Duration::from_millis(300)).unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// One that leaves within the grace keeps its own exit status and is not
+    /// killed, and one that was never signalled at all is simply waited for.
+    #[test]
+    fn a_session_that_leaves_in_time_keeps_its_exit_status() {
+        let status = reap_within(sh("exit 3"), Duration::from_secs(10)).unwrap();
+        assert_eq!(status.code(), Some(3), "{status}");
+        let status = wait_for_session(sh("exit 5")).unwrap();
+        assert_eq!(status.code(), Some(5), "{status}");
     }
 }

@@ -24,7 +24,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::profiles::Profile;
 
@@ -134,13 +134,26 @@ impl std::fmt::Debug for Session {
 
 impl Sessions {
     /// Start `profile` by re-invoking this executable.
+    ///
+    /// Refuses a profile [`Profile::problem`] objects to, and this is the one
+    /// place the objection has to live: Connect, Reconnect from Running
+    /// Desktops and the macOS host all arrive here, and a value the editor
+    /// would never have saved -- a hand-edited `scale = 200` -- would
+    /// otherwise be caught only by clap in a child with no console to say
+    /// so on, or on macOS by nothing at all.
     pub fn start(&mut self, profile: &Profile) -> Result<()> {
+        if let Some(problem) = profile.problem() {
+            bail!("{} cannot be used: {problem}", profile.name);
+        }
         if let Some(queue) = self.shared.as_mut() {
             queue.push(profile.clone());
             return Ok(());
         }
-        let program = std::env::current_exe().context("finding this executable")?;
-        self.start_with(&program, profile)
+        // The path captured at startup, not what the kernel says now: after
+        // an in-place update on Linux `current_exe` names the unlinked old
+        // file, which cannot be started. See `crate::exe_path`.
+        let program = crate::exe_path().context("finding this executable")?;
+        self.start_with(program, profile)
     }
 
     /// Start using an explicit program, which is what the tests use.
@@ -246,6 +259,16 @@ impl Sessions {
     /// How many sessions this launcher started are still running.
     pub fn count(&mut self) -> usize {
         self.reap();
+        self.open()
+    }
+
+    /// How many sessions were running as of the last [`Self::reap`].
+    ///
+    /// What [`Self::count`] answers without reaping first, for a caller that
+    /// holds only a shared borrow -- the launcher's `enabled`, which decides
+    /// whether a button is drawn. The launcher reaps every repaint, so this
+    /// is at most one frame stale.
+    pub fn open(&self) -> usize {
         self.running.len() + self.shared_active
     }
 
@@ -380,6 +403,23 @@ mod tests {
         let mut p = Profile::new("test");
         p.host = "example.org".into();
         p
+    }
+
+    #[test]
+    fn a_profile_the_editor_would_refuse_is_not_started() {
+        // Reconnect and the macOS host hand profiles straight here, and a
+        // hand-edited file can carry a value the editor never lets through.
+        // The child would refuse it with a usage error nobody can see; the
+        // shared host would apply it as is.
+        let mut sessions = Sessions::default();
+        sessions.use_shared_windows();
+        let mut bad = profile();
+        bad.scale = Some(200);
+        let err = sessions.start(&bad).unwrap_err().to_string();
+        assert!(err.contains("test cannot be used"), "{err}");
+        assert!(err.contains("scale"), "{err}");
+        assert_eq!(sessions.connecting(), 0);
+        assert!(sessions.start(&profile()).is_ok());
     }
 
     /// Run a shell snippet as if it were a session, and wait for it.

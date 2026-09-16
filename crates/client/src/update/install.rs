@@ -8,11 +8,16 @@
 //!
 //! Two rules hold across all of them.
 //!
-//! **The new build is fully in place before the old one stops existing.** Every
-//! swap here unpacks into a staging name *on the same filesystem as the
-//! target*, and only then renames. A rename within a filesystem either
-//! happens or does not, so an interrupted update leaves a working
-//! application and some rubbish beside it, never half an executable.
+//! **Nothing is ever half an executable.** Every swap here unpacks into a
+//! staging name *on the same filesystem as the target*, and only then
+//! renames; a rename within a filesystem either happens or does not. On Linux
+//! the rename goes straight over the old file, and on macOS APFS exchanges
+//! the two bundles in one step, so there the new build is fully in place
+//! before the old one stops existing. Windows will not overwrite a running
+//! image, and a macOS volume that cannot swap has only plain renames, so on
+//! those the old build is moved aside a moment before the new one arrives;
+//! an update interrupted in that moment leaves both beside an empty slot,
+//! and [`sweep`] puts one of them back at the next start.
 //!
 //! **Nothing trusts the archive's own paths.** The tarball and the zip are
 //! checksummed downloads from a release, not hostile input, but an entry
@@ -277,6 +282,34 @@ mod unix {
         }
         Ok(count)
     }
+
+    /// Exchange two directory entries in one step, where the filesystem can.
+    ///
+    /// `renamex_np` with `RENAME_SWAP` is APFS's atomic exchange, the one
+    /// thing that lets a bundle be replaced with no moment at which nothing
+    /// is at its path. HFS+ and network volumes refuse it, and the caller
+    /// falls back to plain renames.
+    #[cfg(target_os = "macos")]
+    pub fn swap(a: &Path, b: &Path) -> std::io::Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let a = CString::new(a.as_os_str().as_bytes())?;
+        let b = CString::new(b.as_os_str().as_bytes())?;
+        // SAFETY: both are NUL-terminated strings that outlive the call, and
+        // the kernel reads them without keeping them.
+        if unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// Only macOS has an exchange the client can reach; elsewhere the caller
+    /// takes the two-rename path.
+    #[cfg(not(target_os = "macos"))]
+    pub fn swap(_a: &Path, _b: &Path) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
 
 #[cfg(unix)]
@@ -314,9 +347,24 @@ fn replace_bundle(bundle: &Path, archive: &Path) -> Result<()> {
     unix::extract_subtree(archive, Path::new(BUNDLE_NAME), &new).inspect_err(|_| {
         let _ = std::fs::remove_dir_all(&new);
     })?;
-    // Move the old one aside rather than deleting it, so a failure at the
-    // second step can put it back. The running process keeps its files
-    // either way -- the bundle is renamed, not emptied.
+    // In one step where the filesystem can: APFS exchanges the two entries
+    // atomically, so there is never a moment with no application at the
+    // path, and the old bundle comes out under the staging name to be
+    // deleted from there. The running process keeps its files either way --
+    // the bundle is renamed, not emptied.
+    match unix::swap(&new, bundle) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&new);
+            return Ok(());
+        }
+        Err(e) => log::debug!(
+            "cannot exchange {} in place ({e}); renaming instead",
+            bundle.display()
+        ),
+    }
+    // Anywhere else it is two renames. The old one is moved aside rather
+    // than deleted, so a failure at the second step can put it back; a crash
+    // between the two leaves both beside an empty slot for `sweep`.
     std::fs::rename(bundle, &old).with_context(|| format!("moving {} aside", bundle.display()))?;
     match std::fs::rename(&new, bundle) {
         Ok(()) => {
@@ -449,23 +497,72 @@ pub fn is_leftover(name: &str) -> bool {
         && stem.to_ascii_lowercase().starts_with("lynxrdp")
 }
 
-/// Delete what an earlier update could not.
+/// Which build a leftover is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Leftover {
+    New,
+    Old,
+}
+
+/// What a staging name stands in for: `.lynxrdp.exe.new-1234` is the new
+/// build of `lynxrdp.exe`. `None` for anything that is not our leftover.
+fn leftover_target(name: &str) -> Option<(&str, Leftover)> {
+    if !is_leftover(name) {
+        return None;
+    }
+    let (stem, _pid) = name[1..].rsplit_once('-')?;
+    if let Some(target) = stem.strip_suffix(".new") {
+        return Some((target, Leftover::New));
+    }
+    stem.strip_suffix(".old")
+        .map(|target| (target, Leftover::Old))
+}
+
+/// Delete what an earlier update could not -- after putting back whatever an
+/// interrupted one left out of place.
 ///
 /// On Windows the replaced executable cannot be removed until the process
 /// running it exits, so it is left behind on purpose and swept up here at the
 /// next start. Failures are ignored: this is tidying, and a file that is
 /// still locked will be gone the time after.
+///
+/// The recovery comes first. An update that died between moving the old
+/// application aside and the new one into place -- possible on Windows and
+/// on a macOS volume that cannot swap -- leaves nothing at the application's
+/// own name and both builds beside it under staging names. Whoever starts
+/// one of those by hand lands here, and the right answer is to put the new
+/// build in place, or failing that the old one back, rather than delete the
+/// only copies there are.
 pub fn sweep(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !is_leftover(name) {
+    let mut leftovers: Vec<(PathBuf, String, Leftover)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let (target, kind) = leftover_target(name.to_str()?)?;
+            Some((entry.path(), target.to_string(), kind))
+        })
+        .collect();
+    // New before old, so the newer build is the one that takes the slot.
+    leftovers.sort_by_key(|(_, _, kind)| *kind == Leftover::Old);
+    for (path, target, _) in &leftovers {
+        let wanted = dir.join(target);
+        // `exists` would follow a symlink, and a dangling one still holds
+        // the name.
+        if wanted.symlink_metadata().is_ok() {
             continue;
         }
-        let path = entry.path();
+        if std::fs::rename(path, &wanted).is_ok() {
+            log::info!("put {} back at {}", path.display(), wanted.display());
+        }
+    }
+    for (path, _, _) in leftovers {
+        // Renamed into place above, or gone already.
+        if path.symlink_metadata().is_err() {
+            continue;
+        }
         if path.is_dir() {
             let _ = std::fs::remove_dir_all(&path);
         } else {
@@ -620,6 +717,69 @@ mod tests {
         assert_eq!(left.len(), 1, "{left:?}");
         // Somewhere that does not exist cannot be written.
         assert!(!can_write(&dir.path().join("nowhere").join(EXE_NAME)));
+    }
+
+    #[test]
+    fn a_staging_name_says_what_it_stands_in_for() {
+        assert_eq!(
+            leftover_target(".lynxrdp.exe.new-12"),
+            Some(("lynxrdp.exe", Leftover::New))
+        );
+        assert_eq!(
+            leftover_target(".LynxRDP.app.old-7"),
+            Some(("LynxRDP.app", Leftover::Old))
+        );
+        assert_eq!(
+            leftover_target(".lynxrdp.new-3"),
+            Some(("lynxrdp", Leftover::New))
+        );
+        assert_eq!(leftover_target("lynxrdp.exe"), None);
+        assert_eq!(leftover_target(".ssh"), None);
+    }
+
+    #[test]
+    fn an_interrupted_update_is_finished_at_the_next_start_rather_than_swept_away() {
+        // Between moving the old build aside and the new one into place
+        // there is nothing at the application's name. Someone who starts
+        // one of the two leftovers by hand must find the new build put in
+        // place, not both copies deleted as rubbish.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("lynxrdp.exe");
+        std::fs::write(dir.path().join(".lynxrdp.exe.new-9"), b"new").unwrap();
+        std::fs::write(dir.path().join(".lynxrdp.exe.old-9"), b"old").unwrap();
+        sweep(dir.path());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        let names = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(dir.path()), vec!["lynxrdp.exe"]);
+
+        // With only the old build left, it goes back: a working application
+        // beats an empty folder.
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(dir.path().join(".lynxrdp.exe.old-10"), b"older").unwrap();
+        sweep(dir.path());
+        assert_eq!(std::fs::read(&target).unwrap(), b"older");
+        assert_eq!(names(dir.path()), vec!["lynxrdp.exe"]);
+
+        // A bundle is put back whole, and a leftover whose application is
+        // present is still just swept.
+        let staged = dir.path().join(".LynxRDP.app.new-3");
+        std::fs::create_dir_all(staged.join("Contents")).unwrap();
+        std::fs::write(staged.join("Contents/Info.plist"), b"new").unwrap();
+        std::fs::write(dir.path().join(".lynxrdp.exe.old-11"), b"x").unwrap();
+        sweep(dir.path());
+        assert_eq!(
+            std::fs::read(dir.path().join("LynxRDP.app/Contents/Info.plist")).unwrap(),
+            b"new"
+        );
+        assert_eq!(names(dir.path()), vec!["LynxRDP.app", "lynxrdp.exe"]);
     }
 
     #[test]
@@ -828,6 +988,15 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o111, 0o111);
+            // Whether the swap was an exchange or two renames, the old
+            // bundle is gone and nothing staged remains.
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with('.'))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
         }
 
         #[test]

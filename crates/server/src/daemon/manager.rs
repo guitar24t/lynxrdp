@@ -58,11 +58,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use lynxrdp_proto::message::reject;
 
 use super::send_rejection;
+use super::supervisor::SESSION_STOP_GRACE;
 use super::users::UserInfo;
 use crate::config::{Config, SessionConfig};
 use crate::handoff::{send_handoff, Handoff, Reply};
@@ -127,14 +128,18 @@ const ESTABLISHED_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// start stalling every other connection -- the worker pool exists to remove.
 const COLD_START_REPLY_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// How long a supervisor gets to shut down cleanly when a handoff has failed.
+/// How long a supervisor gets to exit after SIGTERM before it is killed.
 ///
-/// Deliberately shorter than `stop_all`'s five seconds. The original reason --
-/// that this ran on the daemon's single accept loop -- no longer holds, but it
-/// still runs on one of [`HANDOFF_WORKERS`] threads with a user waiting at the
-/// end of it, and a supervisor that has not answered SIGTERM within a second
-/// is not going to.
-const HANDOFF_TERMINATE_GRACE: Duration = Duration::from_secs(1);
+/// A supervisor answers SIGTERM by forwarding it, waiting up to
+/// [`SESSION_STOP_GRACE`] for the session to leave, killing it if it has not,
+/// and only then closing the PAM session. A grace shorter than that does not
+/// hurry anything; it skips the close. This was one second on a failed
+/// handoff, on the reasoning that a supervisor which had not exited within a
+/// second was not going to -- but it had answered, and was waiting for a
+/// desktop that takes longer than that to exit, so every such desktop leaked
+/// its logind session. The user at the end of it still waits, but only after
+/// a cold start that has already failed, and never past this.
+const SUPERVISOR_EXIT_GRACE: Duration = Duration::from_secs(SESSION_STOP_GRACE.as_secs() + 3);
 
 /// Take a lock, ignoring poisoning.
 ///
@@ -194,6 +199,8 @@ pub struct SessionManager {
     starts: Starts,
     sessions_dir: PathBuf,
     log_dir: PathBuf,
+    /// Set by [`HandoffPool::shutdown`]; no session is started after it.
+    stopping: AtomicBool,
 }
 
 impl SessionManager {
@@ -235,12 +242,24 @@ impl SessionManager {
             starts: Starts::default(),
             sessions_dir,
             log_dir,
+            stopping: AtomicBool::new(false),
         })
     }
 
     /// Directory holding session control sockets.
     pub fn sessions_dir(&self) -> &Path {
         &self.sessions_dir
+    }
+
+    /// Start nothing new from here on: a handoff that reaches the point of
+    /// spawning after this refuses instead.
+    pub fn begin_shutdown(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether [`begin_shutdown`](Self::begin_shutdown) has been called.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 
     /// Forget sessions that have ended.
@@ -407,23 +426,39 @@ impl SessionManager {
     /// together, because a raw descriptor crossing a thread boundary is how
     /// two owners and one double close get introduced.
     pub fn handoff(&self, user: &UserInfo, client_fd: BorrowedFd<'_>, peer: &str) -> Result<u64> {
+        self.handoff_with(user, client_fd, peer, ESTABLISHED_REPLY_TIMEOUT)
+    }
+
+    /// [`handoff`](Self::handoff) with the established-session reply timeout
+    /// as a parameter, so a test can exercise a session that never answers
+    /// without waiting out the real ten seconds.
+    fn handoff_with(
+        &self,
+        user: &UserInfo,
+        client_fd: BorrowedFd<'_>,
+        peer: &str,
+        established_timeout: Duration,
+    ) -> Result<u64> {
         // Everything below is serialised for this uid and for no other. Two
         // connections from one user arriving together would otherwise both
         // find no socket, both spawn, and the second spawn's `remove_file` +
         // `bind` would orphan the first supervisor with the user's desktop
         // still inside it.
         let _starting = self.starts.acquire(user.uid);
+        // Checked again here, and not only by the worker before it took the
+        // job: the wait just above can be a whole cold start for the same uid,
+        // and a daemon told to stop in the meantime has no business spawning
+        // a desktop it will never record. Two cold starts back to back were
+        // past systemd's stop timeout, and the SIGKILL that followed left a
+        // half-spawned supervisor with no record and no daemon.
+        if self.is_stopping() {
+            bail!("the daemon is shutting down");
+        }
         self.reap();
         let socket_path = self.sessions_dir.join(format!("{}.sock", user.uid));
         // Try an existing session first (ours, or one surviving a daemon restart).
         if socket_path.exists() {
-            match try_handoff(
-                &socket_path,
-                user,
-                client_fd,
-                peer,
-                ESTABLISHED_REPLY_TIMEOUT,
-            ) {
+            match try_handoff(&socket_path, user, client_fd, peer, established_timeout) {
                 Ok(()) => {
                     // Looked up and adopted under one lock. Reading whether
                     // the session was known beforehand and acting on it
@@ -459,7 +494,35 @@ impl SessionManager {
                     );
                     return Ok(id);
                 }
-                Err(e) => {
+                // Something is listening and did not take the connection, and
+                // it is not a process this daemon started: a session adopted
+                // after a restart, or one not yet even recorded. There is no
+                // supervisor to signal, so taking its name and starting a
+                // second desktop beside it would strand it -- Xvfb, the
+                // desktop and the logind session all still running where
+                // nothing can reach them, which `probe_adopted` and `stop_all`
+                // go to some length to avoid and this path used to do
+                // anyway, on nothing more than a ten-second reply timeout that
+                // a swapping host, or the user's own `kill -STOP`, can cause.
+                // The connection is refused instead and the session left
+                // exactly as it was; a session that has really gone answers
+                // the next attempt with ECONNREFUSED and is replaced then.
+                Err(HandoffFailure::Unusable(e)) if !self.owns_session(user.uid) => {
+                    log::warn!(
+                        "existing session for {} did not take the connection ({e:#}); \
+                         it was not started by this daemon and is left running",
+                        user.name
+                    );
+                    return Err(e).with_context(|| {
+                        format!(
+                            "the existing session for {} is still running but did not take \
+                             the connection; try again once it is responsive",
+                            user.name
+                        )
+                    });
+                }
+                Err(failure) => {
+                    let e = failure.into_error();
                     log::warn!(
                         "existing session for {} unusable ({e:#}); starting a new one",
                         user.name
@@ -474,7 +537,7 @@ impl SessionManager {
                     };
                     if let Some(mut rec) = stale {
                         if let Some(c) = rec.supervisor.as_mut() {
-                            terminate(c, HANDOFF_TERMINATE_GRACE);
+                            terminate(c, SUPERVISOR_EXIT_GRACE);
                         }
                     }
                     let _ = fs::remove_file(&socket_path);
@@ -515,7 +578,7 @@ impl SessionManager {
                 );
                 Ok(session_id)
             }
-            Err(e) => {
+            Err(failure) => {
                 // Safe to remove by uid alone: the start latch means no other
                 // thread can have inserted a record for this user, and if
                 // `reap` beat us to it there is nothing left to stop.
@@ -525,33 +588,29 @@ impl SessionManager {
                 };
                 if let Some(mut rec) = failed {
                     if let Some(c) = rec.supervisor.as_mut() {
-                        terminate(c, HANDOFF_TERMINATE_GRACE);
+                        terminate(c, SUPERVISOR_EXIT_GRACE);
                     }
                 }
                 let _ = fs::remove_file(&socket_path);
-                Err(e).context("new session did not accept the connection")
+                Err(failure.into_error()).context("new session did not accept the connection")
             }
         }
+    }
+
+    /// Whether the session recorded for `uid` is one this daemon started, and
+    /// so one it holds a supervisor for and can end.
+    fn owns_session(&self, uid: u32) -> bool {
+        lock(&self.inner)
+            .sessions
+            .get(&uid)
+            .is_some_and(|rec| rec.supervisor.is_some())
     }
 
     fn spawn(&self, user: &UserInfo, socket_path: &Path, session_id: u64) -> Result<Child> {
         let _ = fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)
             .with_context(|| format!("binding {}", socket_path.display()))?;
-        let log_path = self.log_dir.join(format!("{}.log", user.name));
-        let log_file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&log_path)
-            .with_context(|| format!("opening {}", log_path.display()))?;
-        if crate::peer::own_uid() == 0 {
-            // SAFETY: chown on a path we just created.
-            let c = std::ffi::CString::new(log_path.as_os_str().as_encoded_bytes())?;
-            unsafe {
-                libc::chown(c.as_ptr(), user.uid, user.gid);
-            }
-        }
+        let (log_path, log_file) = open_session_log(&self.log_dir, user)?;
         let s = &self.cfg.session;
         let session_args = session_argv(s, session_id);
         let exe = std::env::current_exe().context("locating lynxrdpd executable")?;
@@ -626,25 +685,77 @@ impl SessionManager {
     /// Run [`HandoffPool::shutdown`] first. A worker part-way through a spawn
     /// would otherwise insert its record after the map had been drained, and
     /// that session would outlive the daemon it was asked to end with it.
+    ///
+    /// Every supervisor is signalled before any is waited for, so the whole
+    /// thing takes one grace period rather than one per session: each
+    /// supervisor may now take up to [`SUPERVISOR_EXIT_GRACE`] to see its
+    /// desktop out, and a dozen of them in turn would run past systemd's stop
+    /// timeout.
     pub fn stop_all(&self) {
         let records: Vec<(u32, SessionRecord)> = {
             let mut inner = lock(&self.inner);
             inner.sessions.drain().collect()
         };
-        for (uid, mut rec) in records {
-            match rec.supervisor.as_mut() {
-                Some(child) => terminate(child, Duration::from_secs(5)),
-                None => {
-                    log::info!(
-                        "leaving adopted session for {} (uid {uid}) running",
-                        rec.username
-                    );
-                    continue;
-                }
+        let mut ours: Vec<SessionRecord> = Vec::new();
+        for (uid, rec) in records {
+            if rec.supervisor.is_some() {
+                ours.push(rec);
+            } else {
+                log::info!(
+                    "leaving adopted session for {} (uid {uid}) running",
+                    rec.username
+                );
             }
+        }
+        let children: Vec<&mut Child> = ours
+            .iter_mut()
+            .filter_map(|rec| rec.supervisor.as_mut())
+            .collect();
+        terminate_all(children, SUPERVISOR_EXIT_GRACE);
+        for rec in &ours {
             let _ = fs::remove_file(&rec.socket_path);
         }
     }
+}
+
+/// Open the user's session log for appending, creating it if need be.
+///
+/// Without `O_NOFOLLOW` this was root appending to, and then `chown`ing,
+/// whatever `<user>.log` pointed at. The packaged directory is 0700 root and
+/// safe, but `log_dir` is configuration and `ensure_owned_dir` only warns when
+/// it has been widened -- `chgrp adm` so operators can rotate by hand is a
+/// reasonable thing to have done -- and in that configuration anyone able to
+/// create entries there could plant `alice.log -> /etc/sudoers`, connect as
+/// alice, and have root append to it and hand it to her.
+/// `fs.protected_symlinks` covers only sticky world-writable directories, so a
+/// 0775 root:adm one is unprotected. The ownership change goes through the
+/// descriptor for the same reason: a path can be swapped between two calls
+/// and a descriptor cannot.
+fn open_session_log(log_dir: &Path, user: &UserInfo) -> Result<(PathBuf, fs::File)> {
+    let log_path = log_dir.join(format!("{}.log", user.name));
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&log_path)
+        .with_context(|| format!("opening {}", log_path.display()))?;
+    if crate::peer::own_uid() == 0 {
+        // SAFETY: fchown on a descriptor this process holds open.
+        let rc = unsafe { libc::fchown(log_file.as_raw_fd(), user.uid, user.gid) };
+        if rc != 0 {
+            // The session can still write to it -- the descriptor is already
+            // open -- so this costs the user only the ability to read their
+            // own log, which is worth a line and not a refused session.
+            log::warn!(
+                "could not give {} to {}: {}",
+                log_path.display(),
+                user.name,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    Ok((log_path, log_file))
 }
 
 /// One-at-a-time admission per uid.
@@ -790,7 +901,10 @@ pub struct HandoffPool {
     jobs: Option<Sender<Job>>,
     workers: Vec<JoinHandle<()>>,
     admission: Arc<Admission>,
-    stopping: Arc<AtomicBool>,
+    /// Kept so `shutdown` can tell the manager, which is where a worker
+    /// part-way through a handoff looks: the flag has to be visible after the
+    /// start latch as well as before the job, and only the manager is there.
+    manager: Arc<SessionManager>,
 }
 
 impl HandoffPool {
@@ -802,24 +916,22 @@ impl HandoffPool {
     /// something worth refusing to start over.
     pub fn new(manager: Arc<SessionManager>) -> std::io::Result<Self> {
         let (jobs, rx) = bounded::<Job>(HANDOFF_QUEUE);
-        let stopping = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::with_capacity(HANDOFF_WORKERS);
         for i in 0..HANDOFF_WORKERS {
             let rx = rx.clone();
             let manager = Arc::clone(&manager);
-            let stopping = Arc::clone(&stopping);
             // On failure `jobs` and this `rx` drop with the error, so any
             // worker already started sees the channel disconnect and exits.
             let handle = std::thread::Builder::new()
                 .name(format!("handoff-{i}"))
-                .spawn(move || worker(&rx, &manager, &stopping))?;
+                .spawn(move || worker(&rx, &manager))?;
             workers.push(handle);
         }
         Ok(Self {
             jobs: Some(jobs),
             workers,
             admission: Arc::new(Admission::default()),
-            stopping,
+            manager,
         })
     }
 
@@ -868,12 +980,17 @@ impl HandoffPool {
     ///
     /// Queued jobs are discarded rather than run -- dropping one closes the
     /// client socket, which is what that client's own timeout would have done
-    /// a moment later anyway -- so this waits for at most one handoff per
-    /// worker. That is still up to `COLD_START_REPLY_TIMEOUT`, which is the
-    /// same wait a SIGTERM arriving mid-handoff has always had, and well
-    /// inside systemd's default stop timeout.
+    /// a moment later anyway -- and a job that had left the queue but was
+    /// still waiting on its uid's start latch is refused once the latch is
+    /// its own, so this waits for at most one handoff per worker. That is
+    /// still up to `COLD_START_REPLY_TIMEOUT` plus a supervisor's
+    /// [`SUPERVISOR_EXIT_GRACE`], which is the same wait a SIGTERM arriving
+    /// mid-handoff has always had, and inside systemd's default stop timeout
+    /// of ninety seconds. Before the latch re-check it was not: a worker
+    /// parked behind another's cold start ran its own in full afterwards,
+    /// and two cold starts is past that timeout.
     pub fn shutdown(&mut self) {
-        self.stopping.store(true, Ordering::SeqCst);
+        self.manager.begin_shutdown();
         // Dropping the only sender is what ends the workers' `recv` loop.
         drop(self.jobs.take());
         for h in self.workers.drain(..) {
@@ -882,9 +999,9 @@ impl HandoffPool {
     }
 }
 
-fn worker(jobs: &Receiver<Job>, manager: &SessionManager, stopping: &AtomicBool) {
+fn worker(jobs: &Receiver<Job>, manager: &SessionManager) {
     while let Ok(job) = jobs.recv() {
-        if stopping.load(Ordering::SeqCst) {
+        if manager.is_stopping() {
             // Dropping the job closes the client's socket and releases its
             // place. Starting a desktop for someone the daemon is about to
             // stop serving would only leave a session behind.
@@ -923,23 +1040,35 @@ fn run_job(job: Job, manager: &SessionManager) {
 /// Stop a supervisor politely, and only then insistently.
 ///
 /// SIGKILL on its own is wrong here. The supervisor holds the PAM session open
-/// and only its SIGTERM handler runs `pam_close_session`, so killing it
-/// outright leaked a logind session on every failed attempt -- and, because
-/// `lynxrdp-session` had no parent-death link, the whole desktop with it.
+/// and runs `pam_close_session` only once the session it forwarded SIGTERM to
+/// has exited, so killing it outright leaked a logind session on every failed
+/// attempt -- and, because `lynxrdp-session` had no parent-death link, the
+/// whole desktop with it. `grace` has to cover the supervisor's own bounded
+/// wait for that exit, which is what [`SUPERVISOR_EXIT_GRACE`] is.
 fn terminate(child: &mut Child, grace: Duration) {
-    // SAFETY: signalling our own child.
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGTERM);
+    terminate_all(vec![child], grace);
+}
+
+/// [`terminate`] for several supervisors at once, sharing one grace period.
+fn terminate_all(mut children: Vec<&mut Child>, grace: Duration) {
+    for child in &children {
+        // SAFETY: signalling our own child.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGTERM);
+        }
     }
     let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if let Ok(Some(_)) = child.try_wait() {
-            return;
+    loop {
+        children.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+        if children.is_empty() || Instant::now() >= deadline {
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    for child in children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// Whether anything in a `/proc/net/unix` dump is bound to `path`.
@@ -984,15 +1113,72 @@ fn bound_path(row: &str) -> Option<&str> {
     }
 }
 
+/// Why a handoff to an existing session's socket did not go through.
+///
+/// The two are told apart because they call for opposite responses. A socket
+/// nothing is bound to belongs to a session that has exited, and its name is
+/// free to take. A socket that is bound but did not answer belongs to a
+/// session that is still there -- stopped by its owner, or on a host too busy
+/// to schedule it within the timeout -- and taking its name from it strands
+/// a running desktop. `handoff` used to treat both as the first.
+#[derive(Debug)]
+enum HandoffFailure {
+    /// Nothing is listening: the connect was refused, or the file is gone.
+    Dead(anyhow::Error),
+    /// Something is listening and did not take the connection: no reply
+    /// within the timeout, a refusal, or a connection closed unanswered.
+    Unusable(anyhow::Error),
+}
+
+impl HandoffFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            HandoffFailure::Dead(e) | HandoffFailure::Unusable(e) => e,
+        }
+    }
+}
+
 fn try_handoff(
     socket_path: &Path,
     user: &UserInfo,
     client_fd: BorrowedFd<'_>,
     peer: &str,
     timeout: Duration,
+) -> std::result::Result<(), HandoffFailure> {
+    let control = match UnixStream::connect(socket_path) {
+        Ok(c) => c,
+        Err(e) => {
+            // ECONNREFUSED is what a socket file with no listener behind it
+            // answers -- and what a plain file at that name answers too --
+            // and ENOENT is one that has been unlinked. Anything else says
+            // nothing about whether a session is there, and is treated as if
+            // one were: the error that fails closed.
+            let dead = matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            );
+            let e =
+                anyhow::Error::new(e).context(format!("connecting to {}", socket_path.display()));
+            return Err(if dead {
+                HandoffFailure::Dead(e)
+            } else {
+                HandoffFailure::Unusable(e)
+            });
+        }
+    };
+    deliver(&control, socket_path, user, client_fd, peer, timeout).map_err(HandoffFailure::Unusable)
+}
+
+/// The half of [`try_handoff`] after the connect: everything that fails here
+/// fails with a live session on the other end.
+fn deliver(
+    control: &UnixStream,
+    socket_path: &Path,
+    user: &UserInfo,
+    client_fd: BorrowedFd<'_>,
+    peer: &str,
+    timeout: Duration,
 ) -> Result<()> {
-    let control = UnixStream::connect(socket_path)
-        .with_context(|| format!("connecting to {}", socket_path.display()))?;
     // Check who put this socket here before posting somebody's connection
     // through it. SO_PEERCRED on the connecting end reports the credentials of
     // the process that called listen(2), and that is this daemon rather than
@@ -1003,7 +1189,7 @@ fn try_handoff(
     // session's own peer check on the accepting end, and together the two make
     // the handoff safe to reason about without leaning on directory
     // permissions as the only thing standing in the way.
-    let owner = crate::peer::unix_peer(&control)
+    let owner = crate::peer::unix_peer(control)
         .with_context(|| format!("identifying the owner of {}", socket_path.display()))?;
     let own = crate::peer::own_uid();
     if owner.uid != own && owner.uid != 0 {
@@ -1022,7 +1208,17 @@ fn try_handoff(
     // deals in descriptors and nothing else. The kernel gives the session its
     // own descriptor for the same open file; ours stays ours, and the worker
     // closes it once when the job ends.
-    match send_handoff(&control, &h, client_fd.as_raw_fd(), timeout)? {
+    let reply = send_handoff(control, &h, client_fd.as_raw_fd(), timeout).map_err(|e| {
+        match e.kind() {
+            // The socket's timeout surfaces as EAGAIN, which nobody reading a
+            // log or a rejection would recognise as "it never answered".
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                anyhow!("no reply within {timeout:?}")
+            }
+            _ => anyhow::Error::new(e).context("sending the handoff"),
+        }
+    })?;
+    match reply {
         Reply::Accepted => Ok(()),
         Reply::Refused => bail!("session refused the handoff"),
     }
@@ -1207,7 +1403,160 @@ Num       RefCount Protocol Flags    Type St Inode Path
             starts: Starts::default(),
             sessions_dir: sessions_dir.to_path_buf(),
             log_dir: sessions_dir.join("log"),
+            stopping: AtomicBool::new(false),
         }
+    }
+
+    fn user(uid: u32, name: &str) -> UserInfo {
+        UserInfo {
+            uid,
+            // SAFETY: getgid has no preconditions.
+            gid: unsafe { libc::getgid() },
+            name: name.into(),
+            home: "/".into(),
+            shell: "/bin/sh".into(),
+        }
+    }
+
+    /// The failure a dead socket produces is told apart from the one a live
+    /// but silent session produces, because the two call for opposite
+    /// responses: the first name is free to take, the second is not.
+    #[test]
+    fn a_dead_socket_and_a_silent_session_are_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _other) = UnixStream::pair().unwrap();
+        let me = user(crate::peer::own_uid(), "me");
+        let short = Duration::from_millis(300);
+        let attempt = |path: &Path| try_handoff(path, &me, client.as_fd(), "p", short);
+
+        // Nothing at the name, a plain file at the name, and a socket whose
+        // listener has gone while the file stayed: all three are dead.
+        let gone = dir.path().join("gone.sock");
+        assert!(matches!(attempt(&gone), Err(HandoffFailure::Dead(_))));
+        let plain = dir.path().join("plain.sock");
+        fs::write(&plain, b"").unwrap();
+        assert!(matches!(attempt(&plain), Err(HandoffFailure::Dead(_))));
+        let closed = dir.path().join("closed.sock");
+        drop(UnixListener::bind(&closed).unwrap());
+        assert!(closed.exists());
+        assert!(matches!(attempt(&closed), Err(HandoffFailure::Dead(_))));
+
+        // A listener that never accepts: the connect succeeds and the reply
+        // never comes, which is what a stopped session looks like.
+        let silent = dir.path().join("silent.sock");
+        let _listener = UnixListener::bind(&silent).unwrap();
+        let err = attempt(&silent).unwrap_err();
+        assert!(matches!(err, HandoffFailure::Unusable(_)), "{err:?}");
+        let text = format!("{:#}", err.into_error());
+        assert!(text.contains("no reply"), "{text}");
+    }
+
+    /// A session this daemon did not start, and so cannot signal, is left
+    /// exactly as it is when it fails to answer: socket in place, record in
+    /// place, and no second desktop started beside it. Unlinking it was how
+    /// a daemon restart followed by ten busy seconds lost a user's desktop.
+    #[test]
+    fn an_adopted_session_that_does_not_answer_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = manager_at(dir.path());
+        let me = user(crate::peer::own_uid(), "me");
+        let socket = dir.path().join(format!("{}.sock", me.uid));
+        let _listener = UnixListener::bind(&socket).unwrap();
+        lock(&mgr.inner).sessions.insert(
+            me.uid,
+            SessionRecord {
+                supervisor: None,
+                socket_path: socket.clone(),
+                session_id: 0,
+                username: me.name.clone(),
+                started: Instant::now(),
+            },
+        );
+        let (client, _other) = UnixStream::pair().unwrap();
+        let short = Duration::from_millis(300);
+        let err = mgr
+            .handoff_with(&me, client.as_fd(), "p", short)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("still running"), "{err:#}");
+        assert!(socket.exists(), "the adopted session's socket was unlinked");
+        assert!(
+            UnixStream::connect(&socket).is_ok(),
+            "the listener was taken away"
+        );
+        assert_eq!(mgr.count(), 1, "the record was dropped");
+
+        // The same with no record at all -- the first connection after a
+        // restart, before anything has been adopted -- because what matters
+        // is that there is no supervisor to signal, not whether the session
+        // has been written down yet.
+        lock(&mgr.inner).sessions.clear();
+        let err = mgr
+            .handoff_with(&me, client.as_fd(), "p", short)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("still running"), "{err:#}");
+        assert!(socket.exists());
+        assert!(UnixStream::connect(&socket).is_ok());
+    }
+
+    /// A connection that waited on the start latch behind another for the
+    /// same uid is refused, not started, when the daemon was told to stop
+    /// while it waited. Before the re-check it ran its cold start in full,
+    /// which put shutdown past systemd's stop timeout.
+    #[test]
+    fn a_handoff_that_waited_on_the_latch_refuses_once_shutdown_began() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(manager_at(dir.path()));
+        let me = user(crate::peer::own_uid(), "me");
+        let held = mgr.starts.acquire(me.uid);
+        let waiter = {
+            let mgr = Arc::clone(&mgr);
+            let me = me.clone();
+            std::thread::spawn(move || {
+                let (client, _other) = UnixStream::pair().unwrap();
+                mgr.handoff(&me, client.as_fd(), "p")
+                    .map(|_| ())
+                    .map_err(|e| format!("{e:#}"))
+            })
+        };
+        // Told to stop while (or before) it waits, and released only after.
+        mgr.begin_shutdown();
+        drop(held);
+        let err = waiter.join().unwrap().unwrap_err();
+        assert!(err.contains("shutting down"), "{err}");
+        assert!(
+            !dir.path().join(format!("{}.sock", me.uid)).exists(),
+            "a session was spawned during shutdown"
+        );
+        assert_eq!(mgr.count(), 0);
+    }
+
+    /// Root appending to `<user>.log` must not follow a symlink planted at
+    /// that name, and must not change the ownership of whatever it points at.
+    #[test]
+    fn the_session_log_is_not_opened_through_a_symlink() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("not-a-log");
+        fs::write(&target, b"precious").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("alice.log")).unwrap();
+        let err = open_session_log(dir.path(), &user(1000, "alice")).unwrap_err();
+        assert!(format!("{err:#}").contains("alice.log"), "{err:#}");
+        assert_eq!(fs::read(&target).unwrap(), b"precious");
+
+        // An ordinary log, or none yet, is opened for appending as before.
+        let bob = user(1001, "bob");
+        let (path, mut log) = open_session_log(dir.path(), &bob).unwrap();
+        log.write_all(b"one\n").unwrap();
+        drop(log);
+        let (_, mut log) = open_session_log(dir.path(), &bob).unwrap();
+        log.write_all(b"two\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"one\ntwo\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     fn add_ended_session(mgr: &SessionManager, uid: u32, socket_path: &Path) {

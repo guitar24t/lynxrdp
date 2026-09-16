@@ -5,15 +5,28 @@ use std::{
     ffi::{CString, OsString},
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
+
+/// How long `xdg-user-dir` may take to answer.
+///
+/// It reads one small file under the user's config directory, and the answer
+/// when it cannot is the same `~/Desktop` it would have named anyway. What it
+/// must not do is hold the delivery thread for as long as a home that has
+/// stopped answering holds it, since the whole drop is waiting behind it.
+const USER_DIR_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) struct Delivery {
     pub id: u64,
     pub result: crossbeam_channel::Receiver<Result<()>>,
+    /// When the copy started, so the caller can give up on one that never
+    /// finishes.
+    pub started: Instant,
     cancelled: Arc<AtomicBool>,
 }
 impl Drop for Delivery {
@@ -34,30 +47,52 @@ pub(super) fn start(id: u64, roots: Vec<PathBuf>) -> Result<Delivery> {
     Ok(Delivery {
         id,
         result,
+        started: Instant::now(),
         cancelled,
     })
 }
 fn desktop_directory() -> Result<PathBuf> {
     let home =
         PathBuf::from(std::env::var_os("HOME").context("No home directory for desktop files")?);
-    let path = match std::process::Command::new("xdg-user-dir")
-        .arg("DESKTOP")
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let mut bytes = output.stdout;
-            while bytes.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
-                bytes.pop();
-            }
-            PathBuf::from(OsString::from_vec(bytes))
-        }
-        _ => home.join("Desktop"),
-    };
+    let path = user_desktop_dir().unwrap_or_else(|| home.join("Desktop"));
     if !path.is_absolute() || path == home {
         bail!("The desktop folder is disabled in your desktop settings.");
     }
     std::fs::create_dir_all(&path)?;
     Ok(std::fs::canonicalize(path)?)
+}
+/// Ask `xdg-user-dir` where the Desktop folder is, for a bounded time.
+///
+/// `Command::output` would wait for as long as the helper takes, and a helper
+/// stuck on a stalled home never answers. `None` for anything but a prompt,
+/// successful answer, and the caller's `~/Desktop` fallback takes over.
+fn user_desktop_dir() -> Option<PathBuf> {
+    let mut child = Command::new("xdg-user-dir")
+        .arg("DESKTOP")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + USER_DIR_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut bytes = child.wait_with_output().ok()?.stdout;
+                while bytes.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                    bytes.pop();
+                }
+                return Some(PathBuf::from(OsString::from_vec(bytes)));
+            }
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 fn check(cancelled: &AtomicBool) -> Result<()> {
     if cancelled.load(Ordering::Acquire) {

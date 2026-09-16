@@ -55,6 +55,10 @@ pub struct Panel {
     pub message: String,
     seen_message: String,
     toast_until: Option<Instant>,
+    /// The toast announces work the panel is about to show, and goes when
+    /// that work does. A failure is not one: raised in the middle of a batch,
+    /// it has to outlive the rest of it.
+    transient: bool,
     dismissed: bool,
     had_active: bool,
     active_since: Option<Instant>,
@@ -93,7 +97,21 @@ impl Panel {
         }
     }
 
+    /// Show `message` as a toast for a few seconds and keep it in the details.
     pub fn notify(&mut self, message: String) {
+        self.transient = false;
+        self.raise(message);
+    }
+
+    /// Like [`notify`](Self::notify), for a notice that is stale the moment
+    /// the transfers it announces have finished: "Download requested" has
+    /// nothing left to say once the download is done.
+    pub fn notify_transient(&mut self, message: String) {
+        self.transient = true;
+        self.raise(message);
+    }
+
+    fn raise(&mut self, message: String) {
         self.message = message.clone();
         self.record(message);
         self.dismissed = false;
@@ -125,8 +143,11 @@ impl Panel {
             false
         };
         let changed_message = self.message != self.seen_message;
-        if self.had_active && !active_now && !changed_message {
+        if self.had_active && !active_now && !changed_message && self.transient {
             // Clear a preparation message as soon as its transfer finishes.
+            // Only that kind: a failure raised while the rest of its batch was
+            // still running would otherwise go the moment the batch did, which
+            // is often within the second.
             self.toast_until = None;
         }
         self.had_active = active_now;
@@ -525,7 +546,7 @@ mod tests {
     fn automatic_progress_and_errors_disappear_without_opening_details() {
         let ctx = egui::Context::default();
         let mut panel = Panel::default();
-        panel.notify("Preparing copied files".into());
+        panel.notify_transient("Preparing copied files".into());
         let active = [Transfer {
             id: 1,
             name: "report.pdf".into(),
@@ -551,6 +572,35 @@ mod tests {
         frame(&ctx, &mut panel, vec![], &[]);
         let (output, _) = frame(&ctx, &mut panel, vec![], &[]);
         assert!(output.shapes.is_empty());
+    }
+    #[test]
+    fn a_failure_raised_mid_batch_outlives_the_batch() {
+        // Three files dropped, the first fails while the other two are still
+        // going, and they finish a moment later. The failure is the one thing
+        // the user has to see, and the end of the batch must not take it down
+        // with the progress it shared the corner with.
+        let ctx = egui::Context::default();
+        let mut panel = Panel::default();
+        let active = [Transfer {
+            id: 2,
+            name: "second.txt".into(),
+            progress: Some((1, 10)),
+        }];
+        frame(&ctx, &mut panel, vec![], &active);
+        panel.notify("Transfer failed: first.txt".into());
+        frame(&ctx, &mut panel, vec![], &active);
+        frame(&ctx, &mut panel, vec![], &[]);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &[]);
+        text_position(&output, "Transfer failed: first.txt");
+        assert!(panel.visible());
+        // A notice about the work itself still goes when the work does.
+        panel.notify_transient("Download requested".into());
+        frame(&ctx, &mut panel, vec![], &active);
+        frame(&ctx, &mut panel, vec![], &active);
+        frame(&ctx, &mut panel, vec![], &[]);
+        let (output, _) = frame(&ctx, &mut panel, vec![], &[]);
+        assert!(output.shapes.is_empty());
+        assert!(!panel.visible());
     }
     #[test]
     fn clipboard_success_is_silent_but_partial_failures_are_visible() {

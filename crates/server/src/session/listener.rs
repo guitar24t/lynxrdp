@@ -164,3 +164,79 @@ pub fn spawn_client_reader(
         })
         .expect("spawn reader thread")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    use crossbeam_channel::Receiver;
+
+    /// A listener on a fresh loopback port and the channel it admits into.
+    ///
+    /// The thread stays blocked in `accept` for the rest of the test binary;
+    /// there is nothing it holds that is worth the ceremony of reclaiming.
+    fn listening(require_uid: Option<u32>) -> (SocketAddr, Receiver<CoreEvent>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        spawn_tcp_listener(listener, tx, require_uid);
+        (addr, rx)
+    }
+
+    #[test]
+    fn a_connection_from_the_required_uid_is_admitted() {
+        let (addr, rx) = listening(Some(peer::own_uid()));
+        let _client = TcpStream::connect(addr).unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(CoreEvent::NewClient(client)) => assert!(
+                client.description.starts_with("127.0.0.1:"),
+                "{}",
+                client.description
+            ),
+            Ok(_) => panic!("the listener sent something other than a new client"),
+            Err(e) => panic!("the listener did not admit its own user: {e}"),
+        }
+    }
+
+    /// The peer is this process, so from the listener's side any uid but ours
+    /// is another user's. This is the branch SECURITY.md relies on for
+    /// `--listen` mode, and the end-to-end suite cannot reach it: it has no
+    /// second uid to connect as. The test above is what makes this one
+    /// meaningful -- it shows the `/proc/net/tcp` lookup identifies a peer
+    /// here, so the refusal below is the mismatch and not a failed lookup.
+    #[test]
+    fn a_connection_from_another_uid_is_refused() {
+        let (addr, rx) = listening(Some(peer::own_uid().wrapping_add(1)));
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // A refused connection is dropped without a word. Only the listener
+        // holds the accepted end, so EOF here means it let go; an admitted
+        // socket would be sitting open in the channel instead.
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).unwrap(),
+            0,
+            "the connection was not closed"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused connection reached the core"
+        );
+    }
+
+    /// What `--insecure-skip-peer-check` passes.
+    #[test]
+    fn the_check_can_be_switched_off() {
+        let (addr, rx) = listening(None);
+        let _client = TcpStream::connect(addr).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(CoreEvent::NewClient(_))
+        ));
+    }
+}

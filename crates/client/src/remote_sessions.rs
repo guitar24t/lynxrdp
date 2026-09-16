@@ -76,17 +76,24 @@ pub fn run(config: &TunnelConfig, terminate: Option<(u32, u64)>) -> Result<Vec<S
     };
     if !status.success() {
         errors.seek(SeekFrom::Start(0))?;
-        let mut text = String::new();
-        errors.take(8192).read_to_string(&mut text)?;
+        let mut text = Vec::new();
+        errors.take(8192).read_to_end(&mut text)?;
+        // Lossy on purpose, as launch.rs is for the same data: the words are
+        // ssh's, in whatever encoding its host speaks -- a banner in a legacy
+        // code page, a localised message in the OEM code page on Windows, or
+        // the cut above landing inside a multibyte character -- and a strict
+        // read replaced what ssh said with an error about UTF-8.
+        let text = String::from_utf8_lossy(&text);
         bail!("session management failed: {}", text.trim());
     }
     if terminate.is_some() {
         return Ok(Vec::new());
     }
     output.seek(SeekFrom::Start(0))?;
-    let mut text = String::new();
-    output.take(1024 * 1024).read_to_string(&mut text)?;
-    serde_json::from_str(&text).context("reading the session list (the server may need updating)")
+    let mut text = Vec::new();
+    output.take(1024 * 1024).read_to_end(&mut text)?;
+    serde_json::from_str(&String::from_utf8_lossy(&text))
+        .context("reading the session list (the server may need updating)")
 }
 /// A remote session list belonging to one saved SSH connection.
 pub struct Window {
@@ -148,7 +155,10 @@ impl Window {
             ui.label("These are your running desktops. Refreshing does not connect to them.");
             if ui.add_enabled(self.pending.is_none(), egui::Button::new("Refresh")).clicked() { self.refresh(None); }
             if self.pending.is_some() { ui.spinner(); ctx.request_repaint_after(Duration::from_millis(100)); }
-            if let Some(error) = &self.error { ui.colored_label(egui::Color32::LIGHT_RED, error); }
+            // The theme's error colour, not a fixed one: this window is white in the
+            // light theme, where LIGHT_RED fails the contrast floor theme.rs holds
+            // every other error colour to.
+            if let Some(error) = &self.error { ui.colored_label(ui.visuals().error_fg_color, error); }
             if self.pending.is_none() && self.records.is_empty() { ui.label("No running desktops."); }
             for record in &self.records {
                 ui.horizontal(|ui| {
@@ -196,5 +206,30 @@ mod tests {
             args.last().unwrap(),
             "lynxrdp-session --terminate 123 --started 456"
         );
+    }
+
+    /// What ssh said is the whole of what the user has to go on, and one
+    /// byte outside UTF-8 -- a banner in a legacy encoding, a localised
+    /// message -- used to replace all of it with an error about UTF-8.
+    #[cfg(unix)]
+    #[test]
+    fn a_stray_byte_in_sshs_output_does_not_hide_what_it_said() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("ssh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'Permission denied (\\377publickey)\\n' >&2\nexit 255\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cfg = TunnelConfig {
+            destination: "user@host".into(),
+            ssh_program: script.display().to_string(),
+            ..Default::default()
+        };
+        let err = run(&cfg, None).unwrap_err().to_string();
+        assert!(err.contains("Permission denied"), "{err}");
+        assert!(err.contains("publickey"), "{err}");
     }
 }

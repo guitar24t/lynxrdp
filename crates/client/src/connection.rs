@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -76,9 +76,30 @@ fn clipboard_file_entries(paths: &[PathBuf]) -> Result<Vec<lynxrdp_proto::FileEn
         if !meta.is_file() {
             bail!("folders cannot be pasted through the clipboard yet; drag {} into the session to upload it", path.display());
         }
-        let name = path.to_str().context("the filename cannot be represented in the transfer protocol")?;
-        Ok(lynxrdp_proto::FileEntry { path: name.to_owned(), size: meta.len() })
+        let name = wire_path(path).context("the filename cannot be represented in the transfer protocol")?;
+        Ok(lynxrdp_proto::FileEntry { path: name, size: meta.len() })
     }).collect()
+}
+
+/// The spelling of a local path that goes on the wire in a `FileEntry`.
+///
+/// `FileEntry::path` is documented as `/`-separated and the session takes
+/// that literally: the last `/`-separated component is the file's name. A
+/// native Windows path handed over verbatim has no `/` in it, so
+/// `C:\Users\alice\report.pdf` reached the session as one long name and was
+/// staged as `C__Users_alice_report.pdf`. Only Windows is rewritten: on unix
+/// a backslash is an ordinary character in a file name, not a separator.
+///
+/// The local `PathBuf` is kept alongside for opening the file, so this string
+/// is only the key the session asks for it by, and is free to be spelled the
+/// way the protocol wants.
+pub(crate) fn wire_path(path: &Path) -> Option<String> {
+    let text = path.to_str()?.to_owned();
+    if cfg!(windows) {
+        Some(text.replace('\\', "/"))
+    } else {
+        Some(text)
+    }
 }
 
 /// Distinguish a rejected local selection from a failed wire offer. A viewer
@@ -313,9 +334,104 @@ const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// the caller to pass something short.
 const POLL_SLICE: Duration = Duration::from_millis(250);
 
+/// Most bytes of decoded messages the reader thread may hold ahead of the UI.
+///
+/// The one bound on the receive side that is not per message. Every limit in
+/// `proto` caps a single message or transfer; nothing there stops a peer from
+/// sending the next one before this side has looked at the last, and a session
+/// that ignores flow control -- never waiting for a `FrameAck`, streaming
+/// transfer chunks past its window -- used to grow an unbounded channel as fast
+/// as the tunnel could deliver. Sixteen mebibytes is a handful of full-screen
+/// frames: a well-behaved server never has more than one in flight, so it
+/// never meets this, and a hostile one is held at it.
+const MAX_BACKLOG_BYTES: usize = 16 * 1024 * 1024;
+
+/// Most offers this client holds open at once for the session's `FileRequest`s.
+///
+/// The number the server applies to requests from us, mirrored back.
+const MAX_OUTGOING_TRANSFERS: usize = 64;
+
+/// The byte budget between the reader thread and [`Client::poll_event`].
+///
+/// A channel bounded by count would not do the job: a message is anywhere
+/// from a few bytes to `MAX_MESSAGE_SIZE`, so a count small enough to bound
+/// memory would stall a burst of pings and acknowledgements that costs
+/// nothing to hold.
+#[derive(Default)]
+struct Backlog {
+    state: Mutex<BacklogState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct BacklogState {
+    bytes: usize,
+    closed: bool,
+}
+
+impl Backlog {
+    /// Wait until `size` more bytes fit; `false` once the connection is closing.
+    ///
+    /// An empty backlog admits any size. One message can be larger than the
+    /// whole budget, and refusing it would wedge the connection on a frame
+    /// the server is entitled to send.
+    fn admit(&self, size: usize) -> bool {
+        let mut state = self.state.lock().unwrap();
+        while !state.closed
+            && state.bytes > 0
+            && state.bytes.saturating_add(size) > MAX_BACKLOG_BYTES
+        {
+            state = self.changed.wait(state).unwrap();
+        }
+        if state.closed {
+            return false;
+        }
+        state.bytes += size;
+        true
+    }
+
+    fn release(&self, size: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.bytes = state.bytes.saturating_sub(size);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// Wake a reader waiting for room so that it can exit.
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    fn bytes(&self) -> usize {
+        self.state.lock().unwrap().bytes
+    }
+}
+
+/// What holding a decoded message costs, near enough to budget by.
+///
+/// The enum's own size covers everything without a payload; the carriers add
+/// what they own. An underestimate only loosens the bound.
+fn queued_size(msg: &Message) -> usize {
+    let payload = match msg {
+        Message::ScreenUpdate { copies, tiles, .. } => {
+            copies.len() * 12 + tiles.iter().map(|t| t.data.len() + 16).sum::<usize>()
+        }
+        Message::CursorShape { cursor } => cursor.argb.len() * 4,
+        Message::ClipboardText { text } | Message::Notice { text } => text.len(),
+        Message::TransferData { data, .. } => data.len(),
+        Message::FileList { files, .. } => files.iter().map(|f| f.path.len() + 32).sum(),
+        _ => 0,
+    };
+    std::mem::size_of::<Message>() + payload
+}
+
 pub struct Client {
     writer: crate::outbound::Outbound,
-    events: Receiver<Message>,
+    events: Receiver<(Message, usize)>,
+    /// Bytes admitted to `events` and not yet taken out of it.
+    backlog: Arc<Backlog>,
     reader: Option<JoinHandle<()>>,
     decoder: Decoder,
     info: ServerInfo,
@@ -450,9 +566,11 @@ impl Client {
             };
         stream.set_read_timeout(None)?;
 
-        let (tx, rx) = crossbeam_channel::unbounded::<Message>();
+        let (tx, rx) = crossbeam_channel::unbounded::<(Message, usize)>();
         let bytes_received = Arc::new(Mutex::new(0u64));
         let counter = bytes_received.clone();
+        let backlog = Arc::new(Backlog::default());
+        let budget = backlog.clone();
         let writer = crate::outbound::Outbound::new(stream)?;
         let reader_thread = std::thread::Builder::new()
             .name("lynxrdp-reader".into())
@@ -466,7 +584,15 @@ impl Client {
                                 *counter.lock().unwrap() +=
                                     n as u64 + 16 + (copies.len() * 12) as u64;
                             }
-                            if tx.send(msg).is_err() {
+                            // Blocking here is what makes the bound reach the
+                            // peer: a reader that has stopped reading lets the
+                            // socket buffer fill, ssh stops forwarding, and
+                            // the session's own sender blocks -- TCP
+                            // backpressure end to end. Nothing else provides
+                            // it; the server waiting for a FrameAck is a
+                            // courtesy a hostile one need not extend.
+                            let size = queued_size(&msg);
+                            if !budget.admit(size) || tx.send((msg, size)).is_err() {
                                 break;
                             }
                         }
@@ -477,7 +603,10 @@ impl Client {
                                 }
                                 other => other.to_string(),
                             };
-                            let _ = tx.send(Message::Disconnect { reason });
+                            // Outside the budget: it exists to hold back a
+                            // peer that will not wait, and this is the reader
+                            // giving up. Small, and the last thing queued.
+                            let _ = tx.send((Message::Disconnect { reason }, 0));
                             break;
                         }
                     }
@@ -499,6 +628,7 @@ impl Client {
         Ok(Self {
             writer,
             events: rx,
+            backlog,
             reader: Some(reader_thread),
             decoder: Decoder::new(width, height),
             info,
@@ -903,7 +1033,10 @@ impl Client {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let msg = match self.events.recv_timeout(remaining.min(POLL_SLICE)) {
-                Ok(m) => m,
+                Ok((m, size)) => {
+                    self.backlog.release(size);
+                    m
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     if self.last_message_at.elapsed() > LIVENESS_TIMEOUT {
                         let reason = format!(
@@ -1038,7 +1171,32 @@ impl Client {
         })
     }
 
+    /// Apply one server message.
+    ///
+    /// An `Err` out of here is a protocol error -- something in the message
+    /// this client could not make sense of -- and the session window treats
+    /// it as final: the two ends disagree about the wire format, and trying
+    /// again will not change that. The replies sent from inside are the
+    /// exception that has to be caught. `FrameAck`, `Pong` and every transfer
+    /// reply go through the writer, and the writer failing is the tunnel
+    /// dying, which is the one thing the window *does* retry. Noticed at the
+    /// top of `poll_event`, that failure was already a disconnect; noticed
+    /// here, one message earlier, it came out as a protocol error and cost
+    /// the user the reconnection.
     fn handle(&mut self, msg: Message) -> Result<Option<ClientEvent>> {
+        match self.handle_message(msg) {
+            Err(e) => match self.writer.error() {
+                Some(reason) => {
+                    self.closed = Some(reason.clone());
+                    Ok(Some(ClientEvent::Disconnected(reason)))
+                }
+                None => Err(e),
+            },
+            handled => handled,
+        }
+    }
+
+    fn handle_message(&mut self, msg: Message) -> Result<Option<ClientEvent>> {
         if let Some(result) = self.handle_transfer(&msg) {
             return result;
         }
@@ -1077,6 +1235,33 @@ impl Client {
                 .remove(&id)
                 .map(|_| ClientEvent::FileDropResult { id, ok, reason }),
             Message::FileRequest { id, path } => {
+                // The server's `on_file_request` rules, mirrored: one open per
+                // id, and a ceiling on offers outstanding. Each offer holds a
+                // descriptor until the peer accepts or ends it, so a session
+                // that kept asking for the one file the user copied, never
+                // answering, could run this client out of descriptors -- at
+                // which point every local file operation in it fails.
+                let (outgoing, _) = self.transfers.in_flight();
+                let busy = self.transfers.active_ids().contains(&id);
+                if busy || outgoing >= MAX_OUTGOING_TRANSFERS {
+                    log::warn!(
+                        "refusing file request {id} for {path:?}: {outgoing} outgoing \
+                         transfers in progress, id busy: {busy}"
+                    );
+                    let message = if busy {
+                        format!("{path}: transfer {id} is already in progress")
+                    } else {
+                        format!(
+                            "{path}: {MAX_OUTGOING_TRANSFERS} transfers are already in progress"
+                        )
+                    };
+                    self.send(&Message::TransferEnd {
+                        id,
+                        ok: false,
+                        message,
+                    })?;
+                    return Ok(None);
+                }
                 let clipboard_copy = self.offered_files.contains_key(&path);
                 // Serve only what this client put on the clipboard: the
                 // session must not be able to read arbitrary local files.
@@ -1237,6 +1422,10 @@ impl Client {
 
     /// Take the socket down and collect both I/O threads.
     fn close_socket(&mut self, reason: &str) {
+        // Before the join: a reader waiting for room in the backlog is not in
+        // a read the socket shutdown can interrupt, and nobody is going to
+        // poll the room into existence once this has started.
+        self.backlog.close();
         self.writer.close(false);
         if let Some(t) = self.reader.take() {
             let _ = t.join();
@@ -1392,7 +1581,26 @@ mod tests {
             })
             .collect();
         assert_eq!(lists.len(), 1);
-        assert_eq!(lists[0][0].path, file.to_string_lossy());
+        assert_eq!(lists[0][0].path, wire_path(&file).unwrap());
+    }
+
+    #[test]
+    fn wire_paths_are_slash_separated_where_the_native_form_is_not() {
+        // The session names a file by its last `/`-separated component. A
+        // Windows path with no `/` in it is one long name to it.
+        let native = Path::new("C:\\Users\\alice\\report.pdf");
+        let wire = wire_path(native).unwrap();
+        if cfg!(windows) {
+            assert_eq!(wire, "C:/Users/alice/report.pdf");
+        } else {
+            // A backslash is an ordinary character in a unix file name, and
+            // rewriting it would name a file that does not exist.
+            assert_eq!(wire, "C:\\Users\\alice\\report.pdf");
+        }
+        assert_eq!(
+            wire_path(Path::new("/home/alice/report.pdf")).unwrap(),
+            "/home/alice/report.pdf"
+        );
     }
 
     #[test]
@@ -1886,5 +2094,215 @@ mod tests {
         assert_eq!(std::fs::read(destination).unwrap(), payload);
         client.disconnect("done");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_writer_failure_noticed_while_answering_is_a_disconnect_not_a_protocol_error() {
+        // The same failure was classified two ways depending on where it was
+        // noticed. Seen at the top of `poll_event` it was a retryable
+        // disconnect; seen through the `Err` of a reply sent from inside
+        // `handle` -- a Pong, a FrameAck, a transfer reply -- it reached the
+        // session window as "protocol error", the one kind of failure the
+        // window refuses to retry. A tunnel dying mid-burst lost the
+        // reconnection that the same death one message later would get.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = fake_server(listener, vec![hello(4, 4)]);
+        let mut c = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        // A message this client cannot decode is still a protocol error:
+        // that is what the `Err` path is for.
+        let corrupt = Message::ScreenUpdate {
+            frame_id: 1,
+            copies: vec![],
+            tiles: vec![TileUpdate {
+                rect: Rect::new(0, 0, 2, 2),
+                encoding: TileEncoding::Solid,
+                data: vec![1, 2],
+            }],
+        };
+        assert!(c.handle(corrupt).is_err());
+        assert!(c.closed().is_none());
+        // Fail the writer the way a dead tunnel looks from the UI thread: a
+        // send that cannot be queued. Every later send fails the same way,
+        // including the Pong the next Ping asks for.
+        c.writer
+            .send(vec![0; crate::outbound::MAX_BYTES + 1])
+            .unwrap_err();
+        match c.handle(Message::Ping { nonce: 1 }) {
+            Ok(Some(ClientEvent::Disconnected(reason))) => {
+                assert!(reason.contains("outgoing connection stalled"), "{reason}");
+                assert_eq!(c.closed(), Some(reason.as_str()));
+            }
+            other => panic!("expected a disconnect, got {other:?}"),
+        }
+        assert!(matches!(
+            c.poll_event(Duration::ZERO),
+            Ok(Some(ClientEvent::Disconnected(_)))
+        ));
+    }
+
+    #[test]
+    fn a_peer_that_ignores_flow_control_is_held_at_the_backlog_bound() {
+        // Nothing in `proto` bounds how much the peer sends before this side
+        // has read any of it, so the budget is all that stands between a
+        // session that ignores flow control and a client whose memory grows
+        // as fast as the tunnel delivers. The reader must stop reading --
+        // that is what closes the TCP window at the peer -- must resume as
+        // the UI drains, and closing the client must not wait on a reader
+        // that is itself waiting on the UI.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let message = Message::ClipboardText {
+            text: "x".repeat(1024 * 1024),
+        };
+        let per = queued_size(&message);
+        let fit = MAX_BACKLOG_BYTES / per;
+        // Far more than the budget and anything the loopback buffers hold.
+        let flood = 8 * MAX_BACKLOG_BYTES / per;
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+            assert!(matches!(
+                read_message(&mut s).unwrap(),
+                Message::ClientHello { .. }
+            ));
+            write_message(&mut s, &hello(4, 4)).unwrap();
+            let mut sent = 0;
+            for _ in 0..flood {
+                if write_message(&mut s, &message).is_err() {
+                    break;
+                }
+                sent += 1;
+            }
+            sent
+        });
+        let mut c = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        let settle = |c: &Client| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while c.events.len() < fit {
+                assert!(
+                    Instant::now() < deadline,
+                    "the reader stalled short of the bound"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(c.events.len(), fit, "the reader read past the bound");
+            assert!(c.backlog.bytes() <= MAX_BACKLOG_BYTES);
+        };
+        settle(&c);
+        // Draining makes room, and the reader takes it.
+        for _ in 0..3 {
+            assert!(matches!(
+                c.poll_event(Duration::from_secs(5)).unwrap(),
+                Some(ClientEvent::Clipboard(_))
+            ));
+        }
+        settle(&c);
+        let start = Instant::now();
+        c.abandon("enough");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "closing waited on the blocked reader"
+        );
+        assert!(c.reader.is_none());
+        drop(c);
+        let sent = server.join().unwrap();
+        assert!(sent < flood, "the peer was never made to wait");
+    }
+
+    #[test]
+    fn file_requests_are_refused_for_a_busy_id_and_past_the_outstanding_cap() {
+        // Every offer holds an open file until the session accepts or ends
+        // it. Without the server's two rules mirrored here, a session asking
+        // for the copied file over and over and never answering would run
+        // the client out of descriptors.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("copied.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let mut greeting = hello(4, 4);
+        if let Message::ServerHello {
+            features: enabled, ..
+        } = &mut greeting
+        {
+            *enabled |= features::CLIPBOARD_FILES;
+        }
+        let over = MAX_OUTGOING_TRANSFERS as u64 + 1;
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            assert!(matches!(
+                read_message(&mut s).unwrap(),
+                Message::ClientHello { .. }
+            ));
+            write_message(&mut s, &greeting).unwrap();
+            let Message::FileList { files, .. } = read_message(&mut s).unwrap() else {
+                panic!("expected the clipboard file list");
+            };
+            // One past the cap, then the first id again: a duplicate is
+            // refused whatever the count.
+            for id in (1..=over).chain([1]) {
+                write_message(
+                    &mut s,
+                    &Message::FileRequest {
+                        id,
+                        path: files[0].path.clone(),
+                    },
+                )
+                .unwrap();
+            }
+            let mut replies = Vec::new();
+            while replies.len() < over as usize + 1 {
+                if let m @ (Message::TransferOffer { .. } | Message::TransferEnd { .. }) =
+                    read_message(&mut s).unwrap()
+                {
+                    replies.push(m);
+                }
+            }
+            replies
+        });
+        let mut c = Client::connect(addr, &ConnectOptions::default(), None).unwrap();
+        c.offer_clipboard_files(std::slice::from_ref(&file))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !server.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "the session never got all its answers"
+            );
+            let _ = c.poll_event(Duration::from_millis(20)).unwrap();
+        }
+        assert_eq!(c.transfers.in_flight().0, MAX_OUTGOING_TRANSFERS);
+        c.disconnect("bye");
+        let replies = server.join().unwrap();
+        let offered: Vec<u64> = replies
+            .iter()
+            .filter_map(|m| match m {
+                Message::TransferOffer { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            offered,
+            (1..=MAX_OUTGOING_TRANSFERS as u64).collect::<Vec<_>>()
+        );
+        let refused: Vec<(u64, &str)> = replies
+            .iter()
+            .filter_map(|m| match m {
+                Message::TransferEnd {
+                    id,
+                    ok: false,
+                    message,
+                } => Some((*id, message.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert_eq!(refused[0].0, over);
+        assert_eq!(refused[1].0, 1);
+        for (_, why) in &refused {
+            assert!(why.contains("already in progress"), "{why}");
+        }
     }
 }

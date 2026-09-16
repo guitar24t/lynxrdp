@@ -5,18 +5,26 @@
 //! login for the current user with a generated key works -- unless
 //! `LYNXRDP_REQUIRE_E2E` is set, which makes any of those missing a failure.
 
-use std::io::Write;
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use lynxrdp_client::connection::{Client, ClientEvent, ConnectOptions};
 use lynxrdp_client::tunnel::{RemoteTarget, Tunnel, TunnelConfig};
 
 mod common;
-use common::{have, skip_unless};
+use common::{have, skip_unless, ChildGuard};
 
+/// A port that was free a moment ago.
+///
+/// Only for sshd, which has to be told its port in a config file and cannot
+/// be asked for one; the number can be taken by another test between the
+/// release here and sshd's bind, in which case sshd fails to start and the
+/// suite skips. The session is not started this way -- it binds port 0 and
+/// reports what it got.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -43,7 +51,9 @@ fn current_user() -> String {
 
 /// A private sshd on loopback allowing key auth for the current user only.
 struct Sshd {
-    child: Child,
+    /// Held for its drop, which stops the sshd; first, so the directory it
+    /// runs from is still there when it gets the signal.
+    _child: ChildGuard,
     port: u16,
     key: PathBuf,
     _dir: tempfile::TempDir,
@@ -100,14 +110,19 @@ impl Sshd {
         } else {
             "sshd"
         };
-        let child = Command::new(sshd_bin)
-            .arg("-D")
-            .arg("-f")
-            .arg(&cfg)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+        // Guarded at once: the readiness loop below gives up on a slow sshd
+        // by returning `None`, which would otherwise leave it running in a
+        // directory this function has just deleted, and print SKIP.
+        let child = ChildGuard::new(
+            Command::new(sshd_bin)
+                .arg("-D")
+                .arg("-f")
+                .arg(&cfg)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()?,
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
             if Instant::now() > deadline {
@@ -116,7 +131,7 @@ impl Sshd {
             std::thread::sleep(Duration::from_millis(50));
         }
         Some(Self {
-            child,
+            _child: child,
             port,
             key: userkey,
             _dir: dir,
@@ -124,28 +139,29 @@ impl Sshd {
     }
 }
 
-impl Drop for Sshd {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn start_session() -> (Child, u16) {
-    let port = free_port();
-    let child = Command::new(env!("CARGO_BIN_EXE_lynxrdp-session"))
-        .args(["--listen"])
-        .arg(format!("127.0.0.1:{port}"))
-        .args(["--width", "400", "--height", "300", "--startwm", "none"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start session");
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "session did not listen");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+fn start_session() -> (ChildGuard, u16) {
+    // Port 0, and the bound address read back from the session: a port
+    // picked here by binding and releasing it can be handed to another test
+    // in the meantime.
+    let mut child = ChildGuard::new(
+        Command::new(env!("CARGO_BIN_EXE_lynxrdp-session"))
+            .args(["--listen", "127.0.0.1:0"])
+            .args(["--width", "400", "--height", "300", "--startwm", "none"])
+            .arg("--print-display")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start session"),
+    );
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert!(line.starts_with(':'), "expected display, got {line:?}");
+    line.clear();
+    stdout.read_line(&mut line).unwrap();
+    let port = SocketAddr::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("expected the listen address, got {line:?}: {e}"))
+        .port();
     (child, port)
 }
 
@@ -178,8 +194,6 @@ fn connects_through_a_real_ssh_tunnel() {
     let mut tunnel = match Tunnel::open(&cfg, Duration::from_secs(20)) {
         Ok(t) => t,
         Err(e) => {
-            let _ = session.kill();
-            let _ = session.wait();
             if skip_unless(false, &format!("ssh login not available here: {e}")) {
                 return;
             }
@@ -233,7 +247,5 @@ fn connects_through_a_real_ssh_tunnel() {
     }
     client.disconnect("done");
     drop(tunnel);
-    let _ = session.kill();
-    let _ = session.wait();
-    drop(sshd);
+    // The session (already exited) and the sshd go with their guards.
 }

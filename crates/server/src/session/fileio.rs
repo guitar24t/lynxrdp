@@ -281,6 +281,42 @@ fn stalled() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "file worker did not answer")
 }
 
+/// Open `path` for a download, refusing anything but a regular file before
+/// any call that could wait on it.
+///
+/// A plain `File::open` on a FIFO sits in the kernel until a writer turns up,
+/// and this is the only file thread the session has: one such open would stop
+/// every upload, download and clipboard paste for the rest of the login. The
+/// path is the client's to choose, so the open has to come back whatever it
+/// names. `O_NONBLOCK` makes it return at once for a FIFO or a device,
+/// `O_NOCTTY` keeps a terminal device from becoming ours, the type is read
+/// through the descriptor rather than the name so nothing can be swapped in
+/// between, and the flag is cleared again before the file is read -- it means
+/// nothing to a regular file, but a handle should not carry a mode the code
+/// reading it never asked for. A mount that has stopped answering is not
+/// helped by any of this: that open blocks in the kernel whatever the flags,
+/// and the worker's timeout only tells the transfer it stalled.
+fn open_regular(path: &str) -> io::Result<(File, u64)> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    // SAFETY: fcntl on a descriptor this function owns.
+    unsafe {
+        let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+    Ok((file, meta.len()))
+}
+
 // Every component is opened relative to the preceding directory descriptor.
 // No pathname check followed by a separate pathname open: a symlink swap in
 // between cannot redirect the write. The final rename replaces a directory
@@ -361,14 +397,10 @@ fn worker(jobs: Receiver<Job>, events: Sender<CoreEvent>) {
                 if life.strong_count() == 0 {
                     continue;
                 }
-                let result = File::open(&path)
-                    .and_then(|file| {
-                        let meta = file.metadata()?;
-                        if !meta.is_file() {
-                            return Err(io::Error::other("not a regular file"));
-                        }
+                let result = open_regular(&path)
+                    .map(|(file, len)| {
                         open.insert(handle, (life, Handle::Input(file)));
-                        Ok(meta.len())
+                        len
                     })
                     .map_err(|e| e.to_string());
                 let _ = events.send(CoreEvent::FileOpened(Box::new(FileOpened {
@@ -494,6 +526,39 @@ mod tests {
         drop((a, b));
         assert!(start.elapsed() < Duration::from_secs(1));
     }
+    #[test]
+    fn a_fifo_is_refused_without_wedging_the_worker() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: mkfifo on a path inside a directory this test owns.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let io = FileIo::spawn(tx.clone()).unwrap();
+        let opened = |id: u64, path: &Path| {
+            // The reader is handed back because the worker skips an open
+            // nobody is waiting on any more.
+            let reader = io.open(id, 1, path.display().to_string(), tx.clone());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(CoreEvent::FileOpened(answer)) if answer.id == id => break (reader, answer),
+                    Ok(_) => {}
+                    Err(_) => panic!("no answer for {}: the worker is wedged", path.display()),
+                }
+            }
+        };
+        // A plain open of this sat in the kernel waiting for a writer that
+        // never came, and every job after it queued behind for good.
+        let (_fifo_reader, answer) = opened(1, &fifo);
+        assert!(answer.result.is_err(), "{:?}", answer.result);
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"still serving").unwrap();
+        let (_plain_reader, answer) = opened(2, &plain);
+        assert_eq!(answer.result, Ok(13));
+    }
+
     #[test]
     fn symlink_parent_is_refused_and_final_symlink_is_not_followed() {
         let root = tempfile::tempdir().unwrap();

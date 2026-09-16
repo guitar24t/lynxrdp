@@ -186,7 +186,13 @@ impl<R: Read> TransferSender<R> {
             sent: 0,
             next_seq: 0,
             acked: 0,
-            eof: false,
+            // An empty transfer has nothing to read, and the receiver
+            // completes it on the offer alone, so its `TransferEnd { ok: true }`
+            // can arrive before this side has been pumped at all when the
+            // global window is busy with other transfers. A sender that only
+            // learned it was drained inside `next_chunk` reported that
+            // success as a failure.
+            eof: total == 0,
             partial: Vec::new(),
         }
     }
@@ -472,10 +478,14 @@ mod tests {
         ] {
             let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             if size == 0 {
-                // An empty transfer sends no chunks and completes at once.
+                // An empty transfer sends no chunks and completes at once, on
+                // both ends: the sender must not need a `next_chunk` call to
+                // find that out.
                 let rx = TransferReceiver::new(1, 0, Vec::new());
                 assert!(rx.is_complete());
                 assert_eq!(rx.finish().unwrap(), Vec::<u8>::new());
+                let tx = TransferSender::new(1, 0, io::empty());
+                assert!(tx.is_complete());
                 continue;
             }
             assert_eq!(pump(&data, true), data, "size {size}");
@@ -922,6 +932,12 @@ impl TransferManager {
                 name,
                 size,
             } => {
+                // Whatever the answer, the offer is the peer's reply to a
+                // request for this id, so the request is no longer pending.
+                // Taking it out only on the accepting path left a refused id
+                // in `pending` -- and so in `active_ids()` -- for the rest of
+                // the connection.
+                self.pending.remove(id);
                 if self.incoming.contains_key(id)
                     || self.outgoing.contains_key(id)
                     || self.incoming.len() >= 64
@@ -941,7 +957,6 @@ impl TransferManager {
                     });
                     return Some(out);
                 }
-                self.pending.remove(id);
                 match policy.accept(*id, *purpose, name, *size) {
                     Ok(sink) => {
                         // Memory limits are enforced here rather than in each
@@ -1812,6 +1827,128 @@ mod manager_tests {
             )
             .unwrap();
         assert!(again.failed.is_empty());
+    }
+
+    /// An empty transfer accepted while the global window is saturated.
+    ///
+    /// The receiver completes a zero-length transfer on the offer alone, so
+    /// its `TransferEnd { ok: true }` can arrive before `pump` has visited the
+    /// sender at all -- `pump` stops before the first transfer once the budget
+    /// is spent. A sender that only learned it was drained inside
+    /// `next_chunk` then reported the peer's correct success as "success
+    /// before the transfer finished", for a file the peer had written.
+    #[test]
+    fn an_empty_transfer_completes_while_the_window_is_full() {
+        let mut m = TransferManager::new(true);
+        let mut policy = MemoryPolicy;
+        let accept = |id| Message::TransferAccept {
+            id,
+            accepted: true,
+            reason: String::new(),
+        };
+        // Two large transfers between them fill GLOBAL_WINDOW_CHUNKS.
+        let mut queued = 0;
+        for id in [1, 2] {
+            m.offer_stream_with_id(
+                id,
+                TransferPurpose::FileUpload,
+                "big".into(),
+                2_000_000,
+                Box::new(io::repeat(0)),
+            );
+            let out = m.handle(&accept(id), &mut policy).unwrap();
+            queued += out
+                .replies
+                .iter()
+                .filter(|r| matches!(r, Message::TransferData { .. }))
+                .count();
+        }
+        assert_eq!(
+            queued, GLOBAL_WINDOW_CHUNKS as usize,
+            "the window is not full"
+        );
+
+        m.offer_stream_with_id(
+            3,
+            TransferPurpose::FileUpload,
+            ".gitkeep".into(),
+            0,
+            Box::new(io::empty()),
+        );
+        let out = m.handle(&accept(3), &mut policy).unwrap();
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        let out = m
+            .handle(
+                &Message::TransferEnd {
+                    id: 3,
+                    ok: true,
+                    message: String::new(),
+                },
+                &mut policy,
+            )
+            .unwrap();
+        assert!(out.failed.is_empty(), "{:?}", out.failed);
+        assert_eq!(out.sent.len(), 1, "{out:?}");
+        assert_eq!(out.sent[0].0, 3);
+    }
+
+    /// A refused offer for an id this side asked for must not stay pending.
+    ///
+    /// The size and receiver-busy refusals returned before the id was taken
+    /// out of `pending`, so it stayed in `active_ids()` for the rest of the
+    /// connection: a permanent "preparing" entry on the client, and one slot
+    /// fewer for downloads on the server.
+    #[test]
+    fn a_refused_offer_releases_the_requested_id() {
+        let refused = |out: &Outcome| {
+            matches!(
+                out.replies.as_slice(),
+                [Message::TransferAccept {
+                    accepted: false,
+                    ..
+                }]
+            )
+        };
+        let offer = |id, size| Message::TransferOffer {
+            id,
+            purpose: TransferPurpose::FileDownload,
+            name: "f".into(),
+            size,
+        };
+
+        // Over the size limit.
+        let mut m = TransferManager::new(true);
+        m.set_max_size(1024);
+        let id = m.next_id();
+        m.expect(id);
+        assert_eq!(m.active_ids(), vec![id]);
+        let out = m.handle(&offer(id, 10_000), &mut MemoryPolicy).unwrap();
+        assert!(refused(&out), "{out:?}");
+        assert!(m.active_ids().is_empty(), "{:?}", m.active_ids());
+
+        // Receiver busy: 64 incoming already open.
+        struct StreamPolicy;
+        impl TransferPolicy for StreamPolicy {
+            fn accept(
+                &mut self,
+                _: u64,
+                _: TransferPurpose,
+                _: &str,
+                _: u64,
+            ) -> Result<Sink, String> {
+                Ok(Sink::Stream(Box::new(io::sink())))
+            }
+        }
+        let mut m = TransferManager::new(true);
+        for id in 0..64 {
+            let out = m.handle(&offer(1000 + id, 1), &mut StreamPolicy).unwrap();
+            assert!(!refused(&out), "offer {id} within the limit was refused");
+        }
+        let id = m.next_id();
+        m.expect(id);
+        let out = m.handle(&offer(id, 1), &mut StreamPolicy).unwrap();
+        assert!(refused(&out), "{out:?}");
+        assert!(!m.active_ids().contains(&id));
     }
 
     #[test]

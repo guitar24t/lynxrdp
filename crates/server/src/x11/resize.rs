@@ -30,6 +30,10 @@ pub fn resize_screen(display: &Arc<XDisplay>, width: u32, height: u32, dpi: u32)
     if (cur_w, cur_h) == (width, height) {
         return Ok(());
     }
+    // GetScreenResourcesCurrent is a RANDR 1.3 request (the 1.2 one probes
+    // every output, which on Xorg means a blocking re-detection of monitors),
+    // and `XDisplay::from_connection` disables resizing below 1.3 so that it
+    // is never sent to a server that would answer it with BadRequest.
     let res = conn
         .randr_get_screen_resources_current(root)?
         .reply()

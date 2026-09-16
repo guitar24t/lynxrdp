@@ -115,6 +115,29 @@ fn samples() -> Vec<(&'static str, Message)> {
             },
         ),
         (
+            // The entry above ORs the six bits that existed when it was
+            // written; ATOMIC_FILES and TARGETED_DROPS, which gate the
+            // extension messages, were added later and pinned nowhere. A new
+            // entry rather than an edit, for the usual reason: the
+            // regenerator refuses to rewrite an existing pin while the floor
+            // stands, and adding one costs nobody.
+            "ClientHello/all-features-v4",
+            Message::ClientHello {
+                version: 4,
+                client_name: "lynxrdp-client/corpus-v4".into(),
+                features: features::LOCAL_CURSOR
+                    | features::CLIPBOARD
+                    | features::RESIZE
+                    | features::CLIPBOARD_IMAGE
+                    | features::FILE_TRANSFER
+                    | features::CLIPBOARD_FILES
+                    | features::ATOMIC_FILES
+                    | features::TARGETED_DROPS,
+                width: 2560,
+                height: 1440,
+            },
+        ),
+        (
             "KeyEvent/press",
             Message::KeyEvent {
                 keysym: 0xff0d,
@@ -728,9 +751,10 @@ fn every_message_kind_is_pinned() {
 /// The corpus catches a field that moved. It is blind to a *constant* that
 /// changed number whenever the sample carrying it is a bitmask, because
 /// `A | B` encodes identically whichever of the two is which:
-/// `ClientHello/all-features` ORs all six feature bits into `0x3f` and
-/// `ClipboardOffer/all-formats` ORs all three formats into `0x07`, so any
-/// permutation inside either set is invisible there. Measured, not assumed --
+/// `ClientHello/all-features` ORs six feature bits into `0x3f` (its `-v4`
+/// sibling all eight into `0xff`) and `ClipboardOffer/all-formats` ORs all
+/// three formats into `0x07`, so any permutation inside either set is
+/// invisible there. Measured, not assumed --
 /// swapping `features::CLIPBOARD` with `features::CLIPBOARD_IMAGE`, which is
 /// an old client offering clipboard *text* being read by a new server as an
 /// offer of *images*, leaves every other test in this file green.
@@ -781,10 +805,46 @@ the next unused number; the existing ones are spent.";
     assert_eq!(features::CLIPBOARD_IMAGE, 0x08_u32, "{RENUMBERED}");
     assert_eq!(features::FILE_TRANSFER, 0x10_u32, "{RENUMBERED}");
     assert_eq!(features::CLIPBOARD_FILES, 0x20_u32, "{RENUMBERED}");
+    // These two gate the extension messages 129-131. Swapped, an old client
+    // advertising atomic uploads is read by a new server as offering targeted
+    // drops: `TransferOptions` is discarded and the server waits for `FileDrop`
+    // messages that never come.
+    assert_eq!(features::ATOMIC_FILES, 0x40_u32, "{RENUMBERED}");
+    assert_eq!(features::TARGETED_DROPS, 0x80_u32, "{RENUMBERED}");
 
     assert_eq!(clipboard_format::TEXT, 0x01_u32, "{RENUMBERED}");
     assert_eq!(clipboard_format::PNG, 0x02_u32, "{RENUMBERED}");
     assert_eq!(clipboard_format::FILES, 0x04_u32, "{RENUMBERED}");
+}
+
+/// Every feature bit is one bit, and no two share it.
+///
+/// The literals above catch a constant that moved. They do not catch a *new*
+/// one that landed on a bit already spent, because nobody writes an assertion
+/// for a constant they do not know is missing from the list. ORing the set
+/// together and counting bits does: two constants on one bit count once.
+#[test]
+fn feature_bits_do_not_overlap() {
+    const ALL: &[u32] = &[
+        features::LOCAL_CURSOR,
+        features::CLIPBOARD,
+        features::RESIZE,
+        features::CLIPBOARD_IMAGE,
+        features::FILE_TRANSFER,
+        features::CLIPBOARD_FILES,
+        features::ATOMIC_FILES,
+        features::TARGETED_DROPS,
+    ];
+    assert!(
+        ALL.iter().all(|b| b.count_ones() == 1),
+        "a feature constant is not a single bit"
+    );
+    let union = ALL.iter().fold(0u32, |acc, b| acc | b);
+    assert_eq!(
+        union.count_ones() as usize,
+        ALL.len(),
+        "two feature constants share a bit"
+    );
 }
 
 /// A tile encoding with no corpus sample is one nobody was made to think about.

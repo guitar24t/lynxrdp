@@ -10,9 +10,15 @@ authors.workspace = true
 
 [dependencies]
 tempfile = "3"
+# The keysym-to-character table for the legacy X11 character ranges (Latin-2
+# to Latin-9, Cyrillic, Greek, Hebrew, Arabic, Thai, currency). Pure Rust, no
+# default features, and already in the tree through winit; hand-embedding the
+# 760-row table would only give us a copy to keep in step with keysymdef.h.
+xkeysym = { version = "0.2", default-features = false }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }
 log = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

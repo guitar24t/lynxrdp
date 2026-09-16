@@ -4,16 +4,18 @@
 //! `LYNXRDP_REQUIRE_E2E` is set, which makes its absence a failure.
 
 use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use lynxrdp_client::connection::{Client, ClientEvent, ConnectOptions};
 
 mod common;
-use common::{have, skip_unless};
+use common::{have, skip_unless, ChildGuard};
 
 struct Daemon {
-    child: Child,
+    /// Declared first: fields drop in order, and the daemon must be gone
+    /// before its runtime and log directories are removed from under it.
+    child: ChildGuard,
     port: u16,
     _dir: tempfile::TempDir,
 }
@@ -21,6 +23,12 @@ struct Daemon {
 impl Daemon {
     fn start(extra_toml: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        // A port that was free a moment ago, and can be taken by another
+        // test before the daemon binds it. There is no better way here: the
+        // daemon refuses `port = 0` in its configuration and has no way to
+        // report a port it chose, so the sessions' port-0 trick does not
+        // apply. Its readiness loop below would then fail rather than talk
+        // to a stranger, and the suite runs single-threaded anyway.
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -34,16 +42,27 @@ impl Daemon {
         );
         let cfg_path = dir.path().join("lynxrdp.toml");
         std::fs::write(&cfg_path, cfg).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_lynxrdpd"))
-            .arg("--config")
-            .arg(&cfg_path)
-            .arg("--allow-non-root")
-            .arg("--stop-sessions-on-exit")
-            .env("RUST_LOG", "debug")
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("start lynxrdpd");
+        // Guarded before the readiness check, so a daemon that never listens
+        // does not outlive the panic that reports it. Thirty seconds of
+        // grace because `--stop-sessions-on-exit` makes its shutdown wait for
+        // every session it started, and the daemon itself allows a
+        // supervisor `SUPERVISOR_EXIT_GRACE` (13 s) to do that before it
+        // gives up on it: a grace only just above that would SIGKILL a
+        // daemon that was about to exit cleanly, on a loaded runner, and
+        // leave its sessions behind.
+        let child = ChildGuard::with_grace(
+            Command::new(env!("CARGO_BIN_EXE_lynxrdpd"))
+                .arg("--config")
+                .arg(&cfg_path)
+                .arg("--allow-non-root")
+                .arg("--stop-sessions-on-exit")
+                .env("RUST_LOG", "debug")
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("start lynxrdpd"),
+            Duration::from_secs(30),
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
             assert!(Instant::now() < deadline, "daemon did not start");
@@ -65,25 +84,7 @@ impl Daemon {
     }
 
     fn stop(&mut self) {
-        // SAFETY: signalling our own child.
-        unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGTERM);
-        }
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        self.stop();
+        self.child.terminate();
     }
 }
 

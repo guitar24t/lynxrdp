@@ -166,9 +166,15 @@ which returns either an in-memory sink or a file. That is the single place
 each side enforces what it is willing to receive, so the rules live in one
 readable function per side rather than spread through the message loop.
 
-Clipboard contents are fetched on demand: an offer names the formats
-available, and the bytes only move if the other side asks for them. Copying
-a large image you never paste therefore costs nothing.
+An offer names the formats available; what then moves depends on the
+format, and it is the same in both directions. Text is sent eagerly, being
+small. File copies are the on-demand case: the offer publishes names and
+sizes, and each file's contents cross only when something on the receiving
+side reads it (the next section). Images are not: the session (`engine.rs`)
+and the client (`connection.rs`) each request the PNG as soon as an offer
+advertises one, so a large screenshot copied while a session is open crosses
+the tunnel whether or not it is ever pasted. A copy you never paste is
+therefore free for files and costs the whole image for an image.
 
 ## File I/O and clipboard batches
 
@@ -268,8 +274,13 @@ because none of the interesting cases (a `.deb` install, an Intel Mac with no
 download, a working copy) exist on the machine running the tests. Only
 `update/fetch.rs` and `update/install.rs` touch the world, and the swap they
 perform always unpacks to a staging name on the target's own filesystem and
-then renames, so an interrupted update leaves a working application and some
-rubbish beside it rather than half an executable.
+then renames, so nothing is ever half an executable. On Linux the new file is
+renamed over the old one and on macOS APFS exchanges the two bundles in one
+step, so there is never a moment without a working application; Windows, and
+a macOS volume that cannot swap, move the old build aside just before the new
+one lands, and an update interrupted in that instant leaves both under
+staging names beside an empty slot, which the next start of either puts
+right.
 
 The version a build believes it is comes from `LYNXRDP_RELEASE_TAG`, stamped
 in by `build.rs` from the release workflow. The Cargo version cannot answer

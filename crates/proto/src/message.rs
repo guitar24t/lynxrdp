@@ -270,6 +270,13 @@ pub struct CursorImage {
 }
 
 /// A protocol message.
+///
+/// Every name, path, reason and message field is free text bounded by
+/// [`crate::wire::MAX_TEXT_LEN`] on both sides -- refused at decode, cut at
+/// encode -- so that a peer-supplied value can always be sent back with a
+/// prefix in front of it. [`Message::ClipboardText`] is the one string allowed
+/// up to [`crate::wire::MAX_BLOB_LEN`], because clipboard text is legitimately
+/// large.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     /// First message from the client.
@@ -612,7 +619,7 @@ impl Message {
                 height,
             } => {
                 w.u16(*version);
-                w.string(client_name);
+                w.text(client_name);
                 w.u32(*features);
                 w.u16(*width);
                 w.u16(*height);
@@ -627,16 +634,16 @@ impl Message {
                 height,
             } => {
                 w.u16(*version);
-                w.string(server_name);
+                w.text(server_name);
                 w.u32(*features);
                 w.u64(*session_id);
-                w.string(username);
+                w.text(username);
                 w.u16(*width);
                 w.u16(*height);
             }
             Message::Rejected { code, reason } => {
                 w.u16(*code);
-                w.string(reason);
+                w.text(reason);
             }
             Message::KeyEvent { keysym, down } => {
                 w.u32(*keysym);
@@ -661,7 +668,7 @@ impl Message {
             }
             Message::ClipboardText { text } => w.string(text),
             Message::Ping { nonce } | Message::Pong { nonce } => w.u64(*nonce),
-            Message::Disconnect { reason } => w.string(reason),
+            Message::Disconnect { reason } => w.text(reason),
             Message::RefreshRequest => {}
             Message::ScreenUpdate {
                 frame_id,
@@ -706,7 +713,7 @@ impl Message {
                 w.u16(*x);
                 w.u16(*y);
             }
-            Message::Notice { text } => w.string(text),
+            Message::Notice { text } => w.text(text),
             Message::TransferOffer {
                 id,
                 purpose,
@@ -715,7 +722,7 @@ impl Message {
             } => {
                 w.u64(*id);
                 w.u8(*purpose as u8);
-                w.string(name);
+                w.text(name);
                 w.u64(*size);
             }
             Message::TransferAccept {
@@ -725,7 +732,7 @@ impl Message {
             } => {
                 w.u64(*id);
                 w.bool(*accepted);
-                w.string(reason);
+                w.text(reason);
             }
             Message::TransferData { id, seq, data } => {
                 w.u64(*id);
@@ -739,7 +746,7 @@ impl Message {
             Message::TransferEnd { id, ok, message } => {
                 w.u64(*id);
                 w.bool(*ok);
-                w.string(message);
+                w.text(message);
             }
             Message::TransferOptions { id, replace } => {
                 w.u64(*id);
@@ -747,13 +754,13 @@ impl Message {
             }
             Message::FileRequest { id, path } => {
                 w.u64(*id);
-                w.string(path);
+                w.text(path);
             }
             Message::FileList { id, files } => {
                 w.u64(*id);
                 w.u32(files.len() as u32);
                 for f in files {
-                    w.string(&f.path);
+                    w.text(&f.path);
                     w.u64(f.size);
                 }
             }
@@ -763,14 +770,14 @@ impl Message {
                 w.u16(*y);
                 w.u32(files.len() as u32);
                 for f in files {
-                    w.string(&f.path);
+                    w.text(&f.path);
                     w.u64(f.size);
                 }
             }
             Message::FileDropResult { id, ok, reason } => {
                 w.u64(*id);
                 w.bool(*ok);
-                w.string(reason);
+                w.text(reason);
             }
             Message::ClipboardOffer { formats } => w.u32(*formats),
             Message::ClipboardRequest { format } => w.u32(*format),
@@ -784,17 +791,17 @@ impl Message {
         let msg = match kind {
             Kind::ClientHello => Message::ClientHello {
                 version: r.u16()?,
-                client_name: r.string()?,
+                client_name: r.text()?,
                 features: r.u32()?,
                 width: r.u16()?,
                 height: r.u16()?,
             },
             Kind::ServerHello => {
                 let version = r.u16()?;
-                let server_name = r.string()?;
+                let server_name = r.text()?;
                 let features = r.u32()?;
                 let session_id = r.u64()?;
-                let username = r.string()?;
+                let username = r.text()?;
                 let width = r.u16()?;
                 let height = r.u16()?;
                 if width > MAX_SCREEN_DIM || height > MAX_SCREEN_DIM {
@@ -812,7 +819,7 @@ impl Message {
             }
             Kind::Rejected => Message::Rejected {
                 code: r.u16()?,
-                reason: r.string()?,
+                reason: r.text()?,
             },
             Kind::KeyEvent => Message::KeyEvent {
                 keysym: r.u32()?,
@@ -838,9 +845,7 @@ impl Message {
             Kind::ClipboardText => Message::ClipboardText { text: r.string()? },
             Kind::Ping => Message::Ping { nonce: r.u64()? },
             Kind::Pong => Message::Pong { nonce: r.u64()? },
-            Kind::Disconnect => Message::Disconnect {
-                reason: r.string()?,
-            },
+            Kind::Disconnect => Message::Disconnect { reason: r.text()? },
             Kind::RefreshRequest => Message::RefreshRequest,
             Kind::ScreenUpdate => {
                 let frame_id = r.u64()?;
@@ -943,12 +948,12 @@ impl Message {
                 x: r.u16()?,
                 y: r.u16()?,
             },
-            Kind::Notice => Message::Notice { text: r.string()? },
+            Kind::Notice => Message::Notice { text: r.text()? },
             Kind::TransferOffer => {
                 let id = r.u64()?;
                 let purpose = TransferPurpose::from_u8(r.u8()?)
                     .ok_or(DecodeError::InvalidValue("transfer purpose"))?;
-                let name = r.string()?;
+                let name = r.text()?;
                 let size = r.u64()?;
                 if size > MAX_TRANSFER_SIZE {
                     return Err(DecodeError::InvalidValue("transfer size"));
@@ -963,7 +968,7 @@ impl Message {
             Kind::TransferAccept => Message::TransferAccept {
                 id: r.u64()?,
                 accepted: r.bool()?,
-                reason: r.string()?,
+                reason: r.text()?,
             },
             Kind::TransferData => {
                 let id = r.u64()?;
@@ -985,7 +990,7 @@ impl Message {
             Kind::TransferEnd => Message::TransferEnd {
                 id: r.u64()?,
                 ok: r.bool()?,
-                message: r.string()?,
+                message: r.text()?,
             },
             Kind::TransferOptions => Message::TransferOptions {
                 id: r.u64()?,
@@ -993,7 +998,7 @@ impl Message {
             },
             Kind::FileRequest => Message::FileRequest {
                 id: r.u64()?,
-                path: r.string()?,
+                path: r.text()?,
             },
             Kind::FileList => {
                 let id = r.u64()?;
@@ -1012,7 +1017,7 @@ impl Message {
                 let mut files = Vec::with_capacity(n);
                 for _ in 0..n {
                     files.push(FileEntry {
-                        path: r.string()?,
+                        path: r.text()?,
                         size: r.u64()?,
                     });
                 }
@@ -1035,7 +1040,7 @@ impl Message {
                 let mut files = Vec::with_capacity(n);
                 for _ in 0..n {
                     files.push(FileEntry {
-                        path: r.string()?,
+                        path: r.text()?,
                         size: r.u64()?,
                     });
                 }
@@ -1044,7 +1049,7 @@ impl Message {
             Kind::FileDropResult => Message::FileDropResult {
                 id: r.u64()?,
                 ok: r.bool()?,
-                reason: r.string()?,
+                reason: r.text()?,
             },
             Kind::ClipboardOffer => Message::ClipboardOffer { formats: r.u32()? },
             Kind::ClipboardRequest => Message::ClipboardRequest { format: r.u32()? },
@@ -1057,6 +1062,7 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::MAX_TEXT_LEN;
     use proptest::prelude::*;
 
     fn all_samples() -> Vec<Message> {
@@ -1391,6 +1397,53 @@ mod tests {
                 height: MAX_SCREEN_DIM,
             })
         );
+    }
+
+    /// A peer-supplied name or path that filled `MAX_BLOB_LEN` exactly could
+    /// not be sent back with anything prepended, and the encoder asserted on
+    /// that -- on the session's main thread. Free text is bounded well below
+    /// the blob limit on both sides so the echo always fits.
+    #[test]
+    fn free_text_fields_are_bounded_below_the_blob_limit() {
+        let request = |len: usize| {
+            let mut w = Writer::new();
+            w.u8(Kind::FileRequest as u8);
+            w.u64(1);
+            w.u32(len as u32);
+            w.raw(&vec![b'a'; len]);
+            Message::decode(w.as_slice())
+        };
+        assert_eq!(
+            request(MAX_TEXT_LEN + 1),
+            Err(DecodeError::LengthTooLarge(MAX_TEXT_LEN + 1))
+        );
+        assert!(matches!(
+            request(MAX_TEXT_LEN),
+            Ok(Message::FileRequest { .. })
+        ));
+
+        // Clipboard text is the one string that is legitimately large.
+        let m = Message::ClipboardText {
+            text: "x".repeat(MAX_TEXT_LEN * 4),
+        };
+        assert_eq!(Message::decode(&m.encode()).unwrap(), m);
+    }
+
+    #[test]
+    fn oversized_free_text_is_cut_at_encode_rather_than_asserted_on() {
+        // Three-byte characters: the cut has to land on a character boundary
+        // below the limit, not on the limit itself.
+        let path = "\u{20ac}".repeat(MAX_TEXT_LEN);
+        let m = Message::TransferEnd {
+            id: 1,
+            ok: false,
+            message: format!("{path}: No such file or directory"),
+        };
+        let Message::TransferEnd { message, .. } = Message::decode(&m.encode()).unwrap() else {
+            panic!("kind changed in transit");
+        };
+        assert_eq!(message.len(), MAX_TEXT_LEN - 1);
+        assert!(path.starts_with(&message));
     }
 
     proptest! {

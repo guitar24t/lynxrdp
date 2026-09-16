@@ -44,7 +44,8 @@ use crate::config::Config;
 /// well under any sane MTU, so a report is never fragmented.
 pub const MAX_REPORT_BYTES: usize = 1200;
 
-/// Longest hostname or node name we will report, in bytes.
+/// Longest hostname or node name we will report, in bytes as it appears in
+/// the JSON, escapes included -- see [`truncate_name`] for why not as typed.
 pub const MAX_NAME_BYTES: usize = 253;
 
 /// Split a `host:port` destination, keeping IPv6 literals in brackets intact.
@@ -139,21 +140,36 @@ impl Report {
 fn escape(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
+        escape_char(c, out);
     }
     out.push('"');
+}
+
+/// One character of a JSON string.
+fn escape_char(c: char, out: &mut String) {
+    match c {
+        '"' => out.push_str("\\\""),
+        '\\' => out.push_str("\\\\"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{08}' => out.push_str("\\b"),
+        '\u{0C}' => out.push_str("\\f"),
+        c if (c as u32) < 0x20 => {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        }
+        c => out.push(c),
+    }
+}
+
+/// How many bytes [`escape_char`] writes for `c`. The two must agree, which
+/// is why they sit together and a test holds them to it.
+fn escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0C}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
 }
 
 /// This machine's hostname, or `"unknown"` if it cannot be read.
@@ -171,16 +187,22 @@ pub fn hostname() -> String {
     }
 }
 
-/// Keep a name within [`MAX_NAME_BYTES`] without splitting a character.
+/// Keep a name within [`MAX_NAME_BYTES`] as it will appear in a report,
+/// without splitting a character.
+///
+/// The bound is on the *escaped* length, not the input's. A control
+/// character costs six bytes once escaped (a backslash, `u` and four hex
+/// digits), so a name of 253 of them -- which the config file allows -- would
+/// serialise to over 1500 and no report would ever fit its datagram. Bounding
+/// what is sent is what makes [`MAX_REPORT_BYTES`] a guarantee rather than a hope.
 pub fn truncate_name(name: &str) -> String {
-    if name.len() <= MAX_NAME_BYTES {
-        return name.to_string();
-    }
-    let mut end = MAX_NAME_BYTES;
-    while end > 0 && !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    name[..end].to_string()
+    let mut used = 0;
+    name.chars()
+        .take_while(|&c| {
+            used += escaped_len(c);
+            used <= MAX_NAME_BYTES
+        })
+        .collect()
 }
 
 /// Handle on the reporter thread.
@@ -243,9 +265,26 @@ impl Reporter {
 impl Drop for Reporter {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        // The thread looks at `stop` between 200 ms sleeps, so it is normally
+        // gone within one of those. It is not gone while `resolve` sits in
+        // getaddrinfo, and with a resolver that does not answer that is
+        // glibc's five seconds an attempt, over several attempts and every
+        // nameserver: tens of seconds a SIGTERM would spend here after the
+        // sessions have already stopped. The thread holds nothing but a UDP
+        // socket and two atomics, so past the bound it is left to finish on
+        // its own or die with the process.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !thread.is_finished() {
+            if Instant::now() >= deadline {
+                log::debug!("the reporting thread is blocked in name resolution; not waiting");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
+        let _ = thread.join();
     }
 }
 
@@ -260,6 +299,27 @@ fn resolve(host: &str, port: u16) -> Option<SocketAddr> {
         }
     }
 }
+
+/// A report that would not fit in one datagram.
+///
+/// Its own type so the reporter thread can tell it from the errors it logs at
+/// debug. A monitoring server being down is weather; a report the caps let
+/// through and then refuse is a bug in the caps, and one that only ever
+/// surfaced at debug level was found by nobody.
+#[derive(Debug)]
+struct OverCap(usize);
+
+impl std::fmt::Display for OverCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "report is {} bytes, over the {MAX_REPORT_BYTES} cap",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for OverCap {}
 
 /// Send one report, returning the address it went to so the caller can log a
 /// change. Errors are logged at debug: a monitoring server being unreachable
@@ -302,12 +362,9 @@ fn send_once(
     };
     let body = report.to_json();
     if body.len() > MAX_REPORT_BYTES {
-        // Cannot happen with bounded names, but truncating a datagram would
-        // produce invalid JSON at the far end, so refuse rather than send.
-        bail!(
-            "report is {} bytes, over the {MAX_REPORT_BYTES} cap",
-            body.len()
-        );
+        // `truncate_name` keeps this unreachable, but a datagram cut to fit
+        // would be invalid JSON at the far end, so refuse rather than send.
+        return Err(OverCap(body.len()).into());
     }
     let datagram = seal::seal(body.as_bytes())?;
     sock.send(&datagram)
@@ -328,6 +385,7 @@ fn run(
 ) {
     let started = Instant::now();
     let step = Duration::from_millis(200).min(interval);
+    let mut warned_over_cap = false;
     while !stop.load(Ordering::SeqCst) {
         match resolve(host, port) {
             Some(dest) => {
@@ -338,7 +396,18 @@ fn run(
                     sessions.load(Ordering::Relaxed),
                     started,
                 ) {
-                    log::debug!("report to {dest} failed: {e:#}");
+                    // A refusal repeats every interval for as long as the
+                    // daemon runs, so warn once: enough to be found, not
+                    // enough to be the whole journal.
+                    if e.is::<OverCap>() && !warned_over_cap {
+                        warned_over_cap = true;
+                        log::warn!(
+                            "report to {dest} refused: {e:#}; nothing will be reported \
+                             while it stays that large"
+                        );
+                    } else {
+                        log::debug!("report to {dest} failed: {e:#}");
+                    }
                 }
             }
             None => log::debug!("{host}:{port} does not resolve; skipping this report"),
@@ -464,23 +533,108 @@ mod tests {
     }
 
     #[test]
+    fn escaped_len_matches_what_escape_writes() {
+        let chars = (0u32..0x80)
+            .chain([0xe9, 0x20ac, 0x1f600])
+            .map(|c| char::from_u32(c).unwrap());
+        for c in chars {
+            let mut out = String::new();
+            escape_char(c, &mut out);
+            assert_eq!(escaped_len(c), out.len(), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn names_are_bounded_by_their_escaped_length() {
+        // Six bytes each once escaped, so a cap on the input would let 253 of
+        // them through and serialise to 1518.
+        let controls = "\u{1}".repeat(MAX_NAME_BYTES);
+        let cut = truncate_name(&controls);
+        let mut json = String::new();
+        escape(&cut, &mut json);
+        let escaped = json.len() - 2;
+        assert!(escaped <= MAX_NAME_BYTES, "{escaped} escaped bytes");
+        assert_eq!(cut.chars().count(), MAX_NAME_BYTES / 6);
+        // Ordinary characters cost what they are: untouched at the cap, cut
+        // one past it.
+        let plain = "n".repeat(MAX_NAME_BYTES);
+        assert_eq!(truncate_name(&plain), plain);
+        assert_eq!(truncate_name(&format!("{plain}n")), plain);
+    }
+
+    #[test]
     fn a_report_fits_in_one_datagram() {
-        // The worst case the caps allow.
-        let r = Report {
-            node: "n".repeat(MAX_NAME_BYTES),
-            ip: "2001:0db8:85a3:0000:0000:8a2e:0370:7334".into(),
-            port: u16::MAX,
-            version: "LynxRDP/999.999.999".into(),
-            sessions: usize::MAX,
-            uptime_secs: u64::MAX,
-            time: u64::MAX,
+        // Why the cap is on the escaped length: the same 253 characters,
+        // uncapped, are more than a datagram on their own.
+        let raw = Report {
+            node: "\u{1}".repeat(MAX_NAME_BYTES),
+            ..sample()
         };
-        let n = r.to_json().len();
-        assert!(n <= MAX_REPORT_BYTES, "{n} bytes");
+        assert!(raw.to_json().len() > MAX_REPORT_BYTES);
+
+        // The worst case the caps allow: a name of the most expensive
+        // characters the escaper knows, capped as `Reporter::start` caps it,
+        // and every other field at its widest.
+        for name in [
+            "n".repeat(MAX_NAME_BYTES),
+            "\u{1}".repeat(MAX_NAME_BYTES),
+            "\"".repeat(MAX_NAME_BYTES),
+        ] {
+            let r = Report {
+                node: truncate_name(&name),
+                ip: "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255".into(),
+                port: u16::MAX,
+                version: "LynxRDP/999.999.999-rc.999+build.99999".into(),
+                sessions: usize::MAX,
+                uptime_secs: u64::MAX,
+                time: u64::MAX,
+            };
+            let n = r.to_json().len();
+            assert!(n <= MAX_REPORT_BYTES, "{n} bytes");
+        }
     }
 
     #[test]
     fn hostname_is_never_blank() {
         assert!(!hostname().is_empty());
+    }
+
+    fn reporter_around(thread: JoinHandle<()>, stop: Arc<AtomicBool>) -> Reporter {
+        Reporter {
+            sessions: Arc::new(AtomicUsize::new(0)),
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    #[test]
+    fn drop_waits_for_a_thread_that_stops() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (stop, finished) = (Arc::clone(&stop), Arc::clone(&finished));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                finished.store(true, Ordering::SeqCst);
+            })
+        };
+        drop(reporter_around(thread, stop));
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "drop returned before the thread it had stopped was gone"
+        );
+    }
+
+    #[test]
+    fn drop_does_not_wait_for_a_thread_stuck_in_resolution() {
+        // Stands in for a getaddrinfo that does not return; it never looks at
+        // `stop`, exactly like `resolve`.
+        let thread = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(30)));
+        let started = Instant::now();
+        drop(reporter_around(thread, Arc::new(AtomicBool::new(false))));
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "drop blocked for {took:?}");
     }
 }

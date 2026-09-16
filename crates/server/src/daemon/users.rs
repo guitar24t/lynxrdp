@@ -121,23 +121,72 @@ pub fn groups_of(user: &UserInfo) -> Vec<String> {
 }
 
 /// Name of a group id.
+///
+/// The failure worth knowing about is logged rather than swallowed: this feeds
+/// the `allow_groups` check, and a lookup that fails is a member of exactly
+/// the group the administrator granted access with being refused, with `id`
+/// showing them in it and nothing pointing at the cause.
 pub fn group_name(gid: u32) -> Option<String> {
-    let mut buf = vec![0u8; 16 * 1024];
-    // SAFETY: as for getpwuid_r.
-    unsafe {
-        let mut gr: libc::group = std::mem::zeroed();
-        let mut result: *mut libc::group = std::ptr::null_mut();
-        let rc = libc::getgrgid_r(
+    // SAFETY: a zeroed `group` is a valid value for getgrgid_r to fill in.
+    let mut gr: libc::group = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: getgrgid_r writes into buffers we own, and `_buf`, which the
+    // strings in `gr` point into, lives until they have been copied out.
+    let (rc, _buf) = grow_until_fits(|buf| unsafe {
+        libc::getgrgid_r(
             gid,
             &mut gr,
             buf.as_mut_ptr() as *mut libc::c_char,
             buf.len(),
             &mut result,
+        )
+    });
+    if rc != 0 {
+        log::warn!(
+            "cannot resolve gid {gid} to a name: {}",
+            std::io::Error::from_raw_os_error(rc)
         );
-        if rc != 0 || result.is_null() {
-            return None;
+        return None;
+    }
+    if result.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null result means gr_name points into `_buf`, still alive.
+    Some(
+        unsafe { CStr::from_ptr(gr.gr_name) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// First buffer offered to a `*_r` lookup.
+const LOOKUP_BUF_INITIAL: usize = 16 * 1024;
+
+/// Largest buffer a `*_r` lookup is retried with.
+///
+/// A group entry carries its whole member list, so this has to hold the
+/// biggest group a directory service will serve: a megabyte is a hundred
+/// thousand short names, past any group `allow_groups` is going to name.
+const LOOKUP_BUF_MAX: usize = 1024 * 1024;
+
+/// Call a reentrant NSS lookup with a buffer that grows until the entry fits.
+///
+/// `getgrgid_r` copies the group's entire membership into the caller's
+/// buffer and answers `ERANGE` when it does not fit. A single fixed 16 KiB
+/// call held about nine hundred members, which is smaller than any
+/// organisation-wide group -- and its `ERANGE` was indistinguishable from
+/// "no such group", so every member of the one group that mattered was
+/// quietly refused. The buffer comes back with the result because the
+/// strings in the caller's struct point into it.
+fn grow_until_fits(mut lookup: impl FnMut(&mut [u8]) -> libc::c_int) -> (libc::c_int, Vec<u8>) {
+    let mut buf = vec![0u8; LOOKUP_BUF_INITIAL];
+    loop {
+        let rc = lookup(&mut buf);
+        if rc != libc::ERANGE || buf.len() >= LOOKUP_BUF_MAX {
+            return (rc, buf);
         }
-        Some(CStr::from_ptr(gr.gr_name).to_string_lossy().into_owned())
+        let grown = (buf.len() * 2).min(LOOKUP_BUF_MAX);
+        buf = vec![0u8; grown];
     }
 }
 
@@ -173,5 +222,51 @@ mod tests {
     #[test]
     fn unknown_uid_is_error() {
         assert!(user_by_uid(4_000_000_000).is_err());
+    }
+
+    /// A lookup that keeps asking for room is given more, and gets its answer
+    /// with the buffer that finally fitted -- not the 16 KiB that used to be
+    /// its only chance.
+    #[test]
+    fn a_lookup_grows_its_buffer_until_the_entry_fits() {
+        let needed = 200 * 1024;
+        let mut calls = 0;
+        let (rc, buf) = grow_until_fits(|buf| {
+            calls += 1;
+            if buf.len() < needed {
+                libc::ERANGE
+            } else {
+                0
+            }
+        });
+        assert_eq!(rc, 0);
+        assert!(buf.len() >= needed, "{}", buf.len());
+        assert!(buf.len() <= LOOKUP_BUF_MAX);
+        // Doubling from 16 KiB: 16, 32, 64, 128, 256.
+        assert_eq!(calls, 5);
+    }
+
+    /// An entry that never fits stops at the cap with ERANGE rather than
+    /// growing forever, and a lookup that fails for any other reason is not
+    /// retried at all.
+    #[test]
+    fn a_lookup_that_never_fits_stops_at_the_cap() {
+        let mut calls = 0;
+        let (rc, buf) = grow_until_fits(|_| {
+            calls += 1;
+            libc::ERANGE
+        });
+        assert_eq!(rc, libc::ERANGE);
+        assert_eq!(buf.len(), LOOKUP_BUF_MAX);
+        assert!(calls < 20, "{calls}");
+
+        let mut calls = 0;
+        let (rc, buf) = grow_until_fits(|_| {
+            calls += 1;
+            libc::EIO
+        });
+        assert_eq!(rc, libc::EIO);
+        assert_eq!(buf.len(), LOOKUP_BUF_INITIAL);
+        assert_eq!(calls, 1);
     }
 }

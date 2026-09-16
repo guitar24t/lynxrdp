@@ -1,8 +1,9 @@
 //! Read-only clipboard references. Metadata never downloads file contents.
 //! A file read queues a normal protocol transfer; only the filesystem worker
 //! waits for it, leaving the session's input and frame loop responsive.
+use crate::{Fetch, FetchReply, FETCH_IDLE};
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Select, Sender};
 use fuser::{
     BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
     ReplyDirectory, ReplyEntry, ReplyOpen, Request,
@@ -12,19 +13,14 @@ use lynxrdp_proto::{
     FileEntry,
 };
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     ffi::OsStr,
     fs::File,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
-pub struct Fetch {
-    pub remote: String,
-    pub destination: PathBuf,
-    pub result: Sender<Option<PathBuf>>,
-}
 pub struct Files {
     // Close queued fetch replies before unmounting. Otherwise a kernel read
     // retried during disconnect can wait for a core that is unmounting us.
@@ -39,6 +35,167 @@ struct Read {
     size: u32,
     reply: ReplyData,
 }
+
+/// A fetch in flight for one offered file, and the reads waiting on it.
+///
+/// Kept per index so that every read of a file that is still arriving --
+/// the kernel's read-ahead, a second process, a file manager retrying --
+/// waits on the one transfer rather than asking the core for another copy
+/// of it.
+struct Pending {
+    reply: Receiver<FetchReply>,
+    /// Bytes reported so far, and when that number last grew.
+    received: u64,
+    advanced: Instant,
+    reads: Vec<Read>,
+}
+
+/// One turn of the read worker's loop.
+enum Turn {
+    /// A read arrived, or (`None`) the mount is being dropped.
+    Read(Option<Read>),
+    /// Fetch `index` reported, or (`None`) the core dropped its end.
+    Reply(usize, Option<FetchReply>),
+    /// Nothing happened before the earliest fetch's idle deadline.
+    Idle,
+}
+
+/// Answer a read from the fetched copy.
+fn serve(read: Read, path: &Path) {
+    let result = (|| -> std::io::Result<Vec<u8>> {
+        let mut data = vec![0; read.size as usize];
+        let n = File::open(path)?.read_at(&mut data, read.offset)?;
+        data.truncate(n);
+        Ok(data)
+    })();
+    match result {
+        Ok(data) => read.reply.data(&data),
+        Err(e) => read.reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+    }
+}
+
+/// Serve the fetch queue: start a transfer for the first read of each file,
+/// park every read on the transfer it needs, answer them all when it lands.
+///
+/// A fetch is given up on after [`FETCH_IDLE`] without new bytes, and not
+/// before: the old fixed cap was a file size above which pasting failed on a
+/// slow enough link. Giving up is dropping the reply channel, which is what
+/// tells the core to cancel the transfer -- so the next read of that file,
+/// which the file manager's retry will send, starts one transfer and not a
+/// second alongside the first.
+fn read_worker(
+    reads: Receiver<Read>,
+    fetches: Sender<Fetch>,
+    wake: Option<Box<dyn Fn() + Send>>,
+    offered: Vec<FileEntry>,
+    cache: PathBuf,
+) {
+    let mut cached: Vec<Option<PathBuf>> = (0..offered.len()).map(|_| None).collect();
+    let mut fetching: BTreeMap<usize, Pending> = BTreeMap::new();
+    let fail = |pending: Pending| {
+        for read in pending.reads {
+            read.reply.error(libc::EIO);
+        }
+    };
+    loop {
+        let keys: Vec<usize> = fetching.keys().copied().collect();
+        let turn = {
+            let mut select = Select::new();
+            select.recv(&reads);
+            for index in &keys {
+                select.recv(&fetching[index].reply);
+            }
+            let deadline = keys
+                .iter()
+                .map(|index| fetching[index].advanced + FETCH_IDLE)
+                .min();
+            let selected = match deadline {
+                Some(deadline) => select.select_deadline(deadline),
+                None => Ok(select.select()),
+            };
+            match selected {
+                Err(_) => Turn::Idle,
+                Ok(op) if op.index() == 0 => Turn::Read(op.recv(&reads).ok()),
+                Ok(op) => {
+                    let index = keys[op.index() - 1];
+                    Turn::Reply(index, op.recv(&fetching[&index].reply).ok())
+                }
+            }
+        };
+        match turn {
+            Turn::Read(None) => return,
+            Turn::Read(Some(read)) => {
+                let index = read.index;
+                if let Some(path) = &cached[index] {
+                    serve(read, path);
+                } else if let Some(pending) = fetching.get_mut(&index) {
+                    pending.reads.push(read);
+                } else {
+                    // Room for a few progress reports between two turns of
+                    // this loop; the core drops rather than blocks on a full
+                    // channel.
+                    let (tx, rx) = bounded(4);
+                    let sent = fetches.send(Fetch {
+                        remote: offered[index].path.clone(),
+                        destination: cache.join(index.to_string()),
+                        result: tx,
+                    });
+                    if sent.is_err() {
+                        read.reply.error(libc::EIO);
+                        continue;
+                    }
+                    if let Some(wake) = &wake {
+                        wake();
+                    }
+                    fetching.insert(
+                        index,
+                        Pending {
+                            reply: rx,
+                            received: 0,
+                            advanced: Instant::now(),
+                            reads: vec![read],
+                        },
+                    );
+                }
+            }
+            Turn::Reply(index, Some(FetchReply::Progress(n))) => {
+                let pending = fetching.get_mut(&index).expect("selected fetch");
+                if n > pending.received {
+                    pending.received = n;
+                    pending.advanced = Instant::now();
+                }
+            }
+            Turn::Reply(index, Some(FetchReply::Done(path))) => {
+                let pending = fetching.remove(&index).expect("selected fetch");
+                let size = std::fs::metadata(&path).map(|m| m.len());
+                if size.is_ok_and(|size| size == offered[index].size) {
+                    for read in pending.reads {
+                        serve(read, &path);
+                    }
+                    cached[index] = Some(path);
+                } else {
+                    for read in pending.reads {
+                        read.reply.error(libc::ESTALE);
+                    }
+                }
+            }
+            Turn::Reply(index, None | Some(FetchReply::Failed)) => {
+                fail(fetching.remove(&index).expect("selected fetch"));
+            }
+            Turn::Idle => {
+                let now = Instant::now();
+                let stalled: Vec<usize> = fetching
+                    .iter()
+                    .filter(|(_, pending)| now >= pending.advanced + FETCH_IDLE)
+                    .map(|(index, _)| *index)
+                    .collect();
+                for index in stalled {
+                    fail(fetching.remove(&index).expect("stalled fetch"));
+                }
+            }
+        }
+    }
+}
 struct View {
     names: Vec<String>,
     sizes: Vec<u64>,
@@ -47,6 +204,30 @@ struct View {
 }
 impl Files {
     pub fn new(parent: &Path, files: &[FileEntry]) -> Result<Self> {
+        Self::build(parent, files, None)
+    }
+
+    /// [`Files::new`], with `wake` called on the read thread each time a
+    /// [`Fetch`] has been queued on `requests`.
+    ///
+    /// `requests` is a plain channel, and the side that drains it may be a
+    /// select loop that this channel is not part of: the session core wakes
+    /// for its own events and a housekeeping tick, so without a nudge every
+    /// file's first read waited out that tick before its request left, one
+    /// file after another. The hook is how the queue reaches such a loop.
+    pub fn with_wake(
+        parent: &Path,
+        files: &[FileEntry],
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Self> {
+        Self::build(parent, files, Some(Box::new(wake)))
+    }
+
+    fn build(
+        parent: &Path,
+        files: &[FileEntry],
+        wake: Option<Box<dyn Fn() + Send>>,
+    ) -> Result<Self> {
         anyhow::ensure!(
             !files.is_empty() && files.len() <= 4096,
             "Invalid clipboard file count"
@@ -73,42 +254,7 @@ impl Files {
         let offered = files.to_vec();
         std::thread::Builder::new()
             .name("clipboard-file-reads".into())
-            .spawn(move || {
-                let mut cached: Vec<Option<PathBuf>> = (0..offered.len()).map(|_| None).collect();
-                while let Ok(read) = reads.recv() {
-                    let result = (|| -> std::io::Result<Vec<u8>> {
-                        if cached[read.index].is_none() {
-                            let (tx, rx) = bounded(1);
-                            fetches
-                                .send(Fetch {
-                                    remote: offered[read.index].path.clone(),
-                                    destination: cache.join(read.index.to_string()),
-                                    result: tx,
-                                })
-                                .map_err(|_| std::io::Error::from_raw_os_error(libc::EIO))?;
-                            let path = rx
-                                .recv_timeout(Duration::from_secs(300))
-                                .ok()
-                                .flatten()
-                                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EIO))?;
-                            let file = File::open(&path)?;
-                            if file.metadata()?.len() != offered[read.index].size {
-                                return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
-                            }
-                            cached[read.index] = Some(path);
-                        }
-                        let mut data = vec![0; read.size as usize];
-                        let n = File::open(cached[read.index].as_ref().unwrap())?
-                            .read_at(&mut data, read.offset)?;
-                        data.truncate(n);
-                        Ok(data)
-                    })();
-                    match result {
-                        Ok(data) => read.reply.data(&data),
-                        Err(e) => read.reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
-                    }
-                }
-            })?;
+            .spawn(move || read_worker(reads, fetches, wake, offered, cache))?;
         let view = View {
             names,
             sizes: files.iter().map(|f| f.size).collect(),

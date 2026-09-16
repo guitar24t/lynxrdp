@@ -248,6 +248,32 @@ fn capture_serial(display: &Arc<XDisplay>, fb: &mut Framebuffer, bands: &[Rect])
     Ok(())
 }
 
+/// Whether `err` is the X server saying a capture asked for pixels the root
+/// window does not have.
+///
+/// `GetImage` answers `BadMatch` for a rectangle that reaches outside the
+/// drawable and `BadValue` for one it cannot represent, and both are what a
+/// root that shrank between the choice of rectangles and the request looks
+/// like. Nothing about the connection is wrong then, and the next frame at
+/// the new size is fine; the caller needs to tell that apart from the errors
+/// that do mean the display is gone, because it treats those as fatal.
+pub fn is_geometry_error(err: &anyhow::Error) -> bool {
+    use x11rb::errors::ReplyError;
+    use x11rb::protocol::ErrorKind;
+    use x11rb::x11_utils::X11Error;
+    err.chain().any(|cause| {
+        cause.downcast_ref::<ReplyError>().is_some_and(|e| {
+            matches!(
+                e,
+                ReplyError::X11Error(X11Error {
+                    error_kind: ErrorKind::Match | ErrorKind::Value,
+                    ..
+                })
+            )
+        })
+    })
+}
+
 /// Tallest band a single capture request may cover.
 ///
 /// Carried over from the serial code: an X server services a `GetImage`
@@ -700,6 +726,38 @@ mod tests {
         assert_eq!(batches.len(), 3);
         assert_eq!(batches[0].len(), MAX_PIPELINE);
         assert_eq!(batches[2].len(), 1);
+    }
+
+    /// Only the two errors a shrunken root produces are transient; anything
+    /// else from a capture still has to end the session, or a display that is
+    /// really gone would be retried forever.
+    #[test]
+    fn only_a_stale_geometry_is_a_transient_capture_error() {
+        use x11rb::errors::{ConnectionError, ReplyError};
+        use x11rb::protocol::ErrorKind;
+        use x11rb::x11_utils::X11Error;
+        let x11 = |error_kind| {
+            anyhow::Error::from(ReplyError::X11Error(X11Error {
+                error_kind,
+                error_code: 0,
+                sequence: 0,
+                bad_value: 0,
+                minor_opcode: 0,
+                major_opcode: 0,
+                extension_name: None,
+                request_name: None,
+            }))
+            .context("shm GetImage")
+        };
+        assert!(is_geometry_error(&x11(ErrorKind::Match)));
+        assert!(is_geometry_error(&x11(ErrorKind::Value)));
+        assert!(!is_geometry_error(&x11(ErrorKind::Access)));
+        let lost = anyhow::Error::from(ReplyError::ConnectionError(ConnectionError::IoError(
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        )))
+        .context("shm GetImage");
+        assert!(!is_geometry_error(&lost));
+        assert!(!is_geometry_error(&anyhow::anyhow!("short GetImage reply")));
     }
 
     #[test]

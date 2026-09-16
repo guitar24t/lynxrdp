@@ -34,14 +34,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{after, never, select, Receiver, Sender};
-use lynxrdp_proto::codec::{Encoder, FrameUpdate};
-use lynxrdp_proto::frame::frame_message;
+use lynxrdp_proto::codec::{CopyRect, Encoder, FrameUpdate, TileUpdate};
+use lynxrdp_proto::frame::{frame_message, HEADER_LEN};
 use lynxrdp_proto::message::{clipboard_format, features, reject, CursorImage};
 use lynxrdp_proto::transfer::{
     safe_relative_path, Completed, Sink, TransferManager, TransferPolicy, TransferPurpose,
 };
 use lynxrdp_proto::{
-    agreed_version, peer_meets_floor, Framebuffer, Message, Rect, MIN_COMPATIBLE_VERSION, TILE_SIZE,
+    agreed_version, peer_meets_floor, Framebuffer, Message, Rect, MAX_MESSAGE_SIZE,
+    MIN_COMPATIBLE_VERSION, TILE_SIZE,
 };
 use x11rb::protocol::randr;
 use x11rb::protocol::Event;
@@ -86,6 +87,31 @@ const RTT_WINDOW: Duration = Duration::from_secs(10);
 /// Samples kept for the base estimate regardless of age. At 240 fps ten
 /// seconds is 2400 of them and the minimum is no better for having them all.
 const RTT_SAMPLES: usize = 256;
+/// Longest run of a peer-supplied string that is quoted back to the peer.
+///
+/// A `FileRequest` path or a `TransferOffer` name may be as long as the
+/// decoder allows, and every reply that quotes one adds a prefix, so quoting
+/// a maximal one verbatim produces a string the encoder refuses -- by
+/// asserting, on the session's main thread. Nothing a client needs telling
+/// about its own path takes more than this to recognise.
+const ECHO_LIMIT: usize = 256;
+/// Consecutive captures allowed to fail on stale root geometry before the
+/// failure is believed.
+///
+/// A root that shrank between the choice of rectangles and the request is one
+/// bad frame, and the next one at the re-read size is fine. A capture that
+/// keeps failing the same way at a size just read from the server is not that,
+/// and retrying it at the frame rate forever would hide whatever it is.
+const STALE_CAPTURE_LIMIT: u32 = 3;
+/// Smallest screen edge a client may ask for.
+const MIN_SCREEN_DIM: u32 = 64;
+/// Bytes a `ScreenUpdate` costs beyond its copies and tiles: kind, frame id,
+/// two counts. Pinned against the real encoder by a test below.
+const SCREEN_UPDATE_FIXED: usize = 1 + 8 + 4 + 4;
+/// Bytes per copy rectangle on the wire: six `u16`s.
+const COPY_RECT_BYTES: usize = 12;
+/// Bytes per tile beyond its payload: four `u16`s, the encoding, the length.
+const TILE_FIXED: usize = 8 + 1 + 4;
 
 /// Supported feature bits.
 const SUPPORTED_FEATURES: u32 = features::LOCAL_CURSOR
@@ -126,28 +152,127 @@ struct Client {
     last_client_pointer: (i16, i16),
     /// Last position we told the client about.
     last_sent_pointer: Option<(i16, i16)>,
-    /// Last clipboard text sent to the client (to suppress echoes).
-    last_clipboard_sent: Option<String>,
+    /// A message to this client was lost: its queue overflowed, its writer is
+    /// gone, or something too large for the wire was refused. Set here, acted
+    /// on by [`Core::drop_dead_client`].
+    dead: bool,
     bytes_sent: u64,
     frames_sent: u64,
 }
 
 impl Client {
+    /// Queue a message for the writer thread.
+    ///
+    /// `false` means the message did not go, and that is the end of this
+    /// client: session state has already moved on as if it had -- a transfer's
+    /// chunk sequence advanced, the encoder switched to a new size -- so a
+    /// client that stays connected past a lost message has a wrong picture of
+    /// the session until it eventually times out. The client is marked rather
+    /// than dropped here because the callers are deep inside handlers holding
+    /// state mid-update; `Core::drop_dead_client` does the dropping at the next
+    /// point where nothing is half done. What matters is that the two cannot
+    /// come apart, whichever message it was.
     fn send(&mut self, msg: &Message) -> bool {
+        if self.dead {
+            return false;
+        }
         let mut buf = Vec::new();
         frame_message(msg, &mut buf);
-        self.bytes_sent += buf.len() as u64;
+        let len = buf.len() - HEADER_LEN;
+        // The receiver refuses a frame over the cap without reading it and
+        // drops the link -- then reconnects into the same message again,
+        // forever. Better refused here, once, with the message named.
+        if len > MAX_MESSAGE_SIZE as usize {
+            log::error!(
+                "{:?} to client {} is {len} bytes, over the {MAX_MESSAGE_SIZE}-byte frame \
+                 limit; dropping the client",
+                msg.kind(),
+                self.description
+            );
+            self.dead = true;
+            return false;
+        }
         match self.writer_tx.try_send(buf) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.bytes_sent += (len + HEADER_LEN) as u64;
+                true
+            }
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 log::warn!(
                     "client {} is not draining its socket; dropping",
                     self.description
                 );
+                self.dead = true;
                 false
             }
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                self.dead = true;
+                false
+            }
         }
+    }
+}
+
+/// Keeps clipboard text from bouncing between the two sides.
+///
+/// Text crosses the wire on copy, so each side sets its clipboard to what the
+/// other sent, and a clipboard manager on either side then announces the new
+/// contents as a fresh copy. Without a record of what just crossed, that
+/// announcement crosses back, and so on. The record is one value per
+/// direction: the text last sent to the client, which the client may echo,
+/// and the text last received from it, which the session's own clipboard may.
+///
+/// Each value is only an echo detector while *both* clipboards still hold that
+/// text, and that is the part the first version of this got wrong: it kept
+/// each value until the next text in the same direction, so after the session
+/// copied an image, a genuine copy of the same text on the client was taken
+/// for the echo of a send made an hour before, and the paste produced the
+/// image. So a value is dropped as soon as either clipboard is known to hold
+/// something else -- text the other way, or a copy of another kind that
+/// either side announces.
+#[derive(Debug, Default)]
+struct ClipboardEcho {
+    /// Text last sent to the client, while the session's clipboard still
+    /// holds it. A copy of it arriving from the client is an echo.
+    sent: Option<String>,
+    /// Text last received from the client, while the client's clipboard still
+    /// holds it. A copy of it turning up in the session is an echo.
+    received: Option<String>,
+}
+
+impl ClipboardEcho {
+    /// The session's clipboard produced `text`. Whether to send it on.
+    fn session_copied(&mut self, text: &str) -> bool {
+        if self.received.as_deref() == Some(text) {
+            return false;
+        }
+        self.sent = Some(text.to_owned());
+        // The client's clipboard is about to hold this, not what it sent.
+        self.received = None;
+        true
+    }
+
+    /// The client sent `text`. Whether to put it on the session's clipboard.
+    fn client_copied(&mut self, text: &str) -> bool {
+        if self.sent.as_deref() == Some(text) {
+            return false;
+        }
+        self.received = Some(text.to_owned());
+        // The session's clipboard is about to hold this, not what was sent.
+        self.sent = None;
+        true
+    }
+
+    /// The session's clipboard has a new owner: whatever was sent from it is
+    /// no longer what it holds.
+    fn session_changed(&mut self) {
+        self.sent = None;
+    }
+
+    /// The client announced a copy that is not text: whatever it sent is no
+    /// longer what it holds.
+    fn client_changed(&mut self) {
+        self.received = None;
     }
 }
 
@@ -182,8 +307,9 @@ impl TransferPolicy for SessionTransferPolicy {
         match purpose {
             TransferPurpose::ClipboardImage => Ok(Sink::Memory(Vec::new())),
             TransferPurpose::FileUpload => {
-                let rel = safe_relative_path(name)
-                    .ok_or_else(|| format!("refusing unsafe upload path {name:?}"))?;
+                let rel = safe_relative_path(name).ok_or_else(|| {
+                    format!("refusing unsafe upload path {:?}", echo_prefix(name))
+                })?;
                 let dest = self.upload_dir.join(&rel);
                 log::info!("receiving upload into {}", dest.display());
                 // The directory and the file are created on the worker, so a
@@ -230,9 +356,9 @@ pub struct Core {
     events_tx: Sender<CoreEvent>,
     min_frame_interval: Duration,
     last_client_seen: Instant,
-    /// Clipboard text received from the client, to avoid echoing it back.
-    last_clipboard_received: Option<String>,
-    /// Queue of X events that arrived while we were busy (drained in order).
+    /// What clipboard text last crossed, each way, so that neither side's
+    /// echo of it crosses back.
+    echo: ClipboardEcho,
     /// Transfers in flight in both directions.
     transfers: TransferManager,
     /// Where uploads land.
@@ -243,7 +369,10 @@ pub struct Core {
     /// Downloads in flight while staging: transfer id to destination.
     staging_downloads: std::collections::HashMap<u64, PathBuf>,
     // Drop pending replies before mounts, then remove their parent directory.
-    staging_results: std::collections::HashMap<u64, crossbeam_channel::Sender<Option<PathBuf>>>,
+    staging_results: std::collections::HashMap<
+        u64,
+        crossbeam_channel::Sender<super::lazy_clipboard::FetchReply>,
+    >,
     /// Current metadata-only clipboard offer; reads request contents lazily.
     staging_batch: Option<super::lazy_clipboard::Files>,
     /// Private mounts and content caches for client clipboard references.
@@ -263,6 +392,9 @@ pub struct Core {
     /// Largest screen the capture can serve. `ScreenCapture` sizes its shared
     /// memory segment once, at construction, and cannot grow it afterwards.
     capture_max: (u32, u32),
+    /// Captures in a row that failed on stale root geometry; see
+    /// [`STALE_CAPTURE_LIMIT`].
+    stale_captures: u32,
 }
 
 /// Why the core loop stopped.
@@ -378,7 +510,7 @@ impl Core {
             events_tx,
             min_frame_interval,
             last_client_seen: Instant::now(),
-            last_clipboard_received: None,
+            echo: ClipboardEcho::default(),
             transfers: TransferManager::new(false),
             upload_dir,
             client_formats: 0,
@@ -392,6 +524,7 @@ impl Core {
             pending_downloads: std::collections::HashMap::new(),
             served: (w, h),
             capture_max,
+            stale_captures: 0,
         })
     }
 
@@ -433,30 +566,39 @@ impl Core {
                 recv(frame_timer) -> _ => Ok(None),
                 recv(housekeeping) -> _ => self.housekeeping(),
             };
-            match outcome {
-                Ok(Some(exit)) => return exit,
-                Ok(None) => {}
-                Err(e) => {
-                    log::error!("session core error: {e:#}");
-                    return Exit::XError(format!("{e:#}"));
-                }
+            if let Some(exit) = Self::settle(outcome, "session core error") {
+                return exit;
             }
             // Drain anything else that is already queued before doing frame
             // work, so a burst of input is applied in one go.
             while let Ok(ev) = self.events_rx.try_recv() {
-                match self.handle(ev) {
-                    Ok(Some(exit)) => return exit,
-                    Ok(None) => {}
-                    Err(e) => {
-                        log::error!("session core error: {e:#}");
-                        return Exit::XError(format!("{e:#}"));
-                    }
+                if let Some(exit) = Self::settle(self.handle(ev), "session core error") {
+                    return exit;
                 }
             }
+            // A send that failed inside any handler above only marked the
+            // client; this is the first point at which nothing is half done.
+            if let Some(exit) = Self::settle(self.drop_dead_client(), "session core error") {
+                return exit;
+            }
             self.pump_clipboard_batch();
-            if let Err(e) = self.pump() {
-                log::error!("frame pump error: {e:#}");
-                return Exit::XError(format!("{e:#}"));
+            let pumped = self.pump().and_then(|()| self.drop_dead_client());
+            if let Some(exit) = Self::settle(pumped, "frame pump error") {
+                return exit;
+            }
+        }
+    }
+
+    /// The exit a step of the loop asked for, with an error treated as the
+    /// loss of the display: by the rule the handlers follow -- anything a
+    /// client or the clipboard did is logged, never propagated -- nothing
+    /// else arrives here as an error.
+    fn settle(outcome: Result<Option<Exit>>, what: &str) -> Option<Exit> {
+        match outcome {
+            Ok(exit) => exit,
+            Err(e) => {
+                log::error!("{what}: {e:#}");
+                Some(Exit::XError(format!("{e:#}")))
             }
         }
     }
@@ -495,9 +637,7 @@ impl Core {
                 if self.client.as_ref().map(|c| c.generation) == Some(generation) {
                     log::info!("client disconnected: {reason}");
                     self.drop_client(None)?;
-                    if self.opts.exit_on_disconnect {
-                        return Ok(Some(Exit::ClientDisconnected));
-                    }
+                    return Ok(self.exit_after_disconnect());
                 }
                 Ok(None)
             }
@@ -517,6 +657,10 @@ impl Core {
             }
             CoreEvent::FileOpened(opened) => {
                 self.on_file_opened(*opened);
+                Ok(None)
+            }
+            CoreEvent::ClipboardFetch => {
+                self.pump_clipboard_batch();
                 Ok(None)
             }
         }
@@ -590,6 +734,10 @@ impl Core {
     fn on_clipboard_event(&mut self, event: ClipboardEvent) -> Result<()> {
         match event {
             ClipboardEvent::Formats(formats) => {
+                // A new owner, so whatever text was last sent from here is no
+                // longer what the session holds -- even if this owner turns
+                // out to offer the same text, which the fetch below will say.
+                self.echo.session_changed();
                 // Announce what is available; the client asks for anything
                 // large only when it actually wants it.
                 let offered = formats & self.client_clipboard_formats();
@@ -687,7 +835,15 @@ impl Core {
         self.staging_results.clear();
         self.staging_downloads.clear();
         self.staging_batch = None;
-        match super::lazy_clipboard::Files::new(self.staging_dir.path(), &files) {
+        // The batch's fetch queue is not one of the core loop's channels, so
+        // without a wake a read in the session waited for the housekeeping
+        // tick before its request left -- once per file, one after another.
+        let wake = self.events_tx.clone();
+        let batch =
+            super::lazy_clipboard::Files::with_wake(self.staging_dir.path(), &files, move || {
+                let _ = wake.send(CoreEvent::ClipboardFetch);
+            });
+        match batch {
             Ok(batch) => {
                 if let Err(e) = self
                     .clipboard
@@ -715,6 +871,9 @@ impl Core {
     }
 
     fn pump_clipboard_batch(&mut self) {
+        // Before anything new starts, so a read retried after a stall never
+        // finds the transfer it gave up on still running beside its own.
+        self.report_staging_progress();
         while let Some(fetch) = self
             .staging_batch
             .as_ref()
@@ -732,12 +891,44 @@ impl Core {
     }
 
     fn settle_clipboard_file(&mut self, id: u64, success: bool) {
+        use super::lazy_clipboard::FetchReply;
         if let Some(drops) = &mut self.drops {
             drops.settle(id, success);
         }
         let path = self.staging_downloads.remove(&id);
         if let Some(result) = self.staging_results.remove(&id) {
-            let _ = result.send(path.filter(|_| success));
+            let _ = result.send(match path.filter(|_| success) {
+                Some(path) => FetchReply::Done(path),
+                None => FetchReply::Failed,
+            });
+        }
+    }
+
+    /// Tell each waiting paste how its transfer is going, and cancel the
+    /// transfers whose readers have stopped waiting.
+    ///
+    /// Every tick, and whether or not the count moved: the send is also the
+    /// probe. The FUSE worker gives up on a fetch that shows no progress for
+    /// `FETCH_IDLE` by dropping its end, and the failed send is the only way
+    /// that decision reaches here. Without it the client would keep pushing
+    /// a file nobody will read through the tunnel the next paste needs.
+    fn report_staging_progress(&mut self) {
+        use super::lazy_clipboard::FetchReply;
+        let mut abandoned = Vec::new();
+        for (id, result) in &self.staging_results {
+            let received = self.transfers.progress(*id).map_or(0, |(done, _)| done);
+            if let Err(crossbeam_channel::TrySendError::Disconnected(_)) =
+                result.try_send(FetchReply::Progress(received))
+            {
+                abandoned.push(*id);
+            }
+        }
+        for id in abandoned {
+            self.staging_results.remove(&id);
+            self.staging_downloads.remove(&id);
+            if let Some(msg) = self.transfers.cancel(id, "the reader stopped waiting") {
+                self.send_to_client(vec![msg]);
+            }
         }
     }
 
@@ -764,6 +955,7 @@ impl Core {
             || self.transfers.active_ids().contains(&id)
             || self.transfers.active_ids().len() >= 64
         {
+            let path = echo_prefix(path);
             log::warn!("transfer id {id} is already opening; refusing {path}");
             self.send_to_client(vec![Message::TransferEnd {
                 id,
@@ -811,11 +1003,12 @@ impl Core {
                 )
             }
             Err(e) => {
-                log::warn!("cannot open {} for download: {e}", opened.path);
+                let path = echo_prefix(&opened.path);
+                log::warn!("cannot open {path} for download: {e}");
                 Message::TransferEnd {
                     id: opened.id,
                     ok: false,
-                    message: format!("{}: {e}", opened.path),
+                    message: format!("{path}: {e}"),
                 }
             }
         };
@@ -840,7 +1033,8 @@ impl Core {
         f
     }
 
-    /// Send messages to the client, dropping it if its queue has backed up.
+    /// Send messages to the client. One that cannot be queued marks the
+    /// client dead (see [`Client::send`]) and the rest are not attempted.
     fn send_to_client(&mut self, msgs: Vec<Message>) {
         let Some(c) = self.client.as_mut() else {
             return;
@@ -933,9 +1127,10 @@ impl Core {
                 }
             }
             TransferPurpose::FileUpload => {
-                log::info!("upload of {:?} finished", done.name);
+                let name = echo_prefix(&done.name);
+                log::info!("upload of {name:?} finished");
                 self.send_to_client(vec![Message::Notice {
-                    text: format!("Received {}", done.name),
+                    text: format!("Received {name}"),
                 }]);
             }
             TransferPurpose::FileDownload => {
@@ -946,16 +1141,17 @@ impl Core {
     }
 
     fn on_session_clipboard(&mut self, text: String) {
-        if self.last_clipboard_received.as_deref() == Some(text.as_str()) {
+        let Some(c) = self.client.as_mut() else {
+            return;
+        };
+        if !(c.ready && c.features & features::CLIPBOARD != 0) {
             return;
         }
-        if let Some(c) = self.client.as_mut() {
-            if c.ready && c.features & features::CLIPBOARD != 0 {
-                log::debug!("clipboard -> client ({} bytes)", text.len());
-                c.last_clipboard_sent = Some(text.clone());
-                c.send(&Message::ClipboardText { text });
-            }
+        if !self.echo.session_copied(&text) {
+            return;
         }
+        log::debug!("clipboard -> client ({} bytes)", text.len());
+        c.send(&Message::ClipboardText { text });
     }
 
     fn refresh_cursor(&mut self, force: bool) -> Result<()> {
@@ -1023,7 +1219,7 @@ impl Core {
             ping_nonce: 0,
             last_client_pointer: self.input.last_pointer(),
             last_sent_pointer: None,
-            last_clipboard_sent: None,
+            dead: false,
             bytes_sent: 0,
             frames_sent: 0,
         });
@@ -1092,11 +1288,36 @@ impl Core {
         }
         self.staging_results.clear();
         self.staging_batch = None;
+        // The next client's clipboard is unknown, so nothing it sends can be
+        // an echo of what went to this one.
+        self.echo = ClipboardEcho::default();
         self.last_client_seen = Instant::now();
         Ok(())
     }
 
-    fn reject(&mut self, code: u16, reason: &str) -> Result<()> {
+    /// Drop a client whose queue overflowed or closed since the last check.
+    ///
+    /// [`Client::send`] only marks; the drop happens here, at a point in the
+    /// loop where no handler is mid-update, and with the same consequence a
+    /// client leaving any other way has.
+    fn drop_dead_client(&mut self) -> Result<Option<Exit>> {
+        if !self.client.as_ref().is_some_and(|c| c.dead) {
+            return Ok(None);
+        }
+        self.drop_client(None)?;
+        Ok(self.exit_after_disconnect())
+    }
+
+    /// What a client's departure means for the session. Every path that
+    /// loses a client ends in this, so `--exit-on-disconnect` cannot depend
+    /// on *how* the client left.
+    fn exit_after_disconnect(&self) -> Option<Exit> {
+        self.opts
+            .exit_on_disconnect
+            .then_some(Exit::ClientDisconnected)
+    }
+
+    fn reject(&mut self, code: u16, reason: &str) -> Result<Option<Exit>> {
         log::warn!("rejecting client: {reason}");
         if let Some(c) = self.client.as_mut() {
             c.send(&Message::Rejected {
@@ -1104,7 +1325,8 @@ impl Core {
                 reason: reason.to_string(),
             });
         }
-        self.drop_client(None)
+        self.drop_client(None)?;
+        Ok(self.exit_after_disconnect())
     }
 
     fn handle_client_message(&mut self, msg: Message) -> Result<Option<Exit>> {
@@ -1117,23 +1339,17 @@ impl Core {
                     features: want,
                     width,
                     height,
-                } => {
-                    self.on_hello(
-                        version,
-                        client_name,
-                        want,
-                        u32::from(width),
-                        u32::from(height),
-                    )?;
-                    Ok(None)
-                }
-                other => {
-                    self.reject(
-                        reject::VERSION,
-                        &format!("expected ClientHello, got {:?}", other.kind()),
-                    )?;
-                    Ok(None)
-                }
+                } => self.on_hello(
+                    version,
+                    client_name,
+                    want,
+                    u32::from(width),
+                    u32::from(height),
+                ),
+                other => self.reject(
+                    reject::VERSION,
+                    &format!("expected ClientHello, got {:?}", other.kind()),
+                ),
             };
         }
         // Transfers are symmetric and stateless from the core's point of view.
@@ -1194,15 +1410,16 @@ impl Core {
                 self.on_resize_request(u32::from(width), u32::from(height))?;
             }
             Message::ClipboardText { text } => {
-                if let Some(c) = self.client.as_ref() {
-                    if c.features & features::CLIPBOARD == 0 {
-                        return Ok(None);
-                    }
-                    if c.last_clipboard_sent.as_deref() == Some(text.as_str()) {
-                        return Ok(None);
-                    }
+                if self
+                    .client
+                    .as_ref()
+                    .is_some_and(|c| c.features & features::CLIPBOARD == 0)
+                {
+                    return Ok(None);
                 }
-                self.last_clipboard_received = Some(text.clone());
+                if !self.echo.client_copied(&text) {
+                    return Ok(None);
+                }
                 if let Some(cb) = self.clipboard.as_mut() {
                     log::debug!("clipboard <- client ({} bytes)", text.len());
                     // Non-fatal for the same reason as in `handle_x_event`:
@@ -1238,6 +1455,7 @@ impl Core {
             Message::ClipboardOffer { formats } => {
                 // The client copied something. Text arrives on its own; ask
                 // for an image only when we can actually use it.
+                self.echo.client_changed();
                 self.client_formats = formats;
                 if formats & clipboard_format::PNG != 0 && self.clipboard.is_some() {
                     self.send_to_client(vec![Message::ClipboardRequest {
@@ -1282,18 +1500,16 @@ impl Core {
             Message::Disconnect { reason } => {
                 log::info!("client requested disconnect: {reason}");
                 self.drop_client(None)?;
-                if self.opts.exit_on_disconnect {
-                    return Ok(Some(Exit::ClientDisconnected));
-                }
+                return Ok(self.exit_after_disconnect());
             }
             Message::ClientHello { .. } => {
-                self.reject(reject::VERSION, "duplicate ClientHello")?;
+                return self.reject(reject::VERSION, "duplicate ClientHello");
             }
             other => {
-                self.reject(
+                return self.reject(
                     reject::VERSION,
                     &format!("unexpected message {:?} from client", other.kind()),
-                )?;
+                );
             }
         }
         Ok(None)
@@ -1306,7 +1522,7 @@ impl Core {
         want: u32,
         width: u32,
         height: u32,
-    ) -> Result<()> {
+    ) -> Result<Option<Exit>> {
         // A floor rather than equality. Refusing anything but our own version
         // makes every release a flag day, which is the wrong trade when server
         // packages are installed by administrators on RHEL 9 while clients
@@ -1349,7 +1565,7 @@ impl Core {
         }
         let (w, h) = self.served;
         let Some(c) = self.client.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
         c.ready = true;
         c.features = features;
@@ -1373,7 +1589,7 @@ impl Core {
             self.refresh_cursor(true)?;
         }
         self.force_full_refresh();
-        Ok(())
+        Ok(None)
     }
 
     fn on_resize_request(&mut self, width: u32, height: u32) -> Result<()> {
@@ -1405,8 +1621,8 @@ impl Core {
     /// so the adoption below and the one the echo triggers must agree -- which
     /// they do, because adoption is idempotent on an unchanged size.
     fn apply_resize(&mut self, width: u32, height: u32) -> Result<()> {
-        let width = width.clamp(64, self.opts.max_width);
-        let height = height.clamp(64, self.opts.max_height);
+        let width = clamp_dimension(width, self.opts.max_width);
+        let height = clamp_dimension(height, self.opts.max_height);
         resize_screen(&self.display, width, height, self.opts.dpi)?;
         // `resize_screen` refreshes the cached size before it returns, and it
         // is the size the server settled on that matters, not the one we asked
@@ -1528,7 +1744,31 @@ impl Core {
         // rectangles costs about one round trip instead of a dozen in series.
         // Calling `capture_into` per rectangle is the case its documentation
         // exists to warn against.
-        self.capture.capture_many(&mut self.screen, &rects)?;
+        if let Err(e) = self.capture.capture_many(&mut self.screen, &rects) {
+            if !crate::x11::capture::is_geometry_error(&e)
+                || self.stale_captures >= STALE_CAPTURE_LIMIT
+            {
+                return Err(e);
+            }
+            // The root changed size between choosing the rectangles and
+            // asking for their pixels: an `xrandr` in the session, or the
+            // desktop applying a saved layout while the first frames go out.
+            // The RANDR event for it is queued or on its way, but a capture
+            // that raced it must not end the session -- that is what the
+            // subscription to those events was for. Re-read the size now
+            // rather than wait for the event, and send the whole screen at
+            // the new size, since whatever landed before the failure is
+            // suspect.
+            self.stale_captures += 1;
+            log::info!("capture raced a root resize ({e:#}); re-reading the root size");
+            match self.display.refresh_size() {
+                Ok((w, h)) => self.adopt_size(w, h),
+                Err(e) => log::warn!("cannot read the root size after a failed capture: {e:#}"),
+            }
+            self.force_full_refresh();
+            return Ok(());
+        }
+        self.stale_captures = 0;
         // A full refresh resets the reference frame, so there is no previous
         // frame a copy could reference; skip scroll detection in that case.
         let frame = self.encoder.encode_frame(&self.screen, &rects, !full);
@@ -1540,30 +1780,39 @@ impl Core {
             return Ok(());
         }
         let FrameUpdate { copies, tiles } = frame;
-        let frame_id = c.next_frame_id;
-        c.next_frame_id += 1;
         let bytes: usize = tiles.iter().map(|t| t.data.len()).sum();
         log::trace!(
-            "frame {frame_id}: {} rects -> {} copies + {} tiles, {} bytes, {:.2} ms",
+            "frame {}: {} rects -> {} copies + {} tiles, {} bytes, {:.2} ms",
+            c.next_frame_id,
             rects.len(),
             copies.len(),
             tiles.len(),
             bytes,
             started.elapsed().as_secs_f64() * 1000.0
         );
-        if !c.send(&Message::ScreenUpdate {
-            frame_id,
-            copies,
-            tiles,
-        }) {
-            self.drop_client(None)?;
-            return Ok(());
+        // Usually one message. A screen large enough, showing content that
+        // will not compress, produces more bytes than one frame may carry,
+        // and the client refuses such a frame unread -- then reconnects into
+        // the same full refresh, forever. Each part is a frame of its own to
+        // the client: acknowledged separately, counted in flight separately.
+        let mut sent_at = Instant::now();
+        for (copies, tiles) in split_frame(copies, tiles) {
+            let frame_id = c.next_frame_id;
+            c.next_frame_id += 1;
+            if !c.send(&Message::ScreenUpdate {
+                frame_id,
+                copies,
+                tiles,
+            }) {
+                // Marked dead; `run` drops it before the next frame.
+                return Ok(());
+            }
+            sent_at = Instant::now();
+            // The send time is what the frame's acknowledgement is measured
+            // against, and the queue's length is the in-flight count.
+            c.frames_in_flight.push_back((frame_id, sent_at));
+            c.frames_sent += 1;
         }
-        let sent_at = Instant::now();
-        // The send time is what the frame's acknowledgement is measured
-        // against, and the queue's length is the in-flight count.
-        c.frames_in_flight.push_back((frame_id, sent_at));
-        c.frames_sent += 1;
         c.last_frame_at = Some(sent_at);
         self.sync_pointer()
     }
@@ -1644,12 +1893,16 @@ impl Core {
         if let Some(reason) = drop_reason {
             log::warn!("dropping client: {reason}");
             self.drop_client(None)?;
-            if self.opts.exit_on_disconnect {
-                return Ok(Some(Exit::ClientDisconnected));
+            if let Some(exit) = self.exit_after_disconnect() {
+                return Ok(Some(exit));
             }
         }
         if self.client.is_some() {
             self.sync_pointer()?;
+            // The desktop's settings daemon turns auto-repeat back on a few
+            // seconds into the first login, which is exactly the runaway-key
+            // case the suppression exists for.
+            self.input.reassert_auto_repeat_suppression();
         } else if let Some(t) = self.opts.idle_timeout {
             if now.duration_since(self.last_client_seen) > t {
                 return Ok(Some(Exit::IdleTimeout));
@@ -1765,6 +2018,67 @@ fn unavailable_notice(format: u32) -> String {
         _ => "content",
     };
     format!("The {what} copied in the remote session could not be transferred to your clipboard.")
+}
+
+/// A peer-supplied string cut to [`ECHO_LIMIT`] characters for quoting back.
+fn echo_prefix(s: &str) -> String {
+    match s.char_indices().nth(ECHO_LIMIT) {
+        Some((end, _)) => format!("{}…", &s[..end]),
+        None => s.to_owned(),
+    }
+}
+
+/// `value` held between the minimum edge and `max`, whichever way round the
+/// two are.
+///
+/// `u32::clamp` panics when its bounds cross, and `max` is an operator's
+/// number: the session binary refuses one below the minimum, but a config
+/// file once did not, and `max_width = 48` reached this as the assertion
+/// `min <= max` on the session's main thread, from the first client's hello.
+/// When the two disagree the operator's maximum wins, because it is the size
+/// the X server was started with and asking for more would fail there.
+fn clamp_dimension(value: u32, max: u32) -> u32 {
+    value.min(max).max(MIN_SCREEN_DIM.min(max))
+}
+
+/// Cut one frame's update into `ScreenUpdate` messages that each fit the
+/// receiver's frame limit.
+fn split_frame(
+    copies: Vec<CopyRect>,
+    tiles: Vec<TileUpdate>,
+) -> Vec<(Vec<CopyRect>, Vec<TileUpdate>)> {
+    split_frame_within(copies, tiles, MAX_MESSAGE_SIZE as usize)
+}
+
+/// [`split_frame`] against an explicit payload budget.
+///
+/// The copies all go in the first part: a message's copies are applied before
+/// its tiles, and every later part holds tiles only, so the order of
+/// application is exactly what one message would have given. Tiles keep their
+/// order. A part is never empty unless the whole frame was, and a first tile
+/// that does not fit beside the copies goes in over budget rather than
+/// nowhere -- a tile is at most 64x64 pixels, so at the real limit that
+/// cannot happen.
+fn split_frame_within(
+    copies: Vec<CopyRect>,
+    tiles: Vec<TileUpdate>,
+    budget: usize,
+) -> Vec<(Vec<CopyRect>, Vec<TileUpdate>)> {
+    let mut parts = Vec::new();
+    let mut copies = Some(copies);
+    let mut part: Vec<TileUpdate> = Vec::new();
+    let mut size = SCREEN_UPDATE_FIXED + copies.as_ref().map_or(0, |c| c.len() * COPY_RECT_BYTES);
+    for tile in tiles {
+        let cost = TILE_FIXED + tile.data.len();
+        if !part.is_empty() && size + cost > budget {
+            parts.push((copies.take().unwrap_or_default(), std::mem::take(&mut part)));
+            size = SCREEN_UPDATE_FIXED;
+        }
+        size += cost;
+        part.push(tile);
+    }
+    parts.push((copies.take().unwrap_or_default(), part));
+    parts
 }
 
 #[cfg(test)]
@@ -1900,5 +2214,131 @@ mod tests {
         // mentions the clipboard and still ends in a full stop, so the two
         // assertions above would not notice it.
         assert!(!notice.contains("The  "), "{notice:?}");
+    }
+
+    #[test]
+    fn a_maximal_peer_string_is_quoted_short_and_between_characters() {
+        // The longest string the decoder accepts, which is also the longest
+        // the encoder does: quoting it with any prefix at all used to trip
+        // the encoder's assertion on the session's main thread.
+        let path = "a".repeat(lynxrdp_proto::wire::MAX_BLOB_LEN);
+        let quoted = echo_prefix(&path);
+        assert!(quoted.chars().count() <= ECHO_LIMIT + 1);
+        assert!(quoted.ends_with('…'));
+        // Multi-byte characters are cut between, never through.
+        let accented = "é".repeat(ECHO_LIMIT * 2);
+        assert_eq!(echo_prefix(&accented).chars().count(), ECHO_LIMIT + 1);
+        assert_eq!(echo_prefix("short"), "short");
+        assert_eq!(echo_prefix(""), "");
+        let mut buf = Vec::new();
+        frame_message(
+            &Message::TransferEnd {
+                id: 1,
+                ok: false,
+                message: format!("{}: transfer 1 is already in progress", echo_prefix(&path)),
+            },
+            &mut buf,
+        );
+        assert!(buf.len() < 1024, "{} bytes", buf.len());
+    }
+
+    #[test]
+    fn a_dimension_clamp_cannot_invert() {
+        assert_eq!(clamp_dimension(1920, 4096), 1920);
+        assert_eq!(clamp_dimension(10, 4096), MIN_SCREEN_DIM);
+        assert_eq!(clamp_dimension(9000, 4096), 4096);
+        // Below the minimum the operator's maximum is what the X server was
+        // started with, so it wins -- and `u32::clamp` used to panic here.
+        assert_eq!(clamp_dimension(1920, 48), 48);
+        assert_eq!(clamp_dimension(10, 48), 48);
+        assert_eq!(clamp_dimension(1920, 0), 0);
+    }
+
+    #[test]
+    fn a_frame_over_the_message_limit_is_split_into_messages_under_it() {
+        use lynxrdp_proto::codec::TileEncoding;
+        let tiles: Vec<TileUpdate> = (0..40u32)
+            .map(|i| TileUpdate {
+                rect: Rect::new(i * 64, 0, 64, 64),
+                encoding: TileEncoding::Raw,
+                data: vec![i as u8; 100],
+            })
+            .collect();
+        let copies = vec![CopyRect {
+            src_x: 0,
+            src_y: 0,
+            dest: Rect::new(0, 64, 64, 64),
+        }];
+        let budget = 400;
+        let parts = split_frame_within(copies.clone(), tiles.clone(), budget);
+        assert!(parts.len() > 1);
+        let mut seen = Vec::new();
+        for (i, (c, t)) in parts.iter().enumerate() {
+            let mut buf = Vec::new();
+            frame_message(
+                &Message::ScreenUpdate {
+                    frame_id: i as u64,
+                    copies: c.clone(),
+                    tiles: t.clone(),
+                },
+                &mut buf,
+            );
+            let payload = buf.len() - HEADER_LEN;
+            assert!(payload <= budget, "part {i} is {payload} bytes");
+            // The per-item costs the split is computed from are the wire's.
+            assert_eq!(
+                payload,
+                SCREEN_UPDATE_FIXED
+                    + c.len() * COPY_RECT_BYTES
+                    + t.iter().map(|t| TILE_FIXED + t.data.len()).sum::<usize>()
+            );
+            assert_eq!(c.is_empty(), i != 0, "copies belong in the first part only");
+            assert!(!t.is_empty());
+            seen.extend(t.iter().cloned());
+        }
+        assert_eq!(seen, tiles);
+        // A frame that fits stays one message, copies and all.
+        let whole = split_frame(copies.clone(), tiles.clone());
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0], (copies, tiles));
+    }
+
+    #[test]
+    fn a_later_copy_of_the_same_text_is_not_mistaken_for_an_echo() {
+        // The session copies T, then an image; the client then copies T.
+        let mut echo = ClipboardEcho::default();
+        assert!(echo.session_copied("T"));
+        assert!(
+            !echo.client_copied("T"),
+            "the client's echo of T is still an echo"
+        );
+        echo.session_changed();
+        assert!(
+            echo.client_copied("T"),
+            "T copied on the client after the session moved on is news"
+        );
+        // The mirror: the client copies T, then an image; the session copies T.
+        let mut echo = ClipboardEcho::default();
+        assert!(echo.client_copied("T"));
+        assert!(!echo.session_copied("T"));
+        echo.client_changed();
+        assert!(echo.session_copied("T"));
+    }
+
+    #[test]
+    fn text_the_other_way_replaces_the_echo_record() {
+        // The session sends U; the client copies T; the client copies U
+        // again. U is news now: the session holds T.
+        let mut echo = ClipboardEcho::default();
+        assert!(echo.session_copied("U"));
+        assert!(echo.client_copied("T"));
+        assert!(echo.client_copied("U"));
+        // A session-side manager re-offering the client's T is still an echo,
+        // and the client echoing what the session sent still is too.
+        let mut echo = ClipboardEcho::default();
+        assert!(echo.client_copied("T"));
+        assert!(!echo.session_copied("T"));
+        assert!(echo.session_copied("U"));
+        assert!(!echo.client_copied("U"));
     }
 }

@@ -24,12 +24,13 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use lynxrdp_server::session::desktop::{describe_wait_status, Desktop};
+use lynxrdp_server::session::desktop::{describe_wait_status, wait_status_from_siginfo, Desktop};
 use lynxrdp_server::session::engine::{Core, Exit};
 use lynxrdp_server::session::listener::{spawn_control_listener, spawn_tcp_listener};
 use lynxrdp_server::session::xserver::{default_runtime_dir, XServer, XServerConfig};
 use lynxrdp_server::session::{CoreEvent, SessionOptions};
 use lynxrdp_server::x11::XDisplay;
+use std::io::Write as _;
 
 /// Run a LynxRDP desktop session.
 #[derive(Parser, Debug)]
@@ -68,11 +69,11 @@ struct Args {
     /// Initial screen height.
     #[arg(long, default_value_t = 1080)]
     height: u32,
-    /// Maximum screen width.
-    #[arg(long, default_value_t = 4096)]
+    /// Maximum screen width (at least 64).
+    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(64..))]
     max_width: u32,
-    /// Maximum screen height.
-    #[arg(long, default_value_t = 2160)]
+    /// Maximum screen height (at least 64).
+    #[arg(long, default_value_t = 2160, value_parser = clap::value_parser!(u32).range(64..))]
     max_height: u32,
     /// DPI reported by the X server (48 to 480; clamped).
     #[arg(long, default_value_t = 96)]
@@ -112,7 +113,8 @@ struct Args {
     /// Directory that uploaded files land in (default: ~/Downloads or ~).
     #[arg(long)]
     upload_dir: Option<PathBuf>,
-    /// Print the display of the started X server to stdout.
+    /// Print the X display to stdout once it is up, then the address this
+    /// session listens on once it is bound (one per line).
     #[arg(long)]
     print_display: bool,
 }
@@ -155,6 +157,15 @@ fn run() -> Result<i32> {
         .format_timestamp_millis()
         .init();
     let args = Args::parse();
+    // Before anything is spawned. Both descriptors arrive from lynxrdpd
+    // through `dup2`, which clears close-on-exec, and `Command` passes on
+    // whatever is not marked: the X server and every desktop process used to
+    // inherit the session's listening socket, and a helper that outlived the
+    // desktop kept it bound after the session was gone -- which the daemon
+    // read as the session still being there.
+    for fd in [args.control_fd, args.ready_fd].into_iter().flatten() {
+        set_cloexec(fd)?;
+    }
     if args.list_sessions {
         println!(
             "{}",
@@ -259,6 +270,15 @@ fn run() -> Result<i32> {
             "listening on {local} (peer uid check: {})",
             require_uid.is_some()
         );
+        // Port 0 is how a test gets a port nothing else can have been handed
+        // in the meantime, so the address goes out where the display did,
+        // once it is actually bound.
+        if args.print_display {
+            // Not `println!`: a caller that read the display line and closed
+            // the pipe -- the whole contract before this line existed -- would
+            // otherwise take the session down with a broken-pipe panic.
+            let _ = writeln!(std::io::stdout(), "{local}");
+        }
         listener_threads.push(spawn_tcp_listener(l, tx.clone(), require_uid));
     }
     if let Some(fd) = args.control_fd {
@@ -312,17 +332,32 @@ fn run() -> Result<i32> {
         std::thread::Builder::new()
             .name("desktop-wait".into())
             .spawn(move || {
-                // Poll rather than wait() so the Desktop object keeps ownership.
+                // Poll rather than wait() so the Desktop object keeps
+                // ownership -- and with WNOWAIT, so that noticing the exit
+                // does not reap it either. `Desktop` is the one reaper: a
+                // `waitpid` here that won the race against its shutdown left
+                // that polling for a status already taken, five seconds of
+                // it, and then signalling a group whose leader was reaped.
                 loop {
-                    let mut status = 0;
-                    // SAFETY: waitpid on our child with WNOHANG.
-                    let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
-                    if r == pid as i32 {
+                    // SAFETY: waitid on our child, into a zeroed siginfo whose
+                    // pid stays zero when nothing has changed.
+                    let (r, code, status, seen) = unsafe {
+                        let mut info: libc::siginfo_t = std::mem::zeroed();
+                        let r = libc::waitid(
+                            libc::P_PID,
+                            pid,
+                            &mut info,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        );
+                        (r, info.si_code, info.si_status(), info.si_pid())
+                    };
+                    if r == 0 && seen == pid as libc::pid_t {
                         // The raw word rather than a description is how the
                         // commonest misconfiguration there is -- a `startwm`
                         // script that does not exist -- reached the log as
                         // "status 32512" instead of naming the missing command.
-                        let _ = tx.send(CoreEvent::DesktopExited(describe_wait_status(status)));
+                        let word = wait_status_from_siginfo(code, status);
+                        let _ = tx.send(CoreEvent::DesktopExited(describe_wait_status(word)));
                         break;
                     }
                     if r < 0 {
@@ -363,6 +398,15 @@ fn run() -> Result<i32> {
         Exit::XError(_) => 2,
         _ => 0,
     })
+}
+
+fn set_cloexec(fd: i32) -> Result<()> {
+    // SAFETY: fcntl on a descriptor number the parent said it passed us.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("marking fd {fd} close-on-exec"));
+    }
+    Ok(())
 }
 
 fn current_username() -> String {

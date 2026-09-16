@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 use windows::{
-    core::{implement, HRESULT, PCWSTR},
+    core::{implement, Interface, HRESULT, PCWSTR},
     Win32::{
         Foundation::*,
         Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
@@ -71,7 +71,10 @@ impl Files {
                             }
                             std::thread::sleep(Duration::from_millis(10));
                         }
-                        if OleIsCurrentClipboard(&object).is_ok() {
+                        // Only S_OK means the clipboard still holds this
+                        // object. S_FALSE means the user has copied something
+                        // else since, and emptying it now would take that.
+                        if OleIsCurrentClipboardRaw(object.as_raw()) == S_OK {
                             let _ = OleSetClipboard(None);
                         }
                         drop(object);
@@ -94,6 +97,14 @@ impl Drop for Files {
             let _ = stop.try_send(());
         }
     }
+}
+// windows 0.58 wraps OleIsCurrentClipboard as `HRESULT::ok()`, and `is_ok` is
+// `self.0 >= 0`, so S_FALSE ("another owner") comes back as Ok exactly like
+// S_OK. Only the raw HRESULT answers the question that call exists for.
+#[link(name = "ole32")]
+extern "system" {
+    #[link_name = "OleIsCurrentClipboard"]
+    fn OleIsCurrentClipboardRaw(pdataobj: *mut core::ffi::c_void) -> HRESULT;
 }
 fn format(name: &str) -> u16 {
     let text: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
@@ -329,7 +340,10 @@ mod tests {
         let fetch = requests.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(fetch.remote, "/remote/report.txt");
         std::fs::write(&fetch.destination, b"hello").unwrap();
-        fetch.result.send(Some(fetch.destination)).unwrap();
+        fetch
+            .result
+            .send(crate::FetchReply::Done(fetch.destination))
+            .unwrap();
         worker.join().unwrap();
         assert!(requests.is_empty());
     }

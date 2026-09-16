@@ -1,39 +1,42 @@
 //! End-to-end tests: a real `lynxrdp-session` process on Xvfb driven by
 //! the headless protocol client.
 //!
-//! These need `Xvfb` and `xterm` installed and are skipped (with a message)
-//! when they are not -- unless `LYNXRDP_REQUIRE_E2E` is set, which turns a
-//! missing dependency into a failure. CI sets it; see `tests/common/mod.rs`.
+//! Every test needs `Xvfb`, `xsetroot` and `xdpyinfo` (Debian: `xvfb`,
+//! `x11-xserver-utils`, `x11-utils`); individual tests also want `xclip` or
+//! `xsel`, `xdotool`, `xdg-user-dir`, Python GTK 3 bindings and FUSE, and say
+//! so where they use them. A missing dependency skips the test with a message
+//! -- unless `LYNXRDP_REQUIRE_E2E` is set, which turns it into a failure. CI
+//! sets it; see `tests/common/mod.rs`.
 
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
+use std::net::SocketAddr;
+use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use lynxrdp_client::connection::{Client, ClientEvent, ConnectOptions};
 use lynxrdp_proto::{keysym, Rect};
 
 mod common;
-use common::{have, have_fuse, skip_unless};
+use common::{have, have_fuse, skip_unless, ChildGuard};
 
-macro_rules! require_xvfb {
+/// The tools every test here shells out to. `Session::x` panics on a program
+/// it cannot run, which is the right answer for a tool this guard has already
+/// found and the wrong one for a box that simply lacks it.
+macro_rules! require_x_tools {
     () => {
-        if skip_unless(have("Xvfb"), "Xvfb not installed") {
-            return;
+        for tool in ["Xvfb", "xsetroot", "xdpyinfo"] {
+            if skip_unless(have(tool), &format!("{tool} not installed")) {
+                return;
+            }
         }
     };
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 struct Session {
-    child: Child,
+    /// Declared first: fields drop in order, and the session must be gone
+    /// before the directories below are removed from under it.
+    child: ChildGuard,
     port: u16,
     display: String,
     runtime_dir: tempfile::TempDir,
@@ -51,13 +54,15 @@ impl Session {
         extra: &[&str],
         env: &[(&str, &std::path::Path)],
     ) -> Self {
-        let port = free_port();
         let runtime_dir = tempfile::tempdir().unwrap();
         let upload_dir = tempfile::tempdir().unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_lynxrdp-session"));
         cmd.envs(env.iter().copied());
+        // Port 0: the session picks a port and prints it once bound. Picking
+        // one here by binding and releasing it handed two concurrent tests
+        // the same number often enough for their sessions to share a client.
         cmd.arg("--listen")
-            .arg(format!("127.0.0.1:{port}"))
+            .arg("127.0.0.1:0")
             .arg("--width")
             .arg(width.to_string())
             .arg("--height")
@@ -81,21 +86,22 @@ impl Session {
             .env("RUST_LOG", "debug")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let mut child = cmd.spawn().expect("start lynxrdp-session");
+        // Guarded before the readiness checks below: either of them failing
+        // would otherwise unwind past a live session and its Xvfb.
+        let mut child = ChildGuard::new(cmd.spawn().expect("start lynxrdp-session"));
         let stdout = child.stdout.take().unwrap();
+        let mut stdout = BufReader::new(stdout);
         let mut line = String::new();
-        BufReader::new(stdout).read_line(&mut line).unwrap();
+        stdout.read_line(&mut line).unwrap();
         let display = line.trim().to_string();
         assert!(display.starts_with(':'), "expected display, got {line:?}");
-        // Wait for the port.
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                break;
-            }
-            assert!(Instant::now() < deadline, "session did not start listening");
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // The second line is the bound address, so there is no port to wait
+        // for: by the time it is printed, a connect is accepted.
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        let port = SocketAddr::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("expected the listen address, got {line:?}: {e}"))
+            .port();
         Self {
             child,
             port,
@@ -137,27 +143,7 @@ impl Session {
     }
 
     fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if let Ok(Some(st)) = self.child.try_wait() {
-                return Some(st);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        None
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        // SAFETY: signalling our own child.
-        unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGTERM);
-        }
-        if self.wait_exit(Duration::from_secs(5)).is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
+        self.child.wait_exit(timeout)
     }
 }
 
@@ -214,7 +200,7 @@ fn count_pixels(client: &Client, rect: &Rect, color: u32) -> usize {
 
 #[test]
 fn handshake_and_first_frame() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(640, 480, "none", &[]);
     let mut c = s.connect(None);
     assert_eq!(c.info().username, "tester");
@@ -244,7 +230,7 @@ fn handshake_and_first_frame() {
 /// request.
 #[test]
 fn refresh_request_resends_the_screen() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
     s.x("xsetroot", &["-solid", "#00ff00"]);
@@ -281,7 +267,7 @@ fn refresh_request_resends_the_screen() {
 
 #[test]
 fn incremental_updates_only_send_changes() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(640, 480, "none", &[]);
     let mut c = s.connect(None);
     s.x("xsetroot", &["-solid", "#0000ff"]);
@@ -310,6 +296,25 @@ fn incremental_updates_only_send_changes() {
     );
 }
 
+/// The cookie the session wrote for its display, read from the file itself.
+///
+/// The file holds two entries for the one display (`FamilyLocal` and a
+/// wildcard) carrying the same cookie, so the first is enough. An entry is a
+/// big-endian family followed by four length-prefixed fields: address,
+/// display number, authorization name and data.
+fn cookie_from(xauth: &std::path::Path) -> Vec<u8> {
+    let bytes = std::fs::read(xauth).expect("read the authority file");
+    let mut fields = Vec::new();
+    let mut pos = 2;
+    for _ in 0..4 {
+        let n = usize::from(u16::from_be_bytes([bytes[pos], bytes[pos + 1]]));
+        fields.push(&bytes[pos + 2..pos + 2 + n]);
+        pos += 2 + n;
+    }
+    assert_eq!(fields[2], b"MIT-MAGIC-COOKIE-1", "unexpected authorization");
+    fields[3].to_vec()
+}
+
 /// A window on the session display that receives keyboard focus and
 /// records the keysyms it is sent. This is deterministic, unlike typing into
 /// a terminal emulator under a window-manager-less X server.
@@ -327,12 +332,28 @@ impl KeySink {
         use x11rb::protocol::xproto::{
             ConnectionExt as _, CreateWindowAux, EventMask, InputFocus, WindowClass,
         };
-        use x11rb::rust_connection::RustConnection;
-        // Connect as an ordinary X client using the session's display and
-        // its private authority cookie.
-        std::env::set_var("XAUTHORITY", s.xauth());
-        let (conn, screen_num) =
-            RustConnection::connect(Some(&s.display)).expect("connect display");
+        use x11rb::reexports::x11rb_protocol::parse_display::parse_display;
+        use x11rb::rust_connection::{DefaultStream, RustConnection};
+        // Connect as an ordinary X client with the session's private cookie
+        // handed over directly. `RustConnection::connect` finds a cookie
+        // through the `XAUTHORITY` variable, and that is process-wide: with
+        // the suite running its tests on two threads, two of these setting
+        // it and then connecting can each read the other's file and be
+        // refused by the wrong Xvfb. So resolve the display the way x11rb
+        // does and skip only the environment lookup.
+        let display = parse_display(Some(&s.display)).expect("parse display");
+        let (stream, _peer) = display
+            .connect_instruction()
+            .find_map(|addr| DefaultStream::connect(&addr).ok())
+            .expect("connect display socket");
+        let screen_num = usize::from(display.screen);
+        let conn = RustConnection::connect_to_stream_with_auth_info(
+            stream,
+            screen_num,
+            b"MIT-MAGIC-COOKIE-1".to_vec(),
+            cookie_from(&s.xauth()),
+        )
+        .expect("connect display");
         let setup = conn.setup();
         let root = setup.roots[screen_num].root;
         let (min, max) = (setup.min_keycode, setup.max_keycode);
@@ -471,7 +492,7 @@ impl KeySink {
 
 #[test]
 fn keyboard_input_reaches_application() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(640, 480, "none", &[]);
     let mut c = s.connect(None);
     let mut sink = KeySink::open(&s);
@@ -537,7 +558,7 @@ fn keyboard_input_reaches_application() {
 
 #[test]
 fn pointer_events_are_injected() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(640, 480, "none", &[]);
     let mut c = s.connect(None);
     c.pointer_move(123, 45).unwrap();
@@ -559,7 +580,7 @@ fn pointer_events_are_injected() {
 
 #[test]
 fn resize_changes_screen_and_resends() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(640, 480, "none", &[]);
     let mut c = s.connect(None);
     s.x("xsetroot", &["-solid", "#123456"]);
@@ -597,7 +618,7 @@ fn resize_changes_screen_and_resends() {
 
 #[test]
 fn resize_can_shrink_one_axis_while_growing_the_other() {
-    require_xvfb!();
+    require_x_tools!();
     // The default desktop entering a Mac's fullscreen viewport: four pixels
     // taller, but 192 pixels narrower. Neither switching the mode first nor
     // setting the final root size first fits; both need an intermediate root.
@@ -649,7 +670,7 @@ fn resize_can_shrink_one_axis_while_growing_the_other() {
 
 #[test]
 fn initial_size_from_hello() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(640, 480, "none", &[]);
     let c = s.connect(Some((1024, 768)));
     assert_eq!(c.size(), (1024, 768));
@@ -657,7 +678,7 @@ fn initial_size_from_hello() {
 
 #[test]
 fn initial_size_can_shrink_one_axis_while_growing_the_other() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(1920, 1080, "none", &[]);
     let mut c = s.connect(Some((1728, 1084)));
     assert_eq!(c.size(), (1728, 1084));
@@ -668,7 +689,7 @@ fn initial_size_can_shrink_one_axis_while_growing_the_other() {
 
 #[test]
 fn second_client_replaces_first() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut first = s.connect(None);
     let mut second = s.connect(None);
@@ -684,7 +705,7 @@ fn second_client_replaces_first() {
 
 #[test]
 fn clipboard_roundtrip() {
-    require_xvfb!();
+    require_x_tools!();
     if skip_unless(
         have("xclip") || have("xsel"),
         "neither xclip nor xsel installed",
@@ -712,27 +733,32 @@ fn clipboard_roundtrip() {
             String::from_utf8_lossy(&out.stdout)
         );
     }
-    // Session -> client.
-    if have("xclip") {
-        let mut child = Command::new("xclip")
-            .args(["-selection", "clipboard", "-i"])
+    // Session -> client, with whichever tool the guard above accepted. Both
+    // read the text from stdin up to EOF and then own the selection: xclip
+    // in this process, xsel in one it forks, which goes when the display does.
+    let (prog, args): (&str, &[&str]) = if have("xclip") {
+        ("xclip", &["-selection", "clipboard", "-i"])
+    } else {
+        ("xsel", &["--clipboard", "--input"])
+    };
+    let mut owner = ChildGuard::new(
+        Command::new(prog)
+            .args(args)
             .env("DISPLAY", &s.display)
             .env("XAUTHORITY", s.xauth())
             .stdin(Stdio::piped())
             .spawn()
-            .unwrap();
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all("from session".as_bytes())
-            .unwrap();
-        assert!(wait_for(&mut c, Duration::from_secs(5), |ev, _| ev
-            == &ClientEvent::Clipboard("from session".into())));
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+            .unwrap(),
+    );
+    use std::io::Write;
+    owner
+        .stdin
+        .take()
+        .unwrap()
+        .write_all("from session".as_bytes())
+        .unwrap();
+    assert!(wait_for(&mut c, Duration::from_secs(5), |ev, _| ev
+        == &ClientEvent::Clipboard("from session".into())));
 }
 
 /// A format the session cannot produce has to come back as *something*.
@@ -745,7 +771,7 @@ fn clipboard_roundtrip() {
 /// request for a format nothing has offered produces one.
 #[test]
 fn a_clipboard_format_the_session_cannot_produce_is_reported() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
     // Nothing in the session has copied an image, so no PNG is on offer and
@@ -777,7 +803,7 @@ fn sample_png(w: usize, h: usize) -> Vec<u8> {
 
 #[test]
 fn clipboard_image_from_client_reaches_the_session() {
-    require_xvfb!();
+    require_x_tools!();
     if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
@@ -809,7 +835,7 @@ fn clipboard_image_from_client_reaches_the_session() {
 
 #[test]
 fn clipboard_image_from_the_session_reaches_the_client() {
-    require_xvfb!();
+    require_x_tools!();
     if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
@@ -822,13 +848,15 @@ fn clipboard_image_from_the_session_reaches_the_client() {
     let mut c = s.connect(None);
 
     // xclip owns the selection for as long as it runs.
-    let mut owner = Command::new("xclip")
-        .args(["-selection", "clipboard", "-t", "image/png", "-i"])
-        .arg(&path)
-        .env("DISPLAY", &s.display)
-        .env("XAUTHORITY", s.xauth())
-        .spawn()
-        .unwrap();
+    let _owner = ChildGuard::new(
+        Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", "image/png", "-i"])
+            .arg(&path)
+            .env("DISPLAY", &s.display)
+            .env("XAUTHORITY", s.xauth())
+            .spawn()
+            .unwrap(),
+    );
 
     let mut got: Option<Vec<u8>> = None;
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -839,8 +867,6 @@ fn clipboard_image_from_the_session_reaches_the_client() {
             got = Some(data);
         }
     }
-    let _ = owner.kill();
-    let _ = owner.wait();
     assert_eq!(
         got.as_deref(),
         Some(&png[..]),
@@ -850,7 +876,7 @@ fn clipboard_image_from_the_session_reaches_the_client() {
 
 #[test]
 fn a_file_uploads_into_the_session() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
 
@@ -869,7 +895,7 @@ fn a_file_uploads_into_the_session() {
 
 #[test]
 fn an_upload_may_not_escape_the_upload_directory() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
 
@@ -878,21 +904,40 @@ fn an_upload_may_not_escape_the_upload_directory() {
     std::fs::write(&local, b"should not land outside").unwrap();
 
     // The session must refuse a destination that climbs out of the directory.
-    let id = c.send_file(&local, "../../escaped.txt").unwrap();
+    let destination = "../../escaped.txt";
+    let id = c.send_file(&local, destination).unwrap();
     let err = c.run_transfer(id, Duration::from_secs(15)).unwrap_err();
     assert!(err.to_string().contains("unsafe"), "{err}");
 
-    let escaped = s.upload_dir.path().parent().unwrap().join("escaped.txt");
+    // Where a naive join of that same string would have written, resolved
+    // lexically: `canonicalize` needs the file to exist, and the point is
+    // that it must not.
+    let mut escaped = s.upload_dir.path().to_path_buf();
+    for part in std::path::Path::new(destination).components() {
+        match part {
+            std::path::Component::ParentDir => {
+                escaped.pop();
+            }
+            other => escaped.push(other),
+        }
+    }
     assert!(
         !escaped.exists(),
         "the file escaped to {}",
         escaped.display()
     );
+    assert!(
+        std::fs::read_dir(s.upload_dir.path())
+            .unwrap()
+            .next()
+            .is_none(),
+        "a refused upload left something in the upload directory"
+    );
 }
 
 #[test]
 fn an_upload_into_a_subdirectory_creates_it() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
     let src = tempfile::tempdir().unwrap();
@@ -908,7 +953,7 @@ fn an_upload_into_a_subdirectory_creates_it() {
 
 #[test]
 fn a_file_downloads_out_of_the_session() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
 
@@ -938,7 +983,7 @@ fn a_file_downloads_out_of_the_session() {
 /// a download would pass all of them. Hence the hand-written loop below.
 #[test]
 fn a_large_download_does_not_stall_the_screen() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
 
@@ -956,18 +1001,22 @@ fn a_large_download_does_not_stall_the_screen() {
     // proves nothing at all: a quiescent screen produces no frames either way,
     // and the assertion below would be measuring the absence of damage rather
     // than the presence of a stall.
-    let mut painter = Command::new("sh")
-        .arg("-c")
-        .arg(
-            "while :; do xsetroot -solid '#ff0000'; sleep 0.02; \
-             xsetroot -solid '#0000ff'; sleep 0.02; done",
-        )
-        .env("DISPLAY", &s.display)
-        .env("XAUTHORITY", s.xauth())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    // Guarded because the loop outlives its display: xsetroot failing does
+    // not end it, so a panic below would leave it spinning forever.
+    let _painter = ChildGuard::new(
+        Command::new("sh")
+            .arg("-c")
+            .arg(
+                "while :; do xsetroot -solid '#ff0000'; sleep 0.02; \
+                 xsetroot -solid '#0000ff'; sleep 0.02; done",
+            )
+            .env("DISPLAY", &s.display)
+            .env("XAUTHORITY", s.xauth())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
 
     let out_dir = tempfile::tempdir().unwrap();
     let dest = out_dir.path().join("big.bin");
@@ -1029,9 +1078,6 @@ fn a_large_download_does_not_stall_the_screen() {
         }
     }
 
-    let _ = painter.kill();
-    let _ = painter.wait();
-
     assert!(done, "the download never finished");
     // Not assert_eq!, which would dump 16 MiB of bytes twice before anyone
     // could read the message. The first differing offset is the useful part.
@@ -1059,7 +1105,7 @@ fn a_large_download_does_not_stall_the_screen() {
 
 #[test]
 fn downloading_a_missing_file_fails_cleanly() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
     let out = tempfile::tempdir().unwrap();
@@ -1133,7 +1179,7 @@ fn clipboard_file_tests_ask_for_fuse_before_using_it() {
 
 #[test]
 fn clipboard_files_from_the_client_are_staged_for_the_session() {
-    require_xvfb!();
+    require_x_tools!();
     if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
@@ -1265,7 +1311,7 @@ fn clipboard_files_from_the_client_are_staged_for_the_session() {
 
 #[test]
 fn clipboard_disconnect_releases_a_waiting_native_reader() {
-    require_xvfb!();
+    require_x_tools!();
     if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
@@ -1325,7 +1371,7 @@ fn clipboard_desktop_text_envelope_is_a_file_offer_not_text() {
 }
 
 fn clipboard_files_round_trip(target: &str) {
-    require_xvfb!();
+    require_x_tools!();
     if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
@@ -1351,13 +1397,15 @@ fn clipboard_files_round_trip(target: &str) {
     let mut c = s.connect(None);
 
     // xclip owns the selection, offering a uri-list, for as long as it runs.
-    let mut owner = Command::new("xclip")
-        .args(["-selection", "clipboard", "-t", target, "-i"])
-        .env("DISPLAY", &s.display)
-        .env("XAUTHORITY", s.xauth())
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut owner = ChildGuard::new(
+        Command::new("xclip")
+            .args(["-selection", "clipboard", "-t", target, "-i"])
+            .env("DISPLAY", &s.display)
+            .env("XAUTHORITY", s.xauth())
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     use std::io::Write;
     owner
         .stdin
@@ -1426,13 +1474,11 @@ fn clipboard_files_round_trip(target: &str) {
         read_clipboard_file(&mut c, &paths[0]).unwrap(),
         b"from the session"
     );
-    let _ = owner.kill();
-    let _ = owner.wait();
 }
 
 #[test]
 fn exit_on_disconnect_ends_session() {
-    require_xvfb!();
+    require_x_tools!();
     let mut s = Session::start(320, 240, "none", &["--exit-on-disconnect"]);
     let mut c = s.connect(None);
     c.disconnect("bye");
@@ -1458,7 +1504,7 @@ fn exit_on_disconnect_ends_session() {
 /// fail to collect the sessions this is for.
 #[test]
 fn an_idle_session_exits_after_the_timeout() {
-    require_xvfb!();
+    require_x_tools!();
     let mut s = Session::start(320, 240, "none", &["--idle-timeout", "2"]);
     let mut c = s.connect(None);
     s.x("xsetroot", &["-solid", "#ff00ff"]);
@@ -1484,7 +1530,7 @@ fn an_idle_session_exits_after_the_timeout() {
 /// `PONG_TIMEOUT` and would be testing something else entirely.
 #[test]
 fn a_session_with_a_client_attached_survives_the_idle_timeout() {
-    require_xvfb!();
+    require_x_tools!();
     let mut s = Session::start(320, 240, "none", &["--idle-timeout", "2"]);
     let mut client = s.connect(None);
     let deadline = Instant::now() + Duration::from_secs(6);
@@ -1512,7 +1558,7 @@ fn a_session_with_a_client_attached_survives_the_idle_timeout() {
 
 #[test]
 fn desktop_exit_ends_session_and_notifies_client() {
-    require_xvfb!();
+    require_x_tools!();
     let mut s = Session::start(320, 240, "sleep 1", &[]);
     let mut c = s.connect(None);
     let reason = wait_disconnect(&mut c, Duration::from_secs(10)).expect("client disconnected");
@@ -1525,7 +1571,7 @@ fn desktop_exit_ends_session_and_notifies_client() {
 
 #[test]
 fn cursor_shape_is_sent() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
     // Xvfb starts with the default cursor; the server sends it right after hello.
@@ -1537,12 +1583,14 @@ fn cursor_shape_is_sent() {
     );
 }
 
+/// The refusal itself -- a peer whose uid is not the session's -- is pinned by
+/// the unit tests in `session/listener.rs`, which can name any uid they like
+/// as the required one; nothing here can connect as somebody else. What this
+/// proves is only that the flag SECURITY.md documents really does turn the
+/// check off, so a session started with it still admits its own user.
 #[test]
-fn peer_uid_check_rejects_other_users() {
-    // We cannot easily connect as another uid in a unit test; instead verify
-    // the check is on by default by reading the log line, and that the
-    // insecure flag turns it off.
-    require_xvfb!();
+fn insecure_skip_peer_check_still_admits_the_owner() {
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &["--insecure-skip-peer-check"]);
     let c = s.connect(None);
     assert_eq!(c.size(), (320, 240));
@@ -1550,7 +1598,7 @@ fn peer_uid_check_rejects_other_users() {
 
 #[test]
 fn latency_probe() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
     c.ping().unwrap();
@@ -1563,7 +1611,7 @@ fn latency_probe() {
 
 #[test]
 fn clipboard_paste_preserves_duplicate_names_and_reports_missing_sources() {
-    require_xvfb!();
+    require_x_tools!();
     if skip_unless(have("xclip"), "xclip not installed") {
         return;
     }
@@ -1612,7 +1660,7 @@ fn clipboard_paste_preserves_duplicate_names_and_reports_missing_sources() {
 
 #[test]
 fn uploads_preserve_existing_files_unless_replacement_is_chosen() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
     let source = tempfile::NamedTempFile::new().unwrap();
@@ -1651,7 +1699,7 @@ fn uploads_preserve_existing_files_unless_replacement_is_chosen() {
 
 #[test]
 fn reconnect_clears_abandoned_transfers_and_a_stalled_worker_does_not_block_input() {
-    require_xvfb!();
+    require_x_tools!();
     let s = Session::start(320, 240, "none", &[]);
     let mut c = s.connect(None);
     let source = tempfile::tempdir().unwrap();
@@ -1713,29 +1761,40 @@ fn reconnect_clears_abandoned_transfers_and_a_stalled_worker_does_not_block_inpu
 
 #[test]
 fn session_management_lists_without_takeover_and_checks_the_start_token() {
-    require_xvfb!();
+    require_x_tools!();
     let mut s = Session::start(320, 240, "none", &[]);
-    let c = s.connect(None);
+    let mut c = s.connect(None);
     let rows = lynxrdp_server::session::admin::list().unwrap();
     let row = rows
         .iter()
         .find(|r| r.pid == s.child.id())
         .expect("desktop listed");
     assert!(lynxrdp_server::session::admin::terminate(row.pid, row.started + 1).is_err());
-    c.send(&lynxrdp_proto::Message::Ping { nonce: 55 }).unwrap();
+    // A round trip, not just a send: `Client::send` only queues the message,
+    // so it succeeds on a connection the listing had already dropped.
+    c.ping().unwrap();
+    assert!(
+        wait_for(&mut c, Duration::from_secs(5), |ev, _| matches!(
+            ev,
+            ClientEvent::Rtt(_)
+        )),
+        "listing sessions took over the attached client"
+    );
     lynxrdp_server::session::admin::terminate(row.pid, row.started).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while s.child.try_wait().unwrap().is_none() {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let reason = wait_disconnect(&mut c, Duration::from_secs(10))
+        .expect("the client was not told the session ended");
+    assert!(reason.contains("shutting down"), "{reason}");
+    assert!(
+        s.wait_exit(Duration::from_secs(10)).is_some(),
+        "the session did not exit on termination"
+    );
 }
 
 /// A native file receiver decides the final folder. Exercise the complete
 /// network pull, staging, XDND negotiation and URI selection conversion.
 #[test]
 fn targeted_drops_reach_the_receiver_under_the_pointer() {
-    require_xvfb!();
+    require_x_tools!();
     use x11rb::{
         connection::Connection,
         protocol::{
@@ -1903,7 +1962,7 @@ fn targeted_drops_reach_the_receiver_under_the_pointer() {
 
 #[test]
 fn targeted_drop_waits_for_gtk_file_inspection() {
-    require_xvfb!();
+    require_x_tools!();
     let gtk = Command::new("python3")
         .args([
             "-c",
@@ -1920,27 +1979,21 @@ fn targeted_drop_waits_for_gtk_file_inspection() {
     let destination = tempfile::tempdir().unwrap();
     let file = source.path().join("gtk-copy.txt");
     std::fs::write(&file, b"asynchronous native copy").unwrap();
-    let mut receiver = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/gtk_drop_receiver.py"
-        ))
-        .arg(destination.path())
-        .env("DISPLAY", &session.display)
-        .env("XAUTHORITY", session.xauth())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    struct Stop(Child);
-    impl Drop for Stop {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
+    let mut receiver = ChildGuard::new(
+        Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/gtk_drop_receiver.py"
+            ))
+            .arg(destination.path())
+            .env("DISPLAY", &session.display)
+            .env("XAUTHORITY", session.xauth())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     let mut output = BufReader::new(receiver.stdout.take().unwrap());
-    let _receiver = Stop(receiver);
     let mut ready = String::new();
     output.read_line(&mut ready).unwrap();
     assert_eq!(ready.trim(), "READY");
@@ -1973,7 +2026,7 @@ fn targeted_drop_waits_for_gtk_file_inspection() {
 
 #[test]
 fn targeted_drop_to_bare_desktop_uses_xdg_folder_and_excludes_windows_and_panel() {
-    require_xvfb!();
+    require_x_tools!();
     if skip_unless(have("xdg-user-dir"), "xdg-user-dir not installed") {
         return;
     }

@@ -116,9 +116,16 @@ pub fn send_rejection(fd: BorrowedFd<'_>, code: u16, reason: &str) {
     }
 }
 
-/// Wait up to `timeout` for a listener fd to become readable. Returns the
-/// index of the ready listener.
-pub fn poll_listeners(fds: &[RawFd], timeout: Duration) -> std::io::Result<Option<usize>> {
+/// Wait up to `timeout` for any listener fd to become readable. Returns the
+/// indices of every ready listener, in the order they were given.
+///
+/// Every one of them, not the first: the accept loop takes one connection per
+/// listener per pass, and returning only the lowest ready index made the TCP
+/// listener, at index 0, the only one served for as long as its backlog stayed
+/// non-empty. A local user connecting and closing in a loop kept it that way
+/// indefinitely, and anyone whose SSH forward targeted the Unix socket could
+/// not connect at all.
+pub fn poll_listeners(fds: &[RawFd], timeout: Duration) -> std::io::Result<Vec<usize>> {
     let mut pfds: Vec<libc::pollfd> = fds
         .iter()
         .map(|&fd| libc::pollfd {
@@ -138,11 +145,40 @@ pub fn poll_listeners(fds: &[RawFd], timeout: Duration) -> std::io::Result<Optio
     if rc < 0 {
         let e = std::io::Error::last_os_error();
         if e.kind() == std::io::ErrorKind::Interrupted {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         return Err(e);
     }
     Ok(pfds
         .iter()
-        .position(|p| p.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0))
+        .enumerate()
+        .filter(|(_, p)| p.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0)
+        .map(|(i, _)| i)
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    /// Two listeners with a connection waiting each are both reported. The
+    /// old `position()` reported the first alone, which is what let TCP load
+    /// starve the Unix socket.
+    #[test]
+    fn every_ready_listener_is_reported_not_just_the_first() {
+        let (mut a_w, a_r) = UnixStream::pair().unwrap();
+        let (mut b_w, b_r) = UnixStream::pair().unwrap();
+        let (_c_w, c_r) = UnixStream::pair().unwrap();
+        a_w.write_all(b"x").unwrap();
+        b_w.write_all(b"x").unwrap();
+        let fds = [a_r.as_raw_fd(), b_r.as_raw_fd(), c_r.as_raw_fd()];
+        let ready = poll_listeners(&fds, Duration::from_secs(5)).unwrap();
+        assert_eq!(ready, vec![0, 1]);
+        // And nothing ready is an empty set, not an error.
+        let fds = [c_r.as_raw_fd()];
+        let ready = poll_listeners(&fds, Duration::from_millis(10)).unwrap();
+        assert!(ready.is_empty());
+    }
 }

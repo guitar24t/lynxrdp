@@ -77,11 +77,28 @@ from the network.
   nothing else.
 * **The clipboard's WebDAV server, on macOS.** Pasting files from a session
   mounts a read-only WebDAV volume, which means a loopback TCP listener any
-  local user can connect to. What they cannot do is name a file: every URL
-  sits below a path prefix of 24 random characters generated for that copy,
-  and a request that does not match it is answered with a 404. Only
-  `OPTIONS`, `PROPFIND`, `HEAD` and `GET` are answered at all, and what they
-  can reach is what the session had already offered.
+  local user can connect to. Its URL is no secret: `mount_webdav` records
+  it as the volume's source and the `webdavfs_agent` it execs carries it in
+  argv, so `mount` and `ps` show it to every uid on the machine. What a
+  request needs is a credential the URL does not carry. Every request must
+  present HTTP Basic authentication with a password generated for that copy
+  from the OS random generator; the server checks it before it looks at the
+  path and answers 401 to anything without it, so a probe learns nothing
+  about the path either. The agent receives the password through a file
+  descriptor (`mount_webdav -a0`, an unlinked 0600 file passed as its
+  stdin), never on its command line, and the 24-character random path
+  prefix stays as a second layer. Only `OPTIONS`, `PROPFIND`, `HEAD` and
+  `GET` are answered at all, and what they can reach is what the session
+  had already offered.
+
+  What a local user can still see, from the mount table, is that a copy is
+  in progress: the port, the URL with its prefix, the volume name and the
+  mount point. What they can still do is connect. A connection holds one of
+  the four workers for at most ten seconds whether or not a request arrives,
+  and nothing it sends is read past a 16 KiB head and a 64 KiB body, so
+  someone keeping the workers busy delays a paste rather than stops one. A
+  user who can read the client's or the agent's memory has the password,
+  as they would have everything else.
 * **The FUSE mount, on Linux.** The same paste is a read-only FUSE mount
   instead, made without `allow_other`, so the kernel refuses every uid but
   the one that mounted it.
@@ -177,8 +194,11 @@ chosen. Files are staged beside the destination and only renamed after all
 promised bytes have arrived. Failure and cancellation remove the staged file
 when the file worker can run; killing the entire process may leave a temporary
 file. A successful rename is atomic visibility, not a power-loss durability
-guarantee. The server refuses symlink parent components; replacing a final
-symlink replaces the link itself rather than writing its target.
+guarantee. A published file has the mode the process umask gives any new
+file, because the staging file is created 0666 for the umask to apply to,
+rather than the private 0600 a temporary file would keep. The server refuses
+symlink parent components; replacing a final symlink replaces the link itself
+rather than writing its target.
 
 The session list and termination helpers run through SSH as the authenticated
 user and inspect only that user's processes. Termination requires both PID and

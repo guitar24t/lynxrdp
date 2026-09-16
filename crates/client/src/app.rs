@@ -37,7 +37,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::clipchange::ClipboardWatcher;
@@ -45,7 +45,8 @@ use crate::connection::{Client, ClientEvent, ConnectOptions};
 use crate::keymap;
 use crate::overlay::{self, Overlay};
 use crate::profiles::MAX_SCALE;
-use crate::tunnel::Endpoint;
+use crate::tunnel::{Endpoint, KillHandle};
+use lynxrdp_filecopy::FetchReply;
 
 /// How long to wait after the last resize before asking the server.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -322,6 +323,9 @@ struct Attempt {
     /// The endpoint comes back whatever happens, so a failed attempt does not
     /// take the tunnel with it.
     done: crossbeam_channel::Receiver<(Endpoint, Result<Client>)>,
+    /// Stops an ssh the attempt may be starting, at exit, when the worker
+    /// holding the endpoint cannot be waited for.
+    kill: KillHandle,
 }
 
 /// Event sent through the winit proxy to wake the loop.
@@ -380,7 +384,7 @@ pub struct App {
     /// progress can be reported across a whole drop rather than per file.
     upload_done: usize,
     // Release waiting readers before dropping/unmounting their file references.
-    clipboard_reads: std::collections::HashMap<u64, crossbeam_channel::Sender<Option<PathBuf>>>,
+    clipboard_reads: std::collections::HashMap<u64, crossbeam_channel::Sender<FetchReply>>,
     clipboard_offer: Option<crossbeam_channel::Receiver<anyhow::Result<lynxrdp_filecopy::Files>>>,
     clipboard_batch: Option<lynxrdp_filecopy::Files>,
     last_clipboard_poll: Instant,
@@ -419,12 +423,20 @@ pub struct App {
     redraw_asked: bool,
     exit_reason: Option<String>,
     shared_window: bool,
-    fullscreen: bool,
-    pressed_keys: Vec<u32>,
-    /// Keysyms consumed as part of a bar accelerator. Their release is
+    /// What the session has been told is held: each physical key with the
+    /// keysym its press was sent as. The release goes out with that same
+    /// keysym whatever the OS spells it, because the two can differ -- a
+    /// shifted press has an unshifted release once Shift goes up first, and
+    /// AltGr+q on a German layout is pressed as '@' and released as 'q'. The
+    /// session binds each spelling to a keycode of its own, so a release in
+    /// the other spelling would leave the pressed one down.
+    pressed_keys: Vec<(PhysicalKey, u32)>,
+    /// Physical keys consumed as part of a bar accelerator. Their release is
     /// consumed too: by then the user may have let go of Ctrl, so the
-    /// modifier test that recognised the press would no longer fire.
-    swallowed: Vec<u32>,
+    /// modifier test that recognised the press would no longer fire. Keyed
+    /// on the physical key because the release's logical spelling can differ
+    /// from the press's -- on macOS, Option let go before the letter.
+    swallowed: Vec<PhysicalKey>,
     /// The connection bar.
     overlay: Overlay,
     /// The pointer is over the bar, so its events are ours and not the
@@ -497,7 +509,6 @@ impl App {
         let now = Instant::now();
         Self {
             client,
-            fullscreen: opts.fullscreen,
             // A pinned scale is known now; an unpinned one is not known until
             // there is a window to ask which display it opened on.
             scale: opts.scale.map_or(1, u32::from),
@@ -679,6 +690,18 @@ impl App {
             attrs = WindowAttributesExtX11::with_name(attrs, crate::APP_ID, crate::APP_ID);
             attrs = WindowAttributesExtWayland::with_name(attrs, crate::APP_ID, crate::APP_ID);
         }
+        // Option is Alt to the session. Left to AppKit, Option+B reaches winit
+        // as the character it composes and Option+E as a dead key, so the
+        // desktop on the far end sees Alt plus a keysym it has never heard of
+        // -- or nothing at all -- where a Linux desktop expects its menu
+        // mnemonic. winit re-reads the key without Option for combinations
+        // that do not also hold Control or Command, which leaves Ctrl+Alt+B
+        // exactly as `accelerator_for` describes it.
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS};
+            attrs = attrs.with_option_as_alt(OptionAsAlt::Both);
+        }
         if let Some(icon) = crate::icon::load() {
             // `from_rgba` only fails on a length mismatch, which `load` has
             // already ruled out; either way a missing icon is not fatal.
@@ -724,7 +747,7 @@ impl App {
         if size != inner {
             let _ = window.request_inner_size(size);
         }
-        if self.fullscreen {
+        if self.opts.fullscreen {
             window.set_fullscreen(Some(Fullscreen::Borderless(None)));
         }
         let context = softbuffer::Context::new(window.clone())
@@ -1226,7 +1249,9 @@ impl App {
             );
             return;
         }
-        if self.fullscreen {
+        // Asked of the window rather than remembered: the green button, a WM
+        // keybinding or Esc leave fullscreen without passing through here.
+        if g.window.fullscreen().is_some() {
             return;
         }
         let want = (width * self.scale, height * self.scale);
@@ -1348,6 +1373,7 @@ impl App {
         let opts = self.session.connect.clone();
         let reader_waker = waker_for(&self.session.waker);
         let nudge = waker_for(&self.session.waker);
+        let kill = endpoint.kill_handle();
         let (tx, rx) = crossbeam_channel::bounded(1);
         let spawned = std::thread::Builder::new()
             .name("lynxrdp-reconnect".into())
@@ -1362,7 +1388,7 @@ impl App {
                 nudge();
             });
         match spawned {
-            Ok(_) => self.attempt = Some(Attempt { done: rx }),
+            Ok(_) => self.attempt = Some(Attempt { done: rx, kill }),
             Err(e) => {
                 // The endpoint went with the closure. There is no way back
                 // from here, and pretending otherwise would leave the window
@@ -1502,23 +1528,7 @@ impl App {
         // A wheel remainder is part of a gesture that ended when the link did.
         self.scroll.reset();
         self.release_all_keys();
-        for b in [
-            MouseButton::Left,
-            MouseButton::Middle,
-            MouseButton::Right,
-            MouseButton::Back,
-            MouseButton::Forward,
-        ] {
-            if let Some((button, bit)) = button_codes(b) {
-                if self.remote_buttons & bit != 0 {
-                    self.send(&Message::PointerButton {
-                        button,
-                        down: false,
-                    });
-                }
-            }
-        }
-        self.remote_buttons = 0;
+        self.release_all_buttons();
         // And where the pointer is, after the buttons are up rather than
         // before: warping first would drag whatever the old link was holding
         // across the desktop and drop it somewhere new.
@@ -1674,21 +1684,7 @@ impl App {
 
     fn open_transfer_panel(&mut self) {
         self.release_all_keys();
-        for (code, bit) in [
-            (button::LEFT, 1),
-            (button::MIDDLE, 2),
-            (button::RIGHT, 4),
-            (button::BACK, 8),
-            (button::FORWARD, 16),
-        ] {
-            if self.remote_buttons & bit != 0 {
-                self.send(&Message::PointerButton {
-                    button: code,
-                    down: false,
-                });
-            }
-        }
-        self.remote_buttons = 0;
+        self.release_all_buttons();
         self.transfer_panel.open = true;
         self.ui_keyboard = true;
         self.full_redraw = true;
@@ -1714,10 +1710,12 @@ impl App {
                             self.transfer_panel.replace,
                         )
                     });
-                self.transfer_panel.notify(match result {
-                    Ok(_) => "Download requested".into(),
-                    Err(e) => format!("{e:#}"),
-                });
+                match result {
+                    Ok(_) => self
+                        .transfer_panel
+                        .notify_transient("Download requested".into()),
+                    Err(e) => self.transfer_panel.notify(format!("{e:#}")),
+                }
             }
             Action::Cancel(id) => {
                 self.client.cancel_transfer(id);
@@ -1732,6 +1730,11 @@ impl App {
                 self.drop_target = None;
                 self.drop_deadline = None;
                 self.uploads.clear();
+                // A cancelled transfer reports no completion, so the count
+                // `pump_uploads` resets at the end of a drop would otherwise
+                // survive into the next one, which would start out reading
+                // as nearly finished.
+                self.upload_done = 0;
                 self.clipboard_reads.clear();
                 self.clipboard_offer = None;
                 self.clipboard_batch = None;
@@ -1739,6 +1742,7 @@ impl App {
                     self.client.cancel_transfer(id);
                 }
                 self.transfer_panel.notify("Transfers cancelled".into());
+                self.update_title();
             }
         }
     }
@@ -1803,22 +1807,22 @@ impl App {
         if !self.link_up() {
             return;
         }
-        let held = |a: u32, b: u32| self.pressed_keys.iter().any(|&k| k == a || k == b);
+        let held = |a: u32, b: u32| self.pressed_keys.iter().any(|&(_, k)| k == a || k == b);
         let mut synth = Vec::new();
         if !held(keysym::CONTROL_L, keysym::CONTROL_R) {
-            synth.push(keysym::CONTROL_L);
+            synth.push((PhysicalKey::Code(KeyCode::ControlLeft), keysym::CONTROL_L));
         }
         if !held(keysym::ALT_L, keysym::ALT_R) {
-            synth.push(keysym::ALT_L);
+            synth.push((PhysicalKey::Code(KeyCode::AltLeft), keysym::ALT_L));
         }
-        for &ks in &synth {
-            self.pressed_keys.push(ks);
+        for &(physical, ks) in &synth {
+            self.pressed_keys.push((physical, ks));
             self.send_key(ks, true);
         }
         self.send_key(keysym::DELETE, true);
         self.send_key(keysym::DELETE, false);
-        for &ks in synth.iter().rev() {
-            self.pressed_keys.retain(|&k| k != ks);
+        for &(_, ks) in synth.iter().rev() {
+            self.pressed_keys.retain(|&(_, k)| k != ks);
             self.send_key(ks, false);
         }
     }
@@ -1935,7 +1939,7 @@ impl App {
         match self.client.drop_files(&files, x, y) {
             Ok(_) => self
                 .transfer_panel
-                .notify("Preparing files for the selected location...".into()),
+                .notify_transient("Preparing files for the selected location...".into()),
             Err(e) => self
                 .transfer_panel
                 .notify(format!("Could not drop files: {e:#}")),
@@ -2004,6 +2008,9 @@ impl App {
         if !self.link_up() {
             return;
         }
+        // Before anything new starts, so a read retried after a stall never
+        // finds the transfer it gave up on still running beside its own.
+        self.report_clipboard_reads();
         if let Some(result) = self
             .clipboard_offer
             .as_ref()
@@ -2048,7 +2055,7 @@ impl App {
                     self.clipboard_reads.insert(id, request.result);
                 }
                 Err(e) => {
-                    let _ = request.result.send(None);
+                    let _ = request.result.send(FetchReply::Failed);
                     self.transfer_panel
                         .notify(format!("Could not paste file: {e:#}"));
                 }
@@ -2058,7 +2065,37 @@ impl App {
 
     fn on_clipboard_file(&mut self, id: u64, path: Option<PathBuf>) {
         if let Some(reply) = self.clipboard_reads.remove(&id) {
-            let _ = reply.send(path);
+            let _ = reply.send(match path {
+                Some(path) => FetchReply::Done(path),
+                None => FetchReply::Failed,
+            });
+        }
+    }
+
+    /// Tell each waiting paste how its transfer is going, and cancel the
+    /// transfers whose readers have stopped waiting.
+    ///
+    /// Every tick, and whether or not the count moved: the send is also the
+    /// probe. A reader that gave up on a stalled transfer has dropped its
+    /// end, and the failed send is the only way that decision reaches here.
+    /// Without it the bytes it was waiting for would keep coming, through the
+    /// tunnel the next paste needs, into a file nobody will open.
+    fn report_clipboard_reads(&mut self) {
+        let mut abandoned = Vec::new();
+        for (id, reply) in &self.clipboard_reads {
+            let received = self
+                .client
+                .transfer_progress(*id)
+                .map_or(0, |(done, _)| done);
+            if let Err(crossbeam_channel::TrySendError::Disconnected(_)) =
+                reply.try_send(FetchReply::Progress(received))
+            {
+                abandoned.push(*id);
+            }
+        }
+        for id in abandoned {
+            self.clipboard_reads.remove(&id);
+            self.client.cancel_transfer(id);
         }
     }
 
@@ -2303,32 +2340,57 @@ impl App {
     }
 
     fn on_key(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
-        let Some(ks) = keymap::keysym_for(&event.logical_key, event.location) else {
+        let key = KeyInput {
+            physical: event.physical_key,
+            logical: &event.logical_key,
+            location: event.location,
+            down: event.state == ElementState::Pressed,
+            repeat: event.repeat,
+        };
+        let Some(acc) = self.key_input(key) else {
             return;
         };
-        if event.state == ElementState::Pressed {
-            if let Some(acc) = self.accelerator(&event.logical_key, event.physical_key) {
-                self.swallowed.push(ks);
-                match acc {
-                    Accelerator::Transfers => self.open_transfer_panel(),
-                    Accelerator::Fullscreen => self.toggle_fullscreen(),
-                    Accelerator::SecureAttention => self.send_secure_attention(),
-                    Accelerator::Pin => {
-                        self.overlay.toggle_pin();
-                        // Flash either way: pinning wants confirmation and
-                        // unpinning wants a last look before it goes.
-                        self.overlay.flash(Instant::now());
-                    }
-                    Accelerator::Reconnect => self.reconnect_now(),
-                    Accelerator::Disconnect => {
-                        self.run_overlay_action(overlay::Action::Disconnect, event_loop)
-                    }
-                }
-                return;
+        match acc {
+            Accelerator::Transfers => self.open_transfer_panel(),
+            Accelerator::Fullscreen => self.toggle_fullscreen(),
+            Accelerator::SecureAttention => self.send_secure_attention(),
+            Accelerator::Pin => {
+                self.overlay.toggle_pin();
+                // Flash either way: pinning wants confirmation and
+                // unpinning wants a last look before it goes.
+                self.overlay.flash(Instant::now());
             }
-        } else if let Some(i) = self.swallowed.iter().position(|&k| k == ks) {
+            Accelerator::Reconnect => self.reconnect_now(),
+            Accelerator::Disconnect => {
+                self.run_overlay_action(overlay::Action::Disconnect, event_loop)
+            }
+        }
+    }
+
+    /// Keep a key, swallow it, or forward it to the session.
+    ///
+    /// Returns the accelerator a press asked for, which the caller runs: that
+    /// is the one part that needs the event loop, and keeping it out is what
+    /// lets a test press keys without one.
+    fn key_input(&mut self, key: KeyInput<'_>) -> Option<Accelerator> {
+        if key.down {
+            if let Some(acc) = self.accelerator(key.logical, key.physical) {
+                // A held accelerator auto-repeats. The action ran on the
+                // first press and its one release is already spoken for;
+                // recording every repeat left entries behind that ate the
+                // releases of ordinary presses of the same key, one at a
+                // time, leaving each of them held on the session.
+                if key.repeat {
+                    return None;
+                }
+                if !self.swallowed.contains(&key.physical) {
+                    self.swallowed.push(key.physical);
+                }
+                return Some(acc);
+            }
+        } else if let Some(i) = self.swallowed.iter().position(|&k| k == key.physical) {
             self.swallowed.swap_remove(i);
-            return;
+            return None;
         }
         // Nothing else reaches the session while the link is down, and
         // nothing is recorded either: `pressed_keys` is this side's copy of
@@ -2337,35 +2399,55 @@ impl App {
         // would have `resync_input` release a key it is not holding, and
         // dropping a release it never saw is what leaves a modifier stuck.
         if !self.link_up() {
-            return;
+            return None;
         }
-        // Numpad digits should arrive as KP_ keysyms.
-        let ks = match (&event.logical_key, event.location) {
-            (Key::Character(s), winit::keyboard::KeyLocation::Numpad) => s
-                .chars()
-                .next()
-                .and_then(keymap::numpad_keysym)
-                .unwrap_or(ks),
-            _ => ks,
-        };
-        // Do not send a key press if we think it is already down, unless it is
-        // an auto-repeat which the server should see as repeated presses.
-        let down = event.state == ElementState::Pressed;
-        if down {
-            if !self.pressed_keys.contains(&ks) {
-                self.pressed_keys.push(ks);
+        if key.down {
+            let ks = keysym_of(key.logical, key.location)?;
+            match self
+                .pressed_keys
+                .iter()
+                .position(|(p, _)| *p == key.physical)
+            {
+                // An auto-repeat, which the session should see as repeated
+                // presses -- unless the spelling changed under it (Shift
+                // pressed while a letter repeats), in which case the session
+                // is holding a keycode for the old spelling and has to let
+                // go of it before it can press the new one.
+                Some(i) => {
+                    let held = self.pressed_keys[i].1;
+                    if held != ks {
+                        self.send_key(held, false);
+                        self.pressed_keys[i].1 = ks;
+                    }
+                }
+                None => self.pressed_keys.push((key.physical, ks)),
             }
+            self.send_key(ks, true);
         } else {
-            // A shifted press may have an unshifted logical release (notably
-            // synthetic X11 typing). Forward it even if its spelling is not
-            // in pressed_keys; otherwise the remote physical key stays held.
-            self.pressed_keys.retain(|&k| k != ks);
+            // The keysym the press went out as, whatever this release says
+            // (see `pressed_keys`). A release with no press on record is
+            // still forwarded as spelled -- synthetic X11 typing can do this
+            // -- and matched by keysym in case the physical key is one the
+            // OS could not identify; otherwise the remote key stays held.
+            let ks = match self
+                .pressed_keys
+                .iter()
+                .position(|(p, _)| *p == key.physical)
+            {
+                Some(i) => self.pressed_keys.swap_remove(i).1,
+                None => {
+                    let ks = keysym_of(key.logical, key.location)?;
+                    self.pressed_keys.retain(|&(_, k)| k != ks);
+                    ks
+                }
+            };
+            self.send_key(ks, false);
         }
-        self.send_key(ks, down);
+        None
     }
 
     fn release_all_keys(&mut self) {
-        for ks in std::mem::take(&mut self.pressed_keys) {
+        for (_, ks) in std::mem::take(&mut self.pressed_keys) {
             self.send_key(ks, false);
         }
         // The releases for these will arrive with the window unfocused, or not
@@ -2373,13 +2455,70 @@ impl App {
         self.swallowed.clear();
     }
 
+    /// Tell the session to let go of every pointer button it was told is
+    /// held, and forget them.
+    ///
+    /// Forgetting alone is not enough: the server's own blanket release runs
+    /// only when a client disconnects, so a button this side stops recording
+    /// without saying so stays down on the desktop for as long as the link
+    /// lasts, and the next click there arrives as a release and then a press.
+    fn release_all_buttons(&mut self) {
+        for b in [
+            MouseButton::Left,
+            MouseButton::Middle,
+            MouseButton::Right,
+            MouseButton::Back,
+            MouseButton::Forward,
+        ] {
+            if let Some((button, bit)) = button_codes(b) {
+                if self.remote_buttons & bit != 0 {
+                    self.send(&Message::PointerButton {
+                        button,
+                        down: false,
+                    });
+                }
+            }
+        }
+        self.remote_buttons = 0;
+    }
+
+    /// The window lost focus, so whatever is held is let go of here: its
+    /// release will be delivered to whoever took the focus, not to us.
+    fn on_focus_lost(&mut self) {
+        // Only while there is a link to release them on. With one down,
+        // `pressed_keys` is the record of what the session was left holding
+        // and the note `resync_input` replays when a new link comes up;
+        // clearing it here would throw that away and leave the modifier held.
+        if self.link_up() {
+            self.release_all_keys();
+        }
+        // A wheel remainder from before the window lost focus is not part of
+        // whatever gesture comes next.
+        self.scroll.reset();
+        // Nor is a drag: a button left recorded as held would keep the bar
+        // down for the rest of the session, and one left held on the desktop
+        // would drag whatever the pointer crossed next.
+        self.release_all_buttons();
+        self.ui_press = false;
+        self.ui_keyboard = false;
+        // A press begun on the bar loses its release the same way; left
+        // armed, it would take the next release meant for the session. A
+        // pinned bar never hides, so housekeeping would not clear this.
+        self.bar_press = false;
+        if std::mem::take(&mut self.pointer_on_bar) {
+            self.restore_cursor();
+        }
+    }
+
     fn toggle_fullscreen(&mut self) {
         let Some(g) = &self.gfx else { return };
-        self.fullscreen = !self.fullscreen;
-        if self.fullscreen {
-            g.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        } else {
+        // The window's own answer, not a remembered one: the green button, a
+        // WM keybinding or Esc leave fullscreen without passing through here,
+        // and asking a windowed window to leave fullscreen does nothing.
+        if g.window.fullscreen().is_some() {
             g.window.set_fullscreen(None);
+        } else {
+            g.window.set_fullscreen(Some(Fullscreen::Borderless(None)));
         }
     }
 
@@ -2436,6 +2575,32 @@ impl App {
             }
         }
     }
+}
+
+/// The parts of a key event this window acts on.
+///
+/// winit's `KeyEvent` cannot be built outside winit, so the routing takes
+/// this instead and a test can press keys without a window.
+struct KeyInput<'a> {
+    physical: PhysicalKey,
+    logical: &'a Key,
+    location: KeyLocation,
+    down: bool,
+    repeat: bool,
+}
+
+/// The keysym a key is sent as, with numpad digits as `KP_` keysyms so an
+/// application can tell them from the row above the letters.
+fn keysym_of(logical: &Key, location: KeyLocation) -> Option<u32> {
+    let ks = keymap::keysym_for(logical, location)?;
+    Some(match (logical, location) {
+        (Key::Character(s), KeyLocation::Numpad) => s
+            .chars()
+            .next()
+            .and_then(keymap::numpad_keysym)
+            .unwrap_or(ks),
+        _ => ks,
+    })
 }
 
 /// The protocol button code and our own held-buttons bit for a winit button.
@@ -2967,24 +3132,7 @@ impl ApplicationHandler<Wake> for App {
                         self.poll_clipboard();
                     }
                 } else {
-                    // Only while there is a link to release them on. With one
-                    // down, `pressed_keys` is the record of what the session
-                    // was left holding and the note `resync_input` replays
-                    // when a new link comes up; clearing it here would throw
-                    // that away and leave the modifier held.
-                    if self.link_up() {
-                        self.release_all_keys();
-                    }
-                    // A wheel remainder from before the window lost focus is
-                    // not part of whatever gesture comes next.
-                    self.scroll.reset();
-                    // Nor is a drag: the release may be delivered to whoever
-                    // took the pointer instead of to us, and a button left
-                    // recorded as held would keep the bar down for the rest
-                    // of the session.
-                    self.remote_buttons = 0;
-                    self.ui_press = false;
-                    self.ui_keyboard = false;
+                    self.on_focus_lost();
                 }
             }
             WindowEvent::ModifiersChanged(m) => {
@@ -3076,24 +3224,43 @@ impl ApplicationHandler<Wake> for App {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // A reconnection worker holds the endpoint, and an SSH endpoint owns
-        // the `ssh` child: leaving while it is out there orphans a process
-        // that would go on forwarding a port with no window behind it. Waiting
-        // a moment gets it back in the ordinary case, where the attempt is one
-        // connection to a tunnel that is already up; anything slower than that
-        // is ssh authenticating, and the exit does not wait on a passphrase.
+        // the `ssh` child: leaving while it is out there would orphan a
+        // process that goes on forwarding a port with no window behind it.
+        // So ssh is killed through the handle first, and the wait is only for
+        // the worker to notice and return -- quick, whether the attempt was
+        // one connection to a tunnel that was up or ssh authenticating. The
+        // exit still does not wait on a passphrase; it no longer needs to.
         if let Some(a) = self.attempt.take() {
+            a.kill.kill();
             let _ = a.done.recv_timeout(Duration::from_millis(250));
         }
+        // Published clipboard files are let go of here, by hand, because on
+        // macOS this can be the last code that runs: Quit from the menu or
+        // the Dock goes through `applicationWillTerminate`, which reaches
+        // `exiting` and then ends the process without dropping the
+        // application state. A `Files` that is never dropped is a WebDAV
+        // volume left mounted with no server behind it. Readers go first so
+        // none is left waiting on a mount that is about to disappear.
+        self.clipboard_reads.clear();
+        if let Some(offer) = self.clipboard_offer.take() {
+            // A copy prepared but not yet published is a mount too.
+            let _ = offer.try_recv();
+        }
+        self.clipboard_batch = None;
         // A failed link was already abandoned; it has no input to release or
         // goodbye to deliver.
-        if !self.link_up() {
-            return;
+        if self.link_up() {
+            self.release_all_keys();
+            // Release Shift/Control keysym remnants explicitly for safety.
+            self.send_key(keysym::SHIFT_L, false);
+            self.client
+                .disconnect(self.exit_reason.as_deref().unwrap_or("client exiting"));
         }
-        self.release_all_keys();
-        // Release Shift/Control keysym remnants explicitly for safety.
-        self.send_key(keysym::SHIFT_L, false);
-        self.client
-            .disconnect(self.exit_reason.as_deref().unwrap_or("client exiting"));
+        // The tunnel goes the same way as the files above, and for the same
+        // reason: after the goodbye, because it carries the goodbye.
+        if let Some(endpoint) = self.session.endpoint.as_mut() {
+            endpoint.close();
+        }
     }
 }
 
@@ -3102,12 +3269,30 @@ fn clipboard_was_replaced(start: Option<u64>, current: Option<u64>) -> bool {
     matches!((start, current), (Some(a), Some(b)) if a != b)
 }
 
+/// What [`clipboard_staging_dir`] puts before the pid, and therefore what
+/// the sweep at start looks for.
+const CLIPBOARD_STAGING_PREFIX: &str = "lynxrdp-clipboard-";
+
 /// Per-process root for private deferred file references and paste caches.
 /// Each native offer owns a unique temporary directory below this root.
 pub fn clipboard_staging_dir() -> anyhow::Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("lynxrdp-clipboard-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("{CLIPBOARD_STAGING_PREFIX}{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// Remove the staging roots of clients that are no longer running.
+///
+/// Once per process, at start: a client that quit without unwinding -- Cmd-Q
+/// on macOS ends the process from `exiting` -- leaves its root behind, and on
+/// macOS a WebDAV volume mounted inside it with nothing answering. See
+/// `lynxrdp_filecopy::sweep_stale_staging` for what is and is not touched.
+pub fn sweep_stale_clipboard_staging() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        lynxrdp_filecopy::sweep_stale_staging(&std::env::temp_dir(), CLIPBOARD_STAGING_PREFIX)
+    });
 }
 
 /// Prefix of a per-copy staging directory under [`clipboard_staging_dir`].
@@ -4851,7 +5036,8 @@ mod tests {
         // part a Ctrl that was down when the network went is down for ever.
         let (addr, seen) = fake_session(2);
         let mut app = test_app(addr, Some(Endpoint::direct(addr).unwrap()));
-        app.pressed_keys.push(keysym::CONTROL_L);
+        app.pressed_keys
+            .push((PhysicalKey::Code(KeyCode::ControlLeft), keysym::CONTROL_L));
         app.remote_buttons = 1;
         app.on_link_lost("connection closed".into());
         assert!(matches!(app.link, Link::Reconnecting { .. }));
@@ -5049,6 +5235,199 @@ mod tests {
             ),
             Some(Accelerator::Fullscreen)
         );
+    }
+
+    /// What the fake session has seen once a message `wanted` accepts has
+    /// arrived. Sends go through the writer thread, so the session lags the
+    /// window; the writer keeps order, so once a later message is there
+    /// everything sent before it is too.
+    fn seen_by_session(
+        seen: &Arc<std::sync::Mutex<Vec<Message>>>,
+        wanted: impl Fn(&Message) -> bool,
+    ) -> Vec<Message> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = seen.lock().unwrap().clone();
+            if got.iter().any(&wanted) {
+                return got;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the session never saw it: {got:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn keystroke(physical: KeyCode, logical: &Key, down: bool, repeat: bool) -> KeyInput<'_> {
+        KeyInput {
+            physical: PhysicalKey::Code(physical),
+            logical,
+            location: KeyLocation::Standard,
+            down,
+            repeat,
+        }
+    }
+
+    fn key_events(seen: &[Message]) -> Vec<(u32, bool)> {
+        seen.iter()
+            .filter_map(|m| match m {
+                Message::KeyEvent { keysym, down } => Some((*keysym, *down)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_release_goes_out_spelled_as_its_press_was() {
+        // AltGr+q on a German layout: the press is '@'. Let go of AltGr a few
+        // milliseconds before q and the OS spells the release 'q'. The session
+        // bound '@' to a keycode of its own, so a release of 'q' would leave
+        // that keycode down -- and every later '@' dropped.
+        use winit::keyboard::SmolStr;
+        let (addr, seen) = fake_session(1);
+        let mut app = test_app(addr, None);
+        let at = Key::Character(SmolStr::new("@"));
+        let q = Key::Character(SmolStr::new("q"));
+        assert_eq!(
+            app.key_input(keystroke(KeyCode::KeyQ, &at, true, false)),
+            None
+        );
+        assert_eq!(
+            app.key_input(keystroke(KeyCode::KeyQ, &q, false, false)),
+            None
+        );
+        assert!(app.pressed_keys.is_empty());
+        let at_ks = keysym::keysym_from_char('@');
+        let got = seen_by_session(
+            &seen,
+            |m| matches!(m, Message::KeyEvent { keysym, down: false } if *keysym == at_ks),
+        );
+        assert_eq!(key_events(&got), vec![(at_ks, true), (at_ks, false)]);
+    }
+
+    #[test]
+    fn a_held_accelerator_runs_once_and_eats_exactly_one_release() {
+        // Holding Ctrl+Alt+Enter past the auto-repeat delay used to record a
+        // swallow per repeat, and each leftover then ate the release of an
+        // ordinary Enter -- leaving Return held on the session and the next
+        // twenty presses of it thrown away.
+        use winit::keyboard::SmolStr;
+        let (addr, seen) = fake_session(1);
+        let mut app = test_app(addr, None);
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::ALT;
+        let enter = Key::Named(NamedKey::Enter);
+        assert_eq!(
+            app.key_input(keystroke(KeyCode::Enter, &enter, true, false)),
+            Some(Accelerator::Fullscreen)
+        );
+        for _ in 0..20 {
+            assert_eq!(
+                app.key_input(keystroke(KeyCode::Enter, &enter, true, true)),
+                None
+            );
+        }
+        assert_eq!(app.swallowed, vec![PhysicalKey::Code(KeyCode::Enter)]);
+        assert_eq!(
+            app.key_input(keystroke(KeyCode::Enter, &enter, false, false)),
+            None
+        );
+        assert!(app.swallowed.is_empty());
+        // The macOS spelling: Option let go before the letter, so the press
+        // arrived as the character Option composes and the release as the
+        // letter. Physical identity is what matches the two.
+        let composed = Key::Character(SmolStr::new("\u{222b}"));
+        let b = Key::Character(SmolStr::new("b"));
+        assert_eq!(
+            app.key_input(keystroke(KeyCode::KeyB, &composed, true, false)),
+            Some(Accelerator::Pin)
+        );
+        assert_eq!(
+            app.key_input(keystroke(KeyCode::KeyB, &b, false, false)),
+            None
+        );
+        assert!(app.swallowed.is_empty());
+        // An ordinary Enter now goes through whole.
+        app.modifiers = ModifiersState::empty();
+        assert_eq!(
+            app.key_input(keystroke(KeyCode::Enter, &enter, true, false)),
+            None
+        );
+        assert_eq!(
+            app.key_input(keystroke(KeyCode::Enter, &enter, false, false)),
+            None
+        );
+        let got = seen_by_session(&seen, |m| {
+            matches!(
+                m,
+                Message::KeyEvent {
+                    keysym: keysym::RETURN,
+                    down: false
+                }
+            )
+        });
+        assert_eq!(
+            key_events(&got),
+            vec![(keysym::RETURN, true), (keysym::RETURN, false)]
+        );
+    }
+
+    #[test]
+    fn losing_focus_lets_go_of_the_buttons_and_the_bar() {
+        // Alt+Tab in the middle of a drag: the release goes to whoever took
+        // the focus. Forgetting the buttons is not enough -- the session has
+        // to be told, or it holds the button until the link ends and the next
+        // click there is a release followed by a press. A press begun on the
+        // bar is in the same position, and left armed it would take the next
+        // release meant for the session.
+        let (addr, seen) = fake_session(1);
+        let mut app = test_app(addr, None);
+        app.remote_buttons = button_codes(MouseButton::Left).unwrap().1
+            | button_codes(MouseButton::Right).unwrap().1;
+        app.bar_press = true;
+        app.pointer_on_bar = true;
+        app.on_focus_lost();
+        assert_eq!(app.remote_buttons, 0);
+        assert!(!app.bar_press);
+        assert!(!app.pointer_on_bar);
+        let got = seen_by_session(&seen, |m| {
+            matches!(
+                m,
+                Message::PointerButton {
+                    button: button::RIGHT,
+                    down: false
+                }
+            )
+        });
+        assert!(got.iter().any(|m| matches!(
+            m,
+            Message::PointerButton {
+                button: button::LEFT,
+                down: false
+            }
+        )));
+        assert!(!got
+            .iter()
+            .any(|m| matches!(m, Message::PointerButton { down: true, .. })));
+    }
+
+    #[test]
+    fn cancel_all_forgets_the_progress_of_the_drop_it_cancelled() {
+        // Cancelled transfers never complete, so nothing else resets the count
+        // of finished files; the next drop would start out reading as nearly
+        // done.
+        let (addr, _seen) = fake_session(1);
+        let mut app = test_app(addr, None);
+        app.upload_done = 50;
+        app.upload_queue
+            .push_back((PathBuf::from("/nowhere/a"), "a".into()));
+        app.transfer_action(crate::transfer_panel::Action::CancelAll);
+        assert_eq!(app.upload_done, 0);
+        assert!(app.upload_queue.is_empty());
+        assert_eq!(app.upload_progress(), None);
+        app.upload_queue
+            .push_back((PathBuf::from("/nowhere/b"), "b".into()));
+        assert_eq!(app.upload_progress(), Some((1, 0)));
     }
 
     #[test]

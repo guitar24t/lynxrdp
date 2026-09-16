@@ -1,6 +1,8 @@
 //! Shared planning and settlement for clipboard file copies.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+
+use unicode_normalization::UnicodeNormalization;
 /// Concurrent files in a clipboard batch.
 pub const MAX_CONCURRENT_CLIPBOARD_FILES: usize = 8;
 /// Leave room for collision suffixes within filesystem name limits.
@@ -23,10 +25,38 @@ pub const MAX_STAGED_NAME: usize = 200;
 pub fn safe_file_name(raw: &str) -> String {
     const FORBIDDEN: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
     // `CON.txt` opens the console on Windows, not a file. The check is on the
-    // part before the first dot, which is how Windows resolves them.
+    // part before the first dot with trailing spaces removed, which is how
+    // Windows resolves them: `CON .txt` is the console too. The superscript
+    // digits are reserved alongside the plain ones.
     const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "COM2",
+        "COM3",
+        "COM4",
+        "COM5",
+        "COM6",
+        "COM7",
+        "COM8",
+        "COM9",
+        "COM\u{b9}",
+        "COM\u{b2}",
+        "COM\u{b3}",
+        "LPT1",
+        "LPT2",
+        "LPT3",
+        "LPT4",
+        "LPT5",
+        "LPT6",
+        "LPT7",
+        "LPT8",
+        "LPT9",
+        "LPT\u{b9}",
+        "LPT\u{b2}",
+        "LPT\u{b3}",
     ];
 
     let mut name: String = raw
@@ -66,7 +96,11 @@ pub fn safe_file_name(raw: &str) -> String {
     } else {
         trimmed.to_string()
     };
-    let stem = name.split('.').next().unwrap_or_default();
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ');
     if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
         name.insert(0, '_');
     }
@@ -78,11 +112,10 @@ pub fn safe_file_name(raw: &str) -> String {
 /// Two files called `notes.txt` from different directories in the session used
 /// to be staged over each other -- the second `File::create` truncated the
 /// first and the paste delivered one file where the user copied two, with no
-/// error anywhere. Comparison is case-insensitive because NTFS and a default
-/// APFS volume both resolve `Notes.txt` and `notes.txt` to the same file, so
-/// on those platforms the collision is real even when the names differ.
+/// error anywhere. Comparison is through [`collision_key`], so that the names
+/// counted as clashing are the ones the target filesystems treat as one file.
 pub fn unique_name(taken: &mut HashSet<String>, name: &str) -> String {
-    if taken.insert(name.to_lowercase()) {
+    if taken.insert(collision_key(name)) {
         return name.to_string();
     }
     let path = Path::new(name);
@@ -98,11 +131,24 @@ pub fn unique_name(taken: &mut HashSet<String>, name: &str) -> String {
     let mut n = 2u32;
     loop {
         let candidate = format!("{stem} ({n}){ext}");
-        if taken.insert(candidate.to_lowercase()) {
+        if taken.insert(collision_key(&candidate)) {
             return candidate;
         }
         n += 1;
     }
+}
+
+/// The form two names are compared in: case folded and canonically composed.
+///
+/// NTFS folds case, and a default APFS volume folds case *and* normalisation:
+/// `café` spelled with U+00E9 and spelled `e` plus U+0301 are one file there,
+/// and both spellings do occur in a Linux session, because macOS tools write
+/// the decomposed form and most others the composed one. Two such names
+/// published side by side reach the Mac as one entry and one of the files is
+/// silently lost. Composition runs after folding, since folding can itself
+/// produce a decomposed sequence.
+fn collision_key(name: &str) -> String {
+    name.to_lowercase().nfc().collect()
 }
 
 /// One clipboard file copy, from the session's list to the local clipboard.
@@ -137,8 +183,8 @@ impl ClipBatch {
         let mut taken = HashSet::new();
         let mut queued = VecDeque::with_capacity(files.len());
         for (slot, f) in files.iter().enumerate() {
-            let base = f.path.rsplit(['/', '\\']).next().unwrap_or_default();
-            let name = unique_name(&mut taken, &safe_file_name(base));
+            let base = crate::urilist::base_name(Path::new(&f.path)).unwrap_or_default();
+            let name = unique_name(&mut taken, &safe_file_name(&base));
             queued.push_back((f.path.clone(), dir.join(name), slot));
         }
         Self {
@@ -204,5 +250,68 @@ impl ClipBatch {
     /// The files that actually landed, in the order they were copied.
     pub fn into_files(self) -> Vec<PathBuf> {
         self.slots.into_iter().flatten().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Windows strips the extension and then trailing spaces before it
+    /// compares against the device names, so `CON .txt` is the console; and
+    /// the superscript digits are device numbers too.
+    #[test]
+    fn reserved_device_names_are_caught_as_windows_resolves_them() {
+        assert_eq!(safe_file_name("CON .txt"), "_CON .txt");
+        assert_eq!(safe_file_name("con.txt"), "_con.txt");
+        assert_eq!(safe_file_name("COM\u{b9}"), "_COM\u{b9}");
+        assert_eq!(safe_file_name("lpt\u{b3}.log"), "_lpt\u{b3}.log");
+        // A device name that is not a whole stem is an ordinary file.
+        assert_eq!(safe_file_name("CONSOLE.txt"), "CONSOLE.txt");
+        assert_eq!(safe_file_name("COM10"), "COM10");
+    }
+
+    /// The NFC and NFD spellings of one name are one file on a default APFS
+    /// volume, so they have to collide here or one of the two is lost on the
+    /// Mac without an error.
+    #[test]
+    fn unique_name_treats_normalisation_twins_as_a_collision() {
+        let mut taken = HashSet::new();
+        let nfc = "caf\u{e9}.txt";
+        let nfd = "cafe\u{301}.txt";
+        assert_eq!(unique_name(&mut taken, nfc), nfc);
+        let second = unique_name(&mut taken, nfd);
+        assert_ne!(second, nfd);
+        assert!(second.ends_with(" (2).txt"), "{second:?}");
+        // Case folding still applies on top of composition.
+        assert!(unique_name(&mut taken, "CAF\u{c9}.txt").ends_with(" (3).txt"));
+        // Names that only look alike are not collisions.
+        assert_eq!(unique_name(&mut taken, "cafe.txt"), "cafe.txt");
+    }
+
+    /// The staged name comes from the same base-name rule on every platform,
+    /// so a Windows client's native path does not become the file's name in
+    /// a Linux session.
+    #[test]
+    fn batch_names_come_from_the_shared_base_name_rule() {
+        let files = vec![
+            crate::FileEntry {
+                path: r"C:\Users\alice\Documents\report.pdf".into(),
+                size: 1,
+            },
+            crate::FileEntry {
+                path: "/home/alice/old/report.pdf".into(),
+                size: 2,
+            },
+            crate::FileEntry {
+                path: "/home/alice/..".into(),
+                size: 3,
+            },
+        ];
+        let mut batch = ClipBatch::new(PathBuf::from("/stage"), &files);
+        let names: Vec<_> = std::iter::from_fn(|| batch.next_request())
+            .map(|(_, dest, _)| dest.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["report.pdf", "report (2).pdf", "file"]);
     }
 }

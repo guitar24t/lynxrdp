@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 /// Default location of the configuration file.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/lynxrdp/lynxrdp.toml";
 
+/// Smallest screen dimension a session will run at. It clamps every size a
+/// client asks for up to this, so a configured maximum below it is one the
+/// session can never honour.
+pub const MIN_SCREEN_DIM: u32 = 64;
+
 /// Top-level configuration.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -225,14 +230,40 @@ impl Config {
             bail!("listen.port must not be 0");
         }
         let s = &self.session;
-        if s.default_width == 0 || s.default_height == 0 {
-            bail!("session.default_width/height must be positive");
+        // 64 is the floor the session clamps every requested size to, and
+        // `u32::clamp` panics when its floor is above its ceiling -- so a
+        // maximum below it was not a small desktop but a session that aborted
+        // on the first ClientHello that carried a size.
+        if s.default_width < MIN_SCREEN_DIM || s.default_height < MIN_SCREEN_DIM {
+            bail!("session.default_width/height must be at least {MIN_SCREEN_DIM}");
+        }
+        if s.max_width < MIN_SCREEN_DIM || s.max_height < MIN_SCREEN_DIM {
+            bail!("session.max_width/height must be at least {MIN_SCREEN_DIM}");
         }
         if s.max_width < s.default_width || s.max_height < s.default_height {
             bail!("session.max_width/height must be >= default_width/height");
         }
         if s.max_width > 16384 || s.max_height > 16384 {
             bail!("session.max_width/height must be <= 16384");
+        }
+        // Each dimension fitting the protocol is not enough: a session sends a
+        // whole frame as one message, and on every (re)connect that frame is
+        // every tile of the screen, raw wherever the content will not
+        // compress. The receiver drops the link over anything above the
+        // message cap, and reconnecting only produces the same frame again,
+        // so a screen this large would not be slow but unusable. The bound
+        // is the encoder's own, next to the layout it measures.
+        let worst = lynxrdp_proto::frame::max_screen_update_len(s.max_width, s.max_height);
+        let cap = u64::from(lynxrdp_proto::MAX_MESSAGE_SIZE);
+        if worst > cap {
+            bail!(
+                "session.max_width x max_height = {}x{} could need {worst} bytes for one \
+                 uncompressed frame, more than the {cap}-byte protocol message limit \
+                 (about {} megapixels)",
+                s.max_width,
+                s.max_height,
+                cap / (3 * 1_000_000)
+            );
         }
         if s.max_fps == 0 || s.max_fps > 240 {
             bail!("session.max_fps must be between 1 and 240");
@@ -364,6 +395,47 @@ mod tests {
         assert!(Config::from_toml("[session]\nmax_in_flight = 9\n").is_err());
         assert!(Config::from_toml("[session]\ndefault_width = 5000\n").is_err());
         assert!(Config::from_toml("[session]\nmax_width = 20000\n").is_err());
+    }
+
+    /// The session clamps every requested size up to 64, and `u32::clamp`
+    /// panics when the floor is above the ceiling: a maximum of 48 used to be
+    /// accepted here and then abort the session on the first size a client
+    /// sent.
+    #[test]
+    fn sizes_below_the_session_floor_are_rejected() {
+        for toml in [
+            "[session]\nmax_width = 48\n",
+            "[session]\nmax_height = 48\n",
+            "[session]\ndefault_width = 32\nmax_width = 32\n",
+            "[session]\ndefault_height = 32\n",
+            "[session]\ndefault_width = 0\n",
+        ] {
+            let err = Config::from_toml(toml).unwrap_err();
+            assert!(err.to_string().contains("at least 64"), "{toml}: {err:#}");
+        }
+        let floor =
+            "[session]\ndefault_width = 64\ndefault_height = 64\nmax_width = 64\nmax_height = 64\n";
+        assert!(Config::from_toml(floor).is_ok());
+    }
+
+    /// A screen whose raw full frame cannot fit in one protocol message is
+    /// refused up front, with the limit in the message. Each dimension being
+    /// under 16384 was not enough: 7680x4320 passed and every reconnect then
+    /// produced a frame the client dropped the link over.
+    #[test]
+    fn a_screen_too_large_for_one_message_is_rejected() {
+        let cap = u64::from(lynxrdp_proto::MAX_MESSAGE_SIZE);
+        // The packaged default and the largest common 5K layout both fit.
+        let d = SessionConfig::default();
+        assert!(lynxrdp_proto::frame::max_screen_update_len(d.max_width, d.max_height) <= cap);
+        assert!(Config::from_toml("[session]\nmax_width = 5120\nmax_height = 4320\n").is_ok());
+        // 8K does not, and neither does anything else over about 22 Mpx.
+        let err =
+            Config::from_toml("[session]\nmax_width = 7680\nmax_height = 4320\n").unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(&cap.to_string()), "{text}");
+        assert!(text.contains("7680x4320"), "{text}");
+        assert!(Config::from_toml("[session]\nmax_width = 5760\nmax_height = 4320\n").is_err());
     }
 
     /// The adaptive window is on unless an operator says otherwise, and

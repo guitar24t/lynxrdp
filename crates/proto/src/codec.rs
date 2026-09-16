@@ -1681,6 +1681,52 @@ mod tests {
         assert_eq!(decode_pixels(&t).unwrap(), px);
     }
 
+    /// The prefix check bounds the allocation; this is the other half, which
+    /// is the library's job. A block whose prefix *understates* its output
+    /// has to be refused by `decompress`, not written past the buffer or
+    /// panicked over -- and lz4_flex documents that it "may panic" here, so
+    /// the contract this site relies on is pinned rather than assumed.
+    #[test]
+    fn an_understated_lz4_prefix_is_refused_by_the_decompressor() {
+        let payload: Vec<u8> = (0..12 * 1024).map(|i| (i % 7) as u8).collect();
+        let mut data = lz4_flex::block::compress_prepend_size(&payload);
+        // A 4x4 raw tile is 48 bytes, so the prefix passes the cap check and
+        // the block then expands to twelve kibibytes.
+        data[..4].copy_from_slice(&48u32.to_le_bytes());
+        let t = TileUpdate {
+            rect: Rect::new(0, 0, 4, 4),
+            encoding: TileEncoding::Lz4,
+            data,
+        };
+        assert_eq!(
+            decode_pixels(&t),
+            Err(CodecError::Corrupt("lz4 decompression failed"))
+        );
+    }
+
+    /// A zstd frame from the streaming encoder carries no content size, so
+    /// there is no declaration to check up front and the capacity handed to
+    /// `zstd::bulk::decompress` is the only thing that stops it.
+    #[test]
+    fn a_size_less_zstd_frame_is_refused_at_the_cap() {
+        let payload: Vec<u8> = (0..12 * 1024).map(|i| (i % 7) as u8).collect();
+        let frame = zstd::stream::encode_all(&payload[..], 1).unwrap();
+        assert!(
+            matches!(zstd::zstd_safe::get_frame_content_size(&frame), Ok(None)),
+            "the streaming encoder recorded a content size; the test no longer \
+             exercises the size-less path"
+        );
+        let t = TileUpdate {
+            rect: Rect::new(0, 0, 4, 4),
+            encoding: TileEncoding::Zstd,
+            data: frame,
+        };
+        assert_eq!(
+            decode_pixels(&t),
+            Err(CodecError::Corrupt("zstd decompression failed"))
+        );
+    }
+
     #[test]
     fn a_frame_may_not_copy_the_screen_over_and_over() {
         // 4096 copies fit in one 48 KiB update, and each is snapshotted

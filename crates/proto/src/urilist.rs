@@ -21,9 +21,12 @@ pub fn percent_decode(s: &str) -> Vec<u8> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                out.push(v);
+            // Two hex digits exactly. `u8::from_str_radix` also takes a
+            // leading sign, which turned `%+4` into byte 4 instead of leaving
+            // it alone.
+            let digit = |b: u8| (b as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (digit(bytes[i + 1]), digit(bytes[i + 2])) {
+                out.push((hi * 16 + lo) as u8);
                 i += 3;
                 continue;
             }
@@ -139,8 +142,20 @@ pub fn build(paths: &[PathBuf]) -> String {
 }
 
 /// The name a path should keep when it moves to the other machine.
+///
+/// The split is on both separators on every platform, not `Path::file_name`,
+/// whose separator set is the *local* one: a Linux session applying it to a
+/// Windows client's `C:\Users\alice\report.pdf` kept the whole path as the
+/// name, and two clients published the session's `reports/final\v2.pdf` under
+/// different names. `unique_name` computes its collisions from these, so the
+/// rule has to be one rule everywhere. Nothing that names no file -- an empty
+/// tail, `.` or `..` -- is a name.
 pub fn base_name(path: &Path) -> Option<String> {
-    path.file_name().map(|n| n.to_string_lossy().into_owned())
+    let path = path.to_string_lossy();
+    match path.rsplit(['/', '\\']).next().unwrap_or_default() {
+        "" | "." | ".." => None,
+        name => Some(name.to_owned()),
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +218,11 @@ mod tests {
         assert_eq!(percent_decode("100%"), b"100%");
         assert_eq!(percent_decode("a%zz"), b"a%zz");
         assert_eq!(percent_decode("%41"), b"A");
+        // A sign is not a hex digit: `%+4` used to decode to byte 4.
+        assert_eq!(percent_decode("rate%+4.txt"), b"rate%+4.txt");
+        assert_eq!(percent_decode("a%-1b"), b"a%-1b");
+        assert_eq!(percent_decode("a% 4b"), b"a% 4b");
+        assert_eq!(percent_decode("%4"), b"%4");
     }
 
     #[test]
@@ -218,6 +238,29 @@ mod tests {
     fn base_name_of_a_path() {
         assert_eq!(base_name(Path::new("/a/b/c.txt")).as_deref(), Some("c.txt"));
         assert_eq!(base_name(Path::new("/")), None);
+        assert_eq!(base_name(Path::new("/a/..")), None);
+        assert_eq!(base_name(Path::new(".")), None);
+    }
+
+    /// The separator set is not the local platform's. A Windows client sends
+    /// its native paths, and the Linux session must not keep the whole thing
+    /// as the file's name; and the same session path must publish under the
+    /// same name on every client, or the collision set differs per platform.
+    #[test]
+    fn base_name_splits_on_both_separators_everywhere() {
+        assert_eq!(
+            base_name(Path::new(r"C:\Users\alice\Documents\report.pdf")).as_deref(),
+            Some("report.pdf")
+        );
+        assert_eq!(
+            base_name(Path::new(r"/home/u/reports/final\v2.pdf")).as_deref(),
+            Some("v2.pdf")
+        );
+        assert_eq!(
+            base_name(Path::new(r"mixed\sub/name.txt")).as_deref(),
+            Some("name.txt")
+        );
+        assert_eq!(base_name(Path::new(r"trailing\")), None);
     }
 }
 

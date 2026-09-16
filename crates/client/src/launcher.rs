@@ -41,6 +41,15 @@ const EXCHANGE_FILE: &str = "connections-export.toml";
 
 /// Open the launcher, returning when the window is closed.
 pub fn run(path: PathBuf) -> Result<()> {
+    // Before the window, on every platform. An update installed last time
+    // may have left the build it replaced behind -- Windows will not delete
+    // the image of a running process -- or, interrupted, left the new build
+    // under its staging name with nothing at the application's own. This is
+    // the next start, so both are dealt with now; macOS included, because a
+    // bundle swap on a volume that cannot exchange has the same gap.
+    if let Some(dir) = crate::exe_path().and_then(update::install::install_dir) {
+        update::install::sweep(&dir);
+    }
     #[cfg(target_os = "macos")]
     return crate::app::desktop::run(Some(path), None).map(|_| ());
     #[cfg(not(target_os = "macos"))]
@@ -49,15 +58,6 @@ pub fn run(path: PathBuf) -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn run_separate(path: PathBuf) -> Result<()> {
-    // Before the window: an update installed last time may have left the
-    // executable it replaced behind, because Windows will not delete the
-    // image of a running process. This is the next start, so it will go now.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = update::install::install_dir(&exe) {
-            update::install::sweep(&dir);
-        }
-    }
-
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("LynxRDP")
         // Matches StartupWMClass in the .desktop entry, which is how a Linux
@@ -306,7 +306,7 @@ impl Editor {
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
-            .map(str::to_string)
+            .map(without_dash_o)
             .collect();
         if let Some(problem) = p.problem() {
             return Err(problem);
@@ -336,10 +336,31 @@ fn parse_size(text: &str) -> Result<Option<(u16, u16)>, String> {
     let (w, h) = text.split_once(['x', 'X']).ok_or_else(bad)?;
     let w: u16 = w.trim().parse().map_err(|_| bad())?;
     let h: u16 = h.trim().parse().map_err(|_| bad())?;
-    if w == 0 || h == 0 {
-        return Err("The size must be positive.".into());
+    // The command line's own floor, so a size that saves here is a size the
+    // session it starts will take.
+    if w < profiles::MIN_SCREEN_SIDE || h < profiles::MIN_SCREEN_SIDE {
+        return Err(format!(
+            "The size must be at least {0}x{0}.",
+            profiles::MIN_SCREEN_SIDE
+        ));
     }
     Ok(Some((w, h)))
+}
+
+/// `-o ProxyJump=bastion` -> `ProxyJump=bastion`.
+///
+/// The command line takes an option after `-o`, so that is the shape people
+/// arrive at the form with; the profile stores the bare `Key=value` and adds
+/// the flag itself when it builds the arguments, and a `-o` inside the value
+/// is a usage error in a child with no console to print it on. Read the way
+/// ssh reads `-oKey=value`. Anything else that starts with a dash is left
+/// for `Profile::problem` to refuse.
+fn without_dash_o(option: &str) -> String {
+    option
+        .strip_prefix("-o")
+        .map(str::trim_start)
+        .unwrap_or(option)
+        .to_string()
 }
 
 /// A profile's arguments as a line a user could paste into a shell.
@@ -464,15 +485,19 @@ impl Launcher {
             Some(0)
         };
         let settings_path = Settings::path_beside(&path);
-        // A settings file we cannot read is a shrug, not a state: the
-        // defaults are perfectly usable and the next change rewrites it. It
-        // must never reach `load_failed`, which exists to protect data.
+        // A settings file we cannot read is a shrug, not a state: what could
+        // be read is kept, the rest is defaults, and the next change rewrites
+        // it. It must never reach `load_failed`, which exists to protect
+        // data. The one thing it must not do is switch the update check on
+        // behind the user's back, which is why the error carries the settings
+        // to run with rather than leaving that to `Settings::default()`.
         let (settings, status) = match Settings::load(&settings_path) {
             Ok(settings) => (settings, String::new()),
-            Err(e) => (
-                Settings::default(),
-                format!("Using the default view settings: {e:#}"),
-            ),
+            Err(e) => {
+                let status =
+                    format!("Some view settings could not be read and are at their defaults: {e}");
+                (e.salvaged, status)
+            }
         };
         Self {
             path,
@@ -622,10 +647,9 @@ impl Launcher {
         let Some(profile) = self.store.items.get(index).cloned() else {
             return;
         };
-        if let Some(problem) = profile.problem() {
-            self.error = Some(format!("{} cannot be used: {problem}", profile.name));
-            return;
-        }
+        // `Sessions::start` is where a profile the editor would refuse is
+        // turned away, so that Reconnect and the macOS host get the same
+        // answer as this button.
         match self.sessions.start(&profile) {
             Ok(()) => {
                 // A spawned process is not evidence of a live connection.
@@ -705,9 +729,11 @@ impl Launcher {
     fn enabled(&self, action: &Action) -> bool {
         let selection = self.selection_is_visible();
         let writable = !self.load_failed;
+        let room = !self.full();
         match action {
-            Action::New | Action::AskImport => writable,
-            Action::Duplicate => selection && writable,
+            Action::New => writable && room,
+            Action::AskImport => writable,
+            Action::Duplicate => selection && writable && room,
             Action::AskDelete => selection && writable,
             // Exporting an empty list because the real one could not be read
             // would write a file that misrepresents what the user has.
@@ -719,12 +745,36 @@ impl Launcher {
             // Every one of these would otherwise be a button that starts a
             // second thread, or one that offers an install nothing found.
             Action::CheckForUpdates => !self.updater.busy(),
-            Action::InstallUpdate => self
-                .updater
-                .found()
-                .is_some_and(|f| f.installable() && !self.updater.busy()),
+            Action::InstallUpdate => self.updater.found().is_some_and(|f| {
+                f.installable()
+                    && !self.updater.busy()
+                    // The Windows installer writes over lynxrdp.exe, which
+                    // every running session has mapped; it cannot until they
+                    // close, and this window closes itself the moment the
+                    // installer starts, so the refusal has to come first. A
+                    // swap does not care: the sessions keep the file they
+                    // started from.
+                    && !(f.via_installer() && self.sessions.open() > 0)
+            }),
             Action::RestartForUpdate => *self.updater.state() == State::Installed,
             _ => true,
+        }
+    }
+
+    /// Whether the list holds as many connections as the file may.
+    fn full(&self) -> bool {
+        self.store.items.len() >= profiles::MAX_PROFILES
+    }
+
+    /// Why a control that adds a connection is off, when it is.
+    fn add_disabled_hint(&self) -> String {
+        if self.load_failed {
+            "The connections file could not be read; adding one now would replace it.".into()
+        } else {
+            format!(
+                "The list is full: {} connections is the most the file may hold.",
+                profiles::MAX_PROFILES
+            )
         }
     }
 
@@ -771,6 +821,12 @@ impl Launcher {
 
             Action::ManageSessions => {
                 if let Some(profile) = self.selected_profile().cloned() {
+                    // The window runs ssh with this profile's host and
+                    // options before anything else would look at them.
+                    if let Some(problem) = profile.problem() {
+                        self.error = Some(format!("{} cannot be used: {problem}", profile.name));
+                        return;
+                    }
                     self.remote_sessions = Some(crate::remote_sessions::Window::new(profile));
                 }
             }
@@ -976,7 +1032,7 @@ impl Launcher {
                 );
                 // Drawn only when it would do something: the button exists
                 // in the same breath as the click that answers it.
-                if found.installable()
+                if self.enabled(&Action::InstallUpdate)
                     && ui
                         .button("Install")
                         .on_hover_text(format!("Downloads {}", found.asset.name))
@@ -1151,9 +1207,12 @@ impl Launcher {
     fn file_menu(&mut self, ui: &mut egui::Ui, chosen: &mut Option<Action>) {
         ui.menu_button("File", |ui| {
             self.item(ui, "New Connection…", Action::New, Some(keys::NEW), chosen)
-                .on_disabled_hover_text(
-                    "The connections file could not be read; adding one now would replace it.",
-                );
+                .on_disabled_hover_text(self.add_disabled_hint());
+            let duplicate_hint = if self.load_failed || self.full() {
+                self.add_disabled_hint()
+            } else {
+                "Select a connection first.".into()
+            };
             self.item(
                 ui,
                 "Duplicate",
@@ -1161,7 +1220,7 @@ impl Launcher {
                 Some(keys::DUPLICATE),
                 chosen,
             )
-            .on_disabled_hover_text("Select a connection first.");
+            .on_disabled_hover_text(duplicate_hint);
             self.item(ui, "Delete…", Action::AskDelete, Some(keys::DELETE), chosen)
                 .on_disabled_hover_text("Select a connection first.");
             ui.separator();
@@ -1361,10 +1420,7 @@ impl Launcher {
                     ui.add_space(theme::LIST_MARGIN);
                     if ui
                         .add_enabled(self.enabled(&Action::New), theme::primary_button(&t, "New"))
-                        .on_disabled_hover_text(
-                            "The connections file could not be read; adding one now would \
-                             replace it.",
-                        )
+                        .on_disabled_hover_text(self.add_disabled_hint())
                         .clicked()
                     {
                         chosen = Some(Action::New);
@@ -1808,7 +1864,7 @@ impl Launcher {
                                 [400.0, 3.0 * theme::CONTROL_HEIGHT],
                                 egui::TextEdit::multiline(&mut editor.ssh_options)
                                     .font(egui::TextStyle::Monospace)
-                                    .hint_text("one per line, e.g. ProxyJump=bastion")
+                                    .hint_text("one per line, without the -o: ProxyJump=bastion")
                                     .desired_rows(3),
                             );
                             ui.end_row();
@@ -1893,6 +1949,16 @@ impl Launcher {
                         "There is already a connection called {:?}. Names have to be unique, \
                          so choose another.",
                         profile.name
+                    ))
+                } else if editor.original.is_none() && self.full() {
+                    // New is off once the list is full; this is the editor
+                    // that was already open when it filled. The reader
+                    // refuses a file over the limit, so one more entry would
+                    // make the next start the read-only state.
+                    Err(format!(
+                        "The list is full: {} connections is the most the file may hold. \
+                         Delete one first.",
+                        profiles::MAX_PROFILES
                     ))
                 } else {
                     Ok(profile)
@@ -2235,10 +2301,30 @@ impl Launcher {
                                         )
                                         .wrap(),
                                     );
-                                    if found.asset.name.ends_with("-setup.exe") {
-                                        ui.add(egui::Label::new(
-                                            "Windows will request administrator permission for the installer only. Cancelling keeps LynxRDP open. After installation, reopen LynxRDP from Start."
-                                        ).wrap());
+                                    if found.via_installer() {
+                                        let open = self.sessions.open();
+                                        if open > 0 {
+                                            // Said here because the button
+                                            // is simply absent otherwise,
+                                            // and this window will have
+                                            // closed by the time the
+                                            // installer found out.
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!(
+                                                        "Close {} first: the installer replaces \
+                                                         lynxrdp.exe, which they are running.",
+                                                        plural(open, "running session")
+                                                    ))
+                                                    .color(t.warn),
+                                                )
+                                                .wrap(),
+                                            );
+                                        } else {
+                                            ui.add(egui::Label::new(
+                                                "Windows will request administrator permission for the installer only. Cancelling keeps LynxRDP open. After installation, reopen LynxRDP from Start."
+                                            ).wrap());
+                                        }
                                     }
                                 }
                             }
@@ -2353,6 +2439,25 @@ impl Launcher {
             }
         };
         let zoom = ctx.zoom_factor();
+        // Auto-repeat is a key press to egui and so to `consume_shortcut`,
+        // which would make a Connect key held for a second start twenty
+        // sessions and a held Duplicate save twenty copies. Those two act
+        // only on a press the user made; everything else may repeat, and the
+        // arrows and the zoom are the better for it. Looked up before the
+        // consuming call, which takes the events with it.
+        let fresh = |i: &egui::InputState, key: egui::Key| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: k,
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    } if *k == key
+                )
+            })
+        };
         ctx.input_mut(|i| {
             for (shortcut, action) in [
                 (keys::NEW, Action::New),
@@ -2369,7 +2474,11 @@ impl Launcher {
                 (keys::ZOOM_RESET, Action::Zoom(1.0)),
                 (keys::SHORTCUTS, Action::ShowShortcuts),
             ] {
+                let pressed = fresh(i, shortcut.logical_key);
                 if i.consume_shortcut(&shortcut) {
+                    if matches!(action, Action::Connect | Action::Duplicate) && !pressed {
+                        continue;
+                    }
                     return Some(action);
                 }
             }
@@ -2392,7 +2501,8 @@ impl Launcher {
                     return Some(Action::FocusFilter);
                 }
             }
-            if enter_is_ours && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+            let pressed = fresh(i, egui::Key::Enter);
+            if enter_is_ours && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) && pressed {
                 return Some(Action::Connect);
             }
             None
@@ -2785,6 +2895,32 @@ mod tests {
         assert!(parse_size("0x1080").is_err());
         assert!(parse_size("axb").is_err());
         assert!(parse_size("1920x").is_err());
+        // The command line's floor, so a size that saves is a size the
+        // session it starts will take rather than fail on with exit code 2.
+        assert!(parse_size("32x32").unwrap_err().contains("64x64"));
+        assert_eq!(parse_size("64x64"), Ok(Some((64, 64))));
+    }
+
+    #[test]
+    fn an_option_typed_with_its_dash_o_is_taken_as_the_option() {
+        // The README's command-line example is `-o ProxyJump=bastion`, so
+        // that is the shape people paste in; the child would refuse the
+        // `-o` as a flag it does not know.
+        let mut p = Profile::new("w");
+        p.host = "h".into();
+        let mut e = editor_with(p);
+        e.ssh_options = "-o ProxyJump=bastion\n-oStrictHostKeyChecking=no\nUser=alice\n".into();
+        assert_eq!(
+            e.collect().unwrap().ssh_options,
+            vec![
+                "ProxyJump=bastion",
+                "StrictHostKeyChecking=no",
+                "User=alice"
+            ]
+        );
+        // Anything else that starts with a dash is still refused.
+        e.ssh_options = "--bogus=1".into();
+        assert!(e.collect().unwrap_err().contains("-o"));
     }
 
     fn editor_with(profile: Profile) -> Editor {
@@ -3034,6 +3170,53 @@ mod tests {
         assert!(launcher.error.is_none(), "{:?}", launcher.error);
         let names: Vec<_> = launcher.store.items.iter().map(|p| &p.name).collect();
         assert_eq!(names, vec!["office"]);
+    }
+
+    #[test]
+    fn a_full_list_refuses_another_connection_rather_than_writing_a_file_the_reader_rejects() {
+        // The reader stops at MAX_PROFILES, so one more saved entry would
+        // make the next start the read-only state, with "move it aside" the
+        // only way out.
+        let (_dir, mut launcher) = launcher_on(None);
+        for i in 0..profiles::MAX_PROFILES {
+            launcher.store.items.push(named(&format!("n{i}"), "h"));
+        }
+        launcher.selected = Some(0);
+        assert!(!launcher.enabled(&Action::New));
+        assert!(!launcher.enabled(&Action::Duplicate));
+        assert!(launcher.enabled(&Action::Edit), "editing is not adding");
+        assert!(launcher.add_disabled_hint().contains("full"));
+        // An editor that was open as the list filled is refused at Save.
+        editing(&mut launcher, named("one more", "h"), None);
+        launcher.save_editor();
+        assert!(launcher.error.take().unwrap().contains("full"));
+        assert_eq!(launcher.store.items.len(), profiles::MAX_PROFILES);
+        // A rename is not an addition and still saves.
+        editing(&mut launcher, named("renamed", "h"), Some("n0"));
+        launcher.save_editor();
+        assert!(launcher.error.is_none(), "{:?}", launcher.error);
+        assert_eq!(launcher.store.items.len(), profiles::MAX_PROFILES);
+        // With one gone there is room again.
+        launcher.selected = Some(0);
+        launcher.delete_selected();
+        assert!(launcher.enabled(&Action::New));
+    }
+
+    #[test]
+    fn two_entries_with_one_name_are_told_apart_so_delete_removes_the_one_selected() {
+        // With both called "work", deleting the second by name removed the
+        // first, and saving an edit of the second overwrote it.
+        let (_dir, mut launcher) = launcher_on(Some(
+            "[[connection]]\nname = \"work\"\nhost = \"a.example\"\n\
+             [[connection]]\nname = \"work\"\nhost = \"b.example\"\n",
+        ));
+        assert!(!launcher.load_failed);
+        assert_eq!(launcher.store.items[1].name, "work 2");
+        launcher.selected = Some(1);
+        launcher.delete_selected();
+        assert_eq!(launcher.store.items.len(), 1);
+        assert_eq!(launcher.store.items[0].host, "a.example");
+        assert_eq!(launcher.status, "Deleted work 2");
     }
 
     #[cfg(unix)]
@@ -3385,8 +3568,50 @@ mod tests {
         std::fs::write(dir.path().join(crate::settings::FILE_NAME), BROKEN).unwrap();
         let launcher = Launcher::new(dir.path().join(profiles::FILE_NAME));
         assert!(!launcher.load_failed);
-        assert_eq!(launcher.settings, Settings::default());
-        assert!(launcher.status.contains("default view settings"));
+        assert_eq!(launcher.settings.theme, ThemeChoice::System);
+        assert!(launcher.status.contains("view settings"));
+        // The one preference that is not a shrug: a file we cannot read may
+        // have turned the check off, so off it stays.
+        assert!(!launcher.settings.updates.check);
+    }
+
+    #[test]
+    fn a_broken_settings_file_neither_turns_the_update_check_on_nor_gets_rewritten() {
+        // A typo in `theme` used to fail the whole file; the defaults have
+        // the check on, and the first frame's automatic check then saved
+        // `check = true` over the opt-out. Nothing here may write the file
+        // unless the user changes something.
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(crate::settings::FILE_NAME);
+        let text = "theme = \"blue\"\ncompact_rows = true\n\n[updates]\ncheck = false\n";
+        std::fs::write(&settings, text).unwrap();
+        let mut launcher = Launcher::new(dir.path().join(profiles::FILE_NAME));
+        assert!(!launcher.settings.updates.check);
+        assert!(
+            launcher.settings.compact_rows,
+            "the rest of the file is kept"
+        );
+        assert!(launcher.status.contains("theme"), "{}", launcher.status);
+        launcher.maybe_auto_check();
+        let _ = window(&mut launcher);
+        assert_eq!(*launcher.updater.state(), State::Idle);
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            text,
+            "the file was rewritten"
+        );
+        // A file that is not TOML at all keeps its opt-out where it can
+        // still be made out, and is otherwise off.
+        std::fs::write(&settings, "[updates]\ncheck = False\n").unwrap();
+        let launcher = Launcher::new(dir.path().join(profiles::FILE_NAME));
+        assert!(!launcher.settings.updates.check);
+        std::fs::write(
+            &settings,
+            "zoom = 1.2\n[updates]\ncheck = true\nlast_check = oops\n",
+        )
+        .unwrap();
+        let launcher = Launcher::new(dir.path().join(profiles::FILE_NAME));
+        assert!(launcher.settings.updates.check);
     }
 
     #[test]
@@ -3719,6 +3944,58 @@ mod tests {
         assert!(!launcher.enabled(&Action::RestartForUpdate));
         launcher.updater.offer_for_test(offer(None));
         assert!(!launcher.enabled(&Action::RestartForUpdate));
+    }
+
+    #[test]
+    fn the_windows_installer_is_not_started_while_sessions_are_running() {
+        // The installer writes over lynxrdp.exe, which every session has
+        // mapped, and this window has closed itself by the time NSIS finds
+        // that out. A swap does not care -- the sessions keep the file they
+        // started from -- so only the installer waits.
+        let (_dir, mut launcher) = stocked();
+        launcher.use_shared_windows();
+        let mut via_installer = offer(None);
+        via_installer.asset.name = "lynxrdp-9.9.9-windows-x86_64-setup.exe".into();
+        launcher.updater.offer_for_test(via_installer.clone());
+        assert!(launcher.enabled(&Action::InstallUpdate));
+        launcher.take_connections(1, 0);
+        assert!(!launcher.enabled(&Action::InstallUpdate));
+        launcher.dialog = Some(Dialog::Update);
+        let painted = window(&mut launcher);
+        assert!(painted.has_text("Close 1 running session first"));
+        assert!(
+            !painted.has_text("Install"),
+            "no button whose only outcome is a failed installer"
+        );
+
+        launcher.updater.offer_for_test(offer(None));
+        assert!(launcher.enabled(&Action::InstallUpdate));
+        launcher.take_connections(0, 0);
+        launcher.updater.offer_for_test(via_installer);
+        assert!(launcher.enabled(&Action::InstallUpdate));
+    }
+
+    #[test]
+    fn reconnect_and_running_desktops_refuse_what_connect_refuses() {
+        // Connect checked the profile; Reconnect handed it straight to the
+        // sessions and Running Desktops straight to ssh. One gate now, in
+        // `Sessions::start`, plus a look before the ssh window opens.
+        let (_dir, mut launcher) = stocked();
+        launcher.use_shared_windows();
+        let mut bad = named("odd", "odd.example");
+        bad.scale = Some(200);
+        launcher.store.upsert(bad.clone());
+        let index = launcher.store.position("odd").unwrap();
+        launcher.selected = Some(index);
+        launcher.connect(index);
+        assert!(launcher.error.take().unwrap().contains("cannot be used"));
+        // Reconnect's path.
+        let err = launcher.sessions.start(&bad).unwrap_err().to_string();
+        assert!(err.contains("scale"), "{err}");
+        assert_eq!(launcher.sessions.connecting(), 0);
+        launcher.perform(Action::ManageSessions, &ctx());
+        assert!(launcher.remote_sessions.is_none());
+        assert!(launcher.error.unwrap().contains("cannot be used"));
     }
 
     #[test]
@@ -4251,6 +4528,89 @@ mod tests {
             enter_with_focus(&launcher, Some(egui::Id::new("some-button"))),
             None,
             "Enter was taken from a focused button"
+        );
+    }
+
+    /// What the accelerators make of each frame of `frames`, on one context
+    /// with nothing focused.
+    ///
+    /// One context across the frames is the point: egui decides for itself
+    /// what is a repeat, from its own record of which keys are down, so a
+    /// held key is a press in one frame and the same event again in the next
+    /// with no release between -- whatever the event's own `repeat` says.
+    fn accelerated(launcher: &Launcher, frames: Vec<Vec<egui::Event>>) -> Vec<Option<Action>> {
+        let ctx = ctx();
+        frames
+            .into_iter()
+            .map(|events| {
+                let mut chosen = None;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| chosen = launcher.accelerators(ctx),
+                );
+                chosen
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_held_key_connects_or_duplicates_once_rather_than_once_per_repeat() {
+        // egui reports auto-repeat as a press and `consume_shortcut` takes
+        // it as one: Enter held for a second used to start twenty sessions,
+        // each with its own ssh.
+        let (_dir, launcher) = stocked();
+        let key = |key, modifiers, pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        };
+        let held = |k, m| {
+            vec![
+                vec![key(k, m, true)],
+                vec![key(k, m, true)],
+                vec![key(k, m, true)],
+            ]
+        };
+        assert_eq!(
+            accelerated(&launcher, held(egui::Key::Enter, egui::Modifiers::NONE)),
+            vec![Some(Action::Connect), None, None]
+        );
+        assert_eq!(
+            accelerated(
+                &launcher,
+                held(keys::CONNECT.logical_key, keys::CONNECT.modifiers)
+            ),
+            vec![Some(Action::Connect), None, None]
+        );
+        // Duplicate writes the file, so it is the other one that waits.
+        assert_eq!(
+            accelerated(
+                &launcher,
+                held(keys::DUPLICATE.logical_key, keys::DUPLICATE.modifiers)
+            ),
+            vec![Some(Action::Duplicate), None, None]
+        );
+        // Released and pressed again is two presses.
+        assert_eq!(
+            accelerated(
+                &launcher,
+                vec![
+                    vec![key(egui::Key::Enter, egui::Modifiers::NONE, true)],
+                    vec![key(egui::Key::Enter, egui::Modifiers::NONE, false)],
+                    vec![key(egui::Key::Enter, egui::Modifiers::NONE, true)],
+                ]
+            ),
+            vec![Some(Action::Connect), None, Some(Action::Connect)]
+        );
+        // Moving through the list is meant to repeat.
+        assert_eq!(
+            accelerated(&launcher, held(egui::Key::ArrowDown, egui::Modifiers::NONE)),
+            vec![Some(Action::Move(1)); 3]
         );
     }
 

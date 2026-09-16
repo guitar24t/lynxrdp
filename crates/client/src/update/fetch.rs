@@ -21,9 +21,24 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use ureq::Agent;
 
-/// Long enough for a slow link to finish a large asset, short enough that a
-/// black-holed connection does not leave a thread parked forever.
-const TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// How long the listing and the checksums get.
+///
+/// Both are a few kilobytes from a server that answers in milliseconds or
+/// not at all, and while the check thread waits the menu's Check and Install
+/// are disabled and the window says "Checking". So a connection that is
+/// accepted and then stalls is given seconds, not the download's budget: a
+/// stall on `api.github.com` should cost a status line, not twenty minutes
+/// of a launcher that cannot be asked again.
+const SMALL_CONNECT: Duration = Duration::from_secs(10);
+const SMALL_RESPONSE: Duration = Duration::from_secs(15);
+const SMALL_TOTAL: Duration = Duration::from_secs(60);
+
+/// The download's budget: long enough for a slow link to finish a large
+/// asset, short enough that a black-holed connection does not leave a thread
+/// parked forever. The response deadline is only for the headers -- the
+/// bytes that follow can take the rest.
+const DOWNLOAD_RESPONSE: Duration = Duration::from_secs(30);
+const DOWNLOAD_TOTAL: Duration = Duration::from_secs(20 * 60);
 
 /// The listing and the checksums are small; anything claiming otherwise is
 /// not what we asked for.
@@ -45,12 +60,21 @@ fn user_agent() -> String {
     )
 }
 
-fn agent() -> Agent {
+/// An agent with the given deadlines for the headers and for the whole
+/// exchange; connecting always gets [`SMALL_CONNECT`].
+fn agent(response: Duration, total: Duration) -> Agent {
     Agent::config_builder()
-        .timeout_global(Some(TIMEOUT))
+        .timeout_connect(Some(SMALL_CONNECT))
+        .timeout_recv_response(Some(response))
+        .timeout_global(Some(total))
         .user_agent(user_agent())
         .build()
         .into()
+}
+
+/// For the two small requests.
+fn small() -> Agent {
+    agent(SMALL_RESPONSE, SMALL_TOTAL)
 }
 
 /// The newest `count` releases of `repo`, as JSON.
@@ -60,7 +84,7 @@ fn agent() -> Agent {
 /// would answer "there are none" forever.
 pub fn releases(repo: &str, count: usize) -> Result<String> {
     let url = format!("https://api.github.com/repos/{repo}/releases?per_page={count}");
-    let mut response = agent()
+    let mut response = small()
         .get(&url)
         .header("Accept", "application/vnd.github+json")
         // Pinned so a future default cannot change the shape of the answer
@@ -87,7 +111,7 @@ pub fn sums_url(repo: &str, tag: &str) -> String {
 
 /// Fetch a small text file.
 pub fn text(url: &str) -> Result<String> {
-    let mut response = agent()
+    let mut response = small()
         .get(url)
         .call()
         .with_context(|| format!("fetching {url}"))?;
@@ -106,7 +130,7 @@ pub fn text(url: &str) -> Result<String> {
 /// response -- and a progress bar that cannot say how long it will be is
 /// still better than a window that looks hung.
 pub fn download(url: &str, dest: &Path, progress: &dyn Fn(u64, Option<u64>)) -> Result<()> {
-    let mut response = agent()
+    let mut response = agent(DOWNLOAD_RESPONSE, DOWNLOAD_TOTAL)
         .get(url)
         .call()
         .with_context(|| format!("downloading {url}"))?;

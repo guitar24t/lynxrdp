@@ -4,10 +4,32 @@ use super::*;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const SOCKET_ENV: &str = "LYNXRDP_ASKPASS_SOCKET";
 const LIMIT: u64 = 64 * 1024;
+
+/// The socket of the broker this process is running, if it is running one.
+///
+/// A process-wide fact rather than a value threaded to each caller because
+/// the callers are not one code path: a desktop connection and the Running
+/// Desktops window each build their own ssh, and the one that was not handed
+/// the path prompted from a second application. `askpass::ssh_env` reads it,
+/// so every ssh gets it the same way.
+static ACTIVE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// What to add to an `ssh` environment so its helper relays to the broker.
+///
+/// Empty when none is running, which is every platform but macOS.
+pub fn env() -> Vec<(String, String)> {
+    ACTIVE
+        .lock()
+        .ok()
+        .and_then(|active| active.as_deref().and_then(Path::to_str).map(str::to_owned))
+        .map(|path| vec![(SOCKET_ENV.to_string(), path)])
+        .unwrap_or_default()
+}
 
 pub fn request(path: &Path, prompt: &str) -> Option<String> {
     let mut stream = UnixStream::connect(path).ok()?;
@@ -37,7 +59,9 @@ struct Request {
 }
 
 pub struct Broker {
-    _directory: tempfile::TempDir,
+    /// Dropped first, being first: the socket is unlinked under the listener
+    /// and the directory removed, and neither minds the order.
+    _directory: crate::tunnel::SocketDir,
     pub path: PathBuf,
     listener: UnixListener,
     tx: crossbeam_channel::Sender<Request>,
@@ -46,14 +70,22 @@ pub struct Broker {
 }
 
 impl Broker {
-    pub fn new() -> std::io::Result<Self> {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::Builder::new().prefix("lynxrdp-auth-").tempdir()?;
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
-        let path = directory.path().join("prompt.sock");
+    pub fn new() -> anyhow::Result<Self> {
+        // The tunnel's directory rules, for the tunnel's reasons: `bind(2)`
+        // copies the path into a fixed array -- 104 bytes on macOS -- and
+        // refuses one that does not fit, and macOS's `TMPDIR` is 49 of those
+        // before anything is added. A `tempdir()` under `std::env::temp_dir()`
+        // was that refusal waiting for a long enough `TMPDIR`, with no
+        // fallback behind it and the whole connection manager refusing to
+        // start when it came.
+        let directory = crate::tunnel::create_socket_dir()?;
+        let path = directory.socket.clone();
         let listener = UnixListener::bind(&path)?;
         listener.set_nonblocking(true)?;
         let (tx, rx) = crossbeam_channel::bounded(8);
+        if let Ok(mut active) = ACTIVE.lock() {
+            *active = Some(path.clone());
+        }
         Ok(Self {
             _directory: directory,
             path,
@@ -159,13 +191,47 @@ impl Broker {
     }
 }
 
+impl Drop for Broker {
+    fn drop(&mut self) {
+        // Only our own entry: a later broker may have replaced it.
+        if let Ok(mut active) = ACTIVE.lock() {
+            if active.as_deref() == Some(self.path.as_path()) {
+                *active = None;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// `ACTIVE` is process-wide, so tests that create a broker take turns.
+    static TURN: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_live_broker_reaches_every_ssh_this_process_starts() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(env().is_empty());
+        let broker = Broker::new().unwrap();
+        assert_eq!(
+            env(),
+            vec![(
+                SOCKET_ENV.to_string(),
+                broker.path.to_str().unwrap().to_string()
+            )]
+        );
+        // Under the tunnel's rules, so a `TMPDIR` too long for `sun_path`
+        // falls back to a shorter base rather than failing the whole manager.
+        assert_eq!(crate::tunnel::socket_path_problem(&broker.path), None);
+        drop(broker);
+        assert!(env().is_empty());
+    }
+
     #[test]
     fn helper_prompts_and_cancellation_use_the_owning_ui() {
         use std::os::unix::fs::PermissionsExt;
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
         let mut broker = Broker::new().unwrap();
         assert_eq!(
             std::fs::metadata(broker.path.parent().unwrap())

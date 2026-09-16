@@ -184,40 +184,46 @@ fn run() -> Result<i32> {
                 continue;
             }
         };
-        match ready {
-            Some(0) => match tcp.accept() {
-                Ok((stream, addr)) => {
-                    stream.set_nonblocking(false).ok();
-                    let identity = match peer::tcp_peer(&stream) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            log::warn!("peer lookup for {addr} failed: {e}");
-                            None
+        // One accept from *each* ready listener per pass. Taking only the
+        // first ready one meant a TCP backlog that never emptied -- a local
+        // user connecting and closing in a loop is enough -- left the Unix
+        // socket unserved for as long as it lasted.
+        for idx in ready {
+            match idx {
+                0 => match tcp.accept() {
+                    Ok((stream, addr)) => {
+                        stream.set_nonblocking(false).ok();
+                        let identity = match peer::tcp_peer(&stream) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                log::warn!("peer lookup for {addr} failed: {e}");
+                                None
+                            }
+                        };
+                        let fd = OwnedFd::from(stream);
+                        handle_connection(&cfg, &pool, fd, identity, &addr.to_string(), own_uid);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => log::warn!("accept failed: {e}"),
+                },
+                1 => {
+                    if let Some(u) = &unix {
+                        match u.accept() {
+                            Ok((stream, _)) => {
+                                stream.set_nonblocking(false).ok();
+                                let identity = peer::unix_peer(&stream).ok();
+                                let desc =
+                                    format!("unix socket pid {:?}", identity.and_then(|i| i.pid));
+                                let fd = OwnedFd::from(stream);
+                                handle_connection(&cfg, &pool, fd, identity, &desc, own_uid);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) => log::warn!("unix accept failed: {e}"),
                         }
-                    };
-                    let fd = OwnedFd::from(stream);
-                    handle_connection(&cfg, &pool, fd, identity, &addr.to_string(), own_uid);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => log::warn!("accept failed: {e}"),
-            },
-            Some(1) => {
-                if let Some(u) = &unix {
-                    match u.accept() {
-                        Ok((stream, _)) => {
-                            stream.set_nonblocking(false).ok();
-                            let identity = peer::unix_peer(&stream).ok();
-                            let desc =
-                                format!("unix socket pid {:?}", identity.and_then(|i| i.pid));
-                            let fd = OwnedFd::from(stream);
-                            handle_connection(&cfg, &pool, fd, identity, &desc, own_uid);
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) => log::warn!("unix accept failed: {e}"),
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
     log::info!("shutting down ({} sessions running)", manager.count());

@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, Read};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::os::unix::io::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, Stdio};
@@ -95,9 +95,14 @@ impl XServer {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error()).context("pipe");
         }
-        let (read_fd, write_fd) = (fds[0], fds[1]);
-        // SAFETY: we own read_fd.
-        let mut reader = unsafe { fs::File::from_raw_fd(read_fd) };
+        // SAFETY: `pipe` just created both descriptors and nothing else owns
+        // them. Owned from here so that every early return below -- a spawn
+        // that fails, a server that never reports -- closes them: the write
+        // end used to be closed by hand on the line after the spawn, which a
+        // failed spawn never reached.
+        let (mut reader, write_end) =
+            unsafe { (fs::File::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let write_fd = write_end.as_raw_fd();
 
         let mut cmd = Command::new(&cfg.program);
         cmd.arg("-displayfd")
@@ -129,23 +134,24 @@ impl XServer {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .env_remove("DISPLAY");
-        // SAFETY: only async-signal-safe calls (close, setsid) in the child.
+        // SAFETY: only async-signal-safe calls (setsid, prctl, fcntl) in the
+        // child.
         unsafe {
             cmd.pre_exec(move || {
-                libc::close(read_fd);
                 libc::setsid();
                 // Die with the session process so no X server is ever orphaned.
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                // Everything but the displayfd end, our read end included.
+                super::desktop::close_inherited_fds_on_exec(Some(write_fd));
                 Ok(())
             });
         }
         let mut child = cmd
             .spawn()
             .with_context(|| format!("starting X server {}", cfg.program))?;
-        // SAFETY: we own write_fd in the parent; the child has its own copy.
-        unsafe {
-            libc::close(write_fd);
-        }
+        // The child has its own copy. Ours would keep the pipe open after the
+        // server died, and `read_display_number` would never see its EOF.
+        drop(write_end);
 
         // Start draining stderr immediately, before we wait for the display
         // number: a server that is slow to start is often a server that is
@@ -800,6 +806,31 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
+    /// A script beside the test executable, where cargo already runs code
+    /// from. The temp directory may be mounted `noexec`, and a spawn refused
+    /// there with EACCES would fail a test for a reason that has nothing to
+    /// do with the code under test. Removed again when dropped, panic or not.
+    struct Script(PathBuf);
+
+    impl Script {
+        fn write(name: &str, body: &str) -> Self {
+            let dir = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf))
+                .expect("the test executable has a directory");
+            let path = dir.join(format!("{name}-{}", std::process::id()));
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Script {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
     #[test]
     fn a_failed_start_carries_the_servers_own_last_line() {
         let tmp = tempfile::tempdir().unwrap();
@@ -807,18 +838,15 @@ mod tests {
         // never writes to -displayfd. It ignores the arguments it is handed,
         // which is the only way to script this: the generated arguments come
         // first, so `/bin/sh -c` cannot be spelled through `extra_args`.
-        let fake = tmp.path().join("fake-xserver");
-        fs::write(
-            &fake,
+        let fake = Script::write(
+            "fake-xserver",
             "#!/bin/sh\n\
              echo 'Fatal server error:' >&2\n\
              echo '(EE) could not open default font fixed' >&2\n\
              exit 1\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let cfg = XServerConfig {
-            program: fake.display().to_string(),
+            program: fake.0.display().to_string(),
             extra_args: vec![],
             max_width: 640,
             max_height: 480,

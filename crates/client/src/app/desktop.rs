@@ -12,11 +12,21 @@ type Connected = (Client, AppOptions, Session);
 
 pub fn run(path: Option<PathBuf>, initial: Option<Connected>) -> Result<Option<String>> {
     let event_loop = EventLoop::<Wake>::with_user_event().build()?;
+    // The relay is a convenience, not a requirement: without it ssh's
+    // prompts open in a window of their own, which is what every other
+    // platform gets. A socket that cannot be created -- an over-long or
+    // missing `TMPDIR`, most likely -- must not keep the connection manager
+    // from opening at all.
     #[cfg(unix)]
     let broker = path
         .as_ref()
-        .map(|_| crate::askpass::broker::Broker::new())
-        .transpose()?;
+        .and_then(|_| match crate::askpass::broker::Broker::new() {
+            Ok(broker) => Some(broker),
+            Err(e) => {
+                log::warn!("passphrase prompts will open in a separate window: {e}");
+                None
+            }
+        });
     let mut desktop = Desktop {
         #[cfg(unix)]
         broker,
@@ -41,6 +51,9 @@ pub fn run(path: Option<PathBuf>, initial: Option<Connected>) -> Result<Option<S
 struct Pending {
     name: String,
     result: crossbeam_channel::Receiver<Result<Connected>>,
+    /// Stops the ssh the worker is starting, at exit -- the worker itself
+    /// may be waiting on a passphrase prompt and cannot be asked.
+    kill: crate::tunnel::KillHandle,
 }
 
 struct Desktop {
@@ -82,21 +95,18 @@ impl Desktop {
     fn start(&mut self, profile: Profile) {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let proxy = self.proxy.clone();
-        #[allow(unused_mut)]
-        let mut ssh_env = crate::askpass::ssh_env();
-        #[cfg(unix)]
-        if let Some(broker) = &self.broker {
-            ssh_env.push((
-                crate::askpass::broker::SOCKET_ENV.into(),
-                broker.path.to_string_lossy().into_owned(),
-            ));
-        }
+        // Made here rather than on the worker so the kill handle exists
+        // before the endpoint leaves this thread; the broker's socket reaches
+        // ssh through `askpass::ssh_env`, like every other ssh this process
+        // starts.
+        let endpoint = endpoint_for(&profile);
         self.pending.push(Pending {
             name: profile.name.clone(),
             result: rx,
+            kill: endpoint.kill_handle(),
         });
         std::thread::spawn(move || {
-            let result = connect_profile(&profile, &proxy, ssh_env);
+            let result = connect_profile(&profile, endpoint, &proxy);
             let _ = tx.send(result);
             let _ = proxy.send_event(Wake);
         });
@@ -165,24 +175,28 @@ impl Desktop {
     }
 }
 
-fn connect_profile(
-    profile: &Profile,
-    proxy: &EventLoopProxy<Wake>,
-    ssh_env: Vec<(String, String)>,
-) -> Result<Connected> {
-    use crate::tunnel::{Endpoint, RemoteTarget, TunnelConfig};
-    let mut endpoint = Endpoint::ssh(
+/// The way to a profile's server. No I/O: ssh starts on `connect`.
+fn endpoint_for(profile: &Profile) -> Endpoint {
+    use crate::tunnel::{RemoteTarget, TunnelConfig};
+    Endpoint::ssh(
         TunnelConfig {
             destination: profile.destination(),
             ssh_port: profile.ssh_port,
             identity: profile.identity.clone(),
             options: profile.ssh_options.clone(),
             remote: RemoteTarget::Port(profile.remote_port.unwrap_or(lynxrdp_proto::DEFAULT_PORT)),
-            env: ssh_env,
+            env: crate::askpass::ssh_env(),
             ..Default::default()
         },
         Duration::from_secs(120),
-    );
+    )
+}
+
+fn connect_profile(
+    profile: &Profile,
+    mut endpoint: Endpoint,
+    proxy: &EventLoopProxy<Wake>,
+) -> Result<Connected> {
     let connect = ConnectOptions {
         size: profile.size,
         ..Default::default()
@@ -327,6 +341,14 @@ impl ApplicationHandler<Wake> for Desktop {
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
         #[cfg(unix)]
         self.broker.take();
+        // Kill first, wait second. The wait is for a worker to notice that
+        // its ssh is already gone and return, which is quick; a wait for the
+        // worker on its own terms would be a wait on a passphrase prompt, and
+        // an exit that gave up on that left ssh forwarding with no window
+        // behind it and its socket directory on disk.
+        for pending in &self.pending {
+            pending.kill.kill();
+        }
         for pending in self.pending.drain(..) {
             let _ = pending.result.recv_timeout(Duration::from_millis(250));
         }

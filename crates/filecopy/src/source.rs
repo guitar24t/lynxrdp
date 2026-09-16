@@ -1,3 +1,4 @@
+use crate::Fetch;
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use lynxrdp_proto::{
@@ -8,13 +9,7 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
 };
-pub struct Fetch {
-    pub remote: String,
-    pub destination: PathBuf,
-    pub result: Sender<Option<PathBuf>>,
-}
 pub(crate) struct Source {
     pub files: Vec<FileEntry>,
     pub names: Vec<String>,
@@ -68,7 +63,9 @@ impl Source {
         if let Some(path) = &cached[index] {
             return Ok(path.clone());
         }
-        let (tx, rx) = bounded(1);
+        // Room for a few progress reports the core may send between two of
+        // this thread's turns; it drops rather than blocks on a full one.
+        let (tx, rx) = bounded(4);
         self.requests
             .send(Fetch {
                 remote: file.path.clone(),
@@ -76,10 +73,13 @@ impl Source {
                 result: tx,
             })
             .context("Clipboard offer expired")?;
-        let path = rx
-            .recv_timeout(Duration::from_secs(300))
-            .context("Clipboard transfer timed out")?
-            .context("File could not be transferred")?;
+        // The wait is bounded by inactivity, not by a clock: giving up here
+        // drops `rx`, and the core cancels the transfer when it notices. The
+        // lock is held throughout, so a retried read of the same file after
+        // a stall finds no cache entry and starts afresh -- by which time the
+        // core has already cancelled the abandoned one, because it sweeps
+        // before it starts anything new.
+        let path = crate::fetch::wait(&rx)?;
         anyhow::ensure!(
             std::fs::metadata(&path)?.len() == file.size,
             "Source file changed after Copy"
