@@ -1,3 +1,8 @@
-# Runtime and log directories for lynxrdpd (root only).
-d /run/lynxrdp 0700 root root -
+# Runtime and log directories for lynxrdpd. The runtime directory is
+# traversable, not readable, so the user's sshd can reach the optional Unix
+# listening socket inside it; the sessions directory the daemon creates under
+# it stays 0700 and is the part that needs protecting. Keep the mode in step
+# with RuntimeDirectoryMode in lynxrdpd.service and with
+# packaging/scripts/postinstall.sh, or a reboot undoes what they set.
+d /run/lynxrdp 0711 root root -
 d /var/log/lynxrdp 0700 root root -

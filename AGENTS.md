@@ -19,9 +19,12 @@ cycle.
 
 The CI workflow (`.github/workflows/ci.yml`) is the source of truth. The first
 two of these are steps of it verbatim; the third is a stand-in, not an
-equivalent — CI runs `--lib --bins`, `--doc` and the three integration suites
-as separate steps. It also runs desktop-selection and graphical input/resize
-checks outside cargo (`python3 tools/check-startwm.py` and
+equivalent — CI runs `--lib --bins`, `--doc` and four integration suites as
+separate steps: `e2e`, `daemon`, `tunnel_e2e`, and `report_fixture`, the Rust
+half of the monitoring payload pin, which needs nothing beyond cargo and was
+once left out, leaving that pin enforced on the Python side only. It also
+runs desktop-selection and graphical input/resize checks outside cargo
+(`python3 tools/check-startwm.py` and
 `python3 tools/check-session-ui.py`), plus the ignored display-dependent client
 and X-server authorization/lifecycle tests that plain `cargo test` skips.
 
@@ -185,6 +188,17 @@ assets/generate-icons.sh                             # only when the SVG changes
 installers fine. Generated icons are committed, so a normal build rasterises
 nothing.
 
+The server's maintainer scripts (`packaging/scripts/`) tell an upgrade from a
+removal by what the package manager passes them -- dpkg's second argument to
+`postinst configure`, rpm's instance count -- and the two paths differ on
+purpose: an upgrade restarts the daemon and leaves running desktops alone
+(the unit's `KillMode=process`), a removal ends them before their binaries
+go. `/run/lynxrdp` is mode 0711 so the optional Unix listening socket inside
+it is reachable, and that mode is set in three places that must agree: the
+unit's `RuntimeDirectoryMode`, `lynxrdpd.tmpfiles` and `postinstall.sh`. The
+`.deb` smoke test in CI covers install, upgrade, removal with a stand-in
+process left in the unit's cgroup, and purge.
+
 ## Architecture
 
 `ARCHITECTURE.md` has the detail. The parts worth knowing before you edit:
@@ -262,10 +276,16 @@ not a style question.
   a known-answer test on both sides (`reporting/seal.rs` and
   `tools/lynxrdp-monitor/tests/test_crypto.py`). Change one, change both, or the
   suites diverge silently.
-- **Server packages are built against the RHEL 9 glibc** inside an AlmaLinux 9
-  container, because glibc is backward but not forward compatible — binaries
-  linked against the runner's newer glibc will not start on RHEL 9.
-  `packaging/check-glibc-floor.sh` enforces it in CI.
+- **Every Linux binary that ships is built against the RHEL 9 glibc** inside
+  an AlmaLinux 9 container — the server packages, the client packages, and
+  the `linux-<arch>.tar.gz` client archive the updater downloads, which the
+  `package-server` job produces from the same binary as the packages. glibc
+  is backward but not forward compatible: binaries linked against the
+  runner's newer glibc will not start on RHEL 9, and the updater compares
+  release tags, never glibc, so an archive built on the runner would update
+  an older host into a binary its loader refuses. The `build-client` Linux
+  legs in CI test and build only. `packaging/check-glibc-floor.sh` enforces
+  the floor in CI.
 - **Nothing needs a C library installed.** x11rb, not xlib; PAM is `dlopen`ed
   at runtime (`daemon/pam.rs`) so one binary works with or without PAM present.
   Keep new dependencies in that spirit. The updater's TLS is rustls with
@@ -277,8 +297,10 @@ not a style question.
 - **The updater matches release assets by suffix.** `update::asset_suffix`
   looks for `-linux-x86_64.tar.gz`, `-windows-x86_64.zip`,
   `-windows-x86_64-setup.exe` and so on, where the platform names come from
-  the matrix in `release.yml`. Renaming an asset in `package-client.sh`, or
-  dropping `SHA256SUMS` from the release job, does not fail any build: it
+  `release.yml`: the `build-client` matrix for macOS and Windows, and
+  `linux-<arch>` from the `package-server` job for Linux. Renaming an asset
+  in `package-client.sh`, or dropping `SHA256SUMS` from the release job,
+  does not fail any build: it
   makes every deployed client report "no published download for this
   platform" instead. Change one, change `update/mod.rs`.
 - **`LYNXRDP_RELEASE_TAG` is how a build knows which release it is.**

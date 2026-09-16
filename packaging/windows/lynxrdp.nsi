@@ -33,8 +33,12 @@ ManifestDPIAware true
 Name "${APPNAME} ${VERSION}"
 OutFile "${OUTFILE}"
 InstallDir "$PROGRAMFILES64\${APPNAME}"
-; Reinstalling over an existing copy should land in the same place.
-InstallDirRegKey HKLM "Software\${APPNAME}" "InstallDir"
+; Reinstalling over an existing copy should land in the same place. That is
+; done in .onInit rather than with InstallDirRegKey: the attribute is read
+; before .onInit, in the 32-bit view the installer stub starts in, and the
+; NSIS reference says SetRegView does not affect it -- while the key is
+; written below in the 64-bit view, so it was never found and every
+; reinstall, the self-updater's included, defaulted to Program Files.
 ; Program Files and the machine-wide uninstall key both need administrator.
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
@@ -74,11 +78,41 @@ Function .onInit
         Abort
     ${EndIf}
     SetRegView 64
+    ; A /D= on the command line has already set $INSTDIR and outranks the
+    ; registry, as it did for InstallDirRegKey; nothing else changes it
+    ; before this point, so "still the default" means "not given".
+    ${If} $INSTDIR == "$PROGRAMFILES64\${APPNAME}"
+        ReadRegStr $0 HKLM "Software\${APPNAME}" "InstallDir"
+        ${If} $0 != ""
+            StrCpy $INSTDIR $0
+        ${EndIf}
+    ${EndIf}
 FunctionEnd
 
 Section "${APPNAME}" SecMain
     SectionIn RO
     SetOutPath "$INSTDIR"
+    ; Windows locks the contents of a running image, not its name, so a
+    ; lynxrdp.exe that a session is still using cannot be written over but
+    ; can be renamed out of the way. Without this the extraction below stops
+    ; on an Abort/Retry/Ignore box after the launcher that started us has
+    ; already closed. The staging name is the one the client's own updater
+    ; uses, so the client sweeps the old copy up at its next start; the
+    ; number steps past a copy an earlier install left that is itself still
+    ; in use.
+    ClearErrors
+    Delete "$INSTDIR\lynxrdp.exe"
+    ${If} ${Errors}
+        StrCpy $1 0
+        ${Do}
+            IntOp $1 $1 + 1
+            ClearErrors
+            Rename "$INSTDIR\lynxrdp.exe" "$INSTDIR\.lynxrdp.exe.old-$1"
+            ${IfNot} ${Errors}
+                ${ExitDo}
+            ${EndIf}
+        ${LoopUntil} $1 >= 20
+    ${EndIf}
     File "/oname=lynxrdp.exe" "${EXEPATH}"
     File "/oname=LICENSE.txt" "..\..\LICENSE"
     File "/oname=README.md" "..\..\README.md"
@@ -134,6 +168,9 @@ Section "Uninstall"
     ; would be unrecoverable. Saved connections live in %APPDATA% and are
     ; deliberately left alone.
     Delete "$INSTDIR\lynxrdp.exe"
+    ; What an in-use lynxrdp.exe was renamed to by an install or a
+    ; self-update; the client sweeps these itself, but not after it is gone.
+    Delete "$INSTDIR\.lynxrdp.exe.old-*"
     Delete "$INSTDIR\LICENSE.txt"
     Delete "$INSTDIR\README.md"
     Delete "$INSTDIR\uninstall.exe"

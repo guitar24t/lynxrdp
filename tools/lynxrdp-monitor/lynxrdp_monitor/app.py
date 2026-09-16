@@ -16,6 +16,7 @@ no locking around the table.
 from __future__ import annotations
 
 import argparse
+import html
 import sys
 
 from PySide6.QtCore import Qt, QTimer, Slot
@@ -42,9 +43,29 @@ from .model import DEFAULT_STALE_AFTER, NodeStore, format_age, format_uptime, pa
 #: Port the viewer listens on unless told otherwise.
 DEFAULT_PORT = 9999
 
+#: How long a burst of datagrams may wait for its redraw. One redraw per
+#: burst, not one per readyRead: a rebuild is linear in the table, and a
+#: sender who can fill the table can also keep readyRead firing.
+REFRESH_DELAY_MS = 100
+
 #: Columns, in display order.
 COLUMNS = ["Node", "IP address", "Port", "Sessions", "Version", "Uptime", "Last seen"]
 COL_NODE, COL_IP, COL_PORT, COL_SESSIONS, COL_VERSION, COL_UPTIME, COL_SEEN = range(7)
+
+
+def nat_tooltip(reported: str, source: str) -> str:
+    """The tooltip for a host whose report and datagram disagree on address.
+
+    Qt renders a tooltip as rich text whenever it looks like markup, so both
+    values are escaped. Both are addresses by the time they get here -- the
+    reported one was validated by `parse_report`, the source one comes from
+    the socket -- so this is belt and braces, but it is the one place text
+    from the network meets a markup renderer, and the belt is cheap.
+    """
+    return (
+        f"Reports its address as {html.escape(reported)}, but the datagram came "
+        f"from {html.escape(source)}. Normal behind NAT."
+    )
 
 
 class MonitorWindow(QMainWindow):
@@ -104,6 +125,15 @@ class MonitorWindow(QMainWindow):
         self.tick.timeout.connect(self.refresh)
         self.tick.start()
 
+        # Started by the first datagram of a burst and left alone by the rest,
+        # so a flood costs one rebuild per REFRESH_DELAY_MS rather than one per
+        # readyRead. Restarting it on every burst would be the other classic
+        # debounce, and under a sustained flood that one never fires.
+        self.redraw = QTimer(self)
+        self.redraw.setSingleShot(True)
+        self.redraw.setInterval(REFRESH_DELAY_MS)
+        self.redraw.timeout.connect(self.refresh)
+
     # ---- networking -----------------------------------------------------
 
     def _bind(self, bind: str, port: int) -> None:
@@ -142,7 +172,8 @@ class MonitorWindow(QMainWindow):
             if report is None:
                 continue
             self.store.update(report)
-        self.refresh()
+        if not self.redraw.isActive():
+            self.redraw.start()
 
     # ---- display --------------------------------------------------------
 
@@ -182,10 +213,7 @@ class MonitorWindow(QMainWindow):
                 # Worth surfacing: normal behind NAT, but also what a spoofed
                 # report would look like.
                 node_item.setText(f"{report.node} *")
-                node_item.setToolTip(
-                    f"Reports its address as {report.ip}, but the datagram came "
-                    f"from {report.source_ip}. Normal behind NAT."
-                )
+                node_item.setToolTip(nat_tooltip(report.ip, report.source_ip))
             else:
                 node_item.setToolTip("")
             if selected == report.node:
@@ -199,6 +227,14 @@ class MonitorWindow(QMainWindow):
         message = f"Listening on {where} - {total} host(s)"
         if stale:
             message += f", {stale} stale"
+        if self.store.full:
+            # Said out loud rather than dropped quietly: a real machine that
+            # first reports while the table is full would otherwise just
+            # never appear, and nobody would know to look for it.
+            message += (
+                f" - table full, new hosts are being dropped "
+                f"({self.store.refused} report(s) so far)"
+            )
         self.statusBar().showMessage(message)
 
     # ---- copying --------------------------------------------------------

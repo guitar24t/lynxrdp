@@ -13,7 +13,11 @@ RestartSec=2
 # restarts and package upgrades, so only the daemon itself is stopped.
 KillMode=process
 RuntimeDirectory=lynxrdp
-RuntimeDirectoryMode=0700
+# Traversable so the optional Unix listening socket inside it can be reached
+# by the user's sshd. systemd re-applies this mode on every start, so it has
+# to agree with lynxrdpd.tmpfiles and postinstall.sh; the daemon keeps
+# sessions/ underneath at 0700 itself.
+RuntimeDirectoryMode=0711
 RuntimeDirectoryPreserve=yes
 LogsDirectory=lynxrdp
 LogsDirectoryMode=0700

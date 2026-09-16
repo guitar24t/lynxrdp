@@ -10,7 +10,9 @@ address = "127.0.0.1"
 port = 3390
 # Optionally also listen on a Unix socket (forward with
 # `ssh -L 3390:/run/lynxrdp/lynxrdp.sock host`). Peers are identified with
-# SO_PEERCRED.
+# SO_PEERCRED. The socket is created world-connectable and the packages keep
+# /run/lynxrdp traversable (mode 0711) so a user's sshd can reach it; a socket
+# anywhere else needs a directory every user may search.
 #unix_socket = "/run/lynxrdp/lynxrdp.sock"
 
 [access]

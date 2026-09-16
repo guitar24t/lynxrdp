@@ -72,6 +72,13 @@ jobs:
         env:
           LYNXRDP_REQUIRE_E2E: "1"
         run: cargo test -p lynxrdp-server --test tunnel_e2e -- --test-threads=1
+      # Needs no display, socket or root. It is the Rust half of the
+      # monitoring payload pin (the Python half is test_report_fixture.py in
+      # the monitor job), and an integration test only runs when named: with
+      # this step missing, a change to Report::to_json merged green and the
+      # fixture guarded nothing.
+      - name: Monitoring report fixture
+        run: cargo test -p lynxrdp-server --test report_fixture
       - name: Doc tests
         run: cargo test --workspace --doc
       - name: Graphical session input (Xvfb)
@@ -129,7 +136,13 @@ jobs:
         run: cargo test -p lynxrdp-proto -p lynxrdp-client -p lynxrdp-filecopy --target ${{ matrix.target }}
       - name: Build release client
         run: cargo build --release -p lynxrdp-client --target ${{ matrix.target }}
+      # The Linux legs stop here. They exist to run the tests and a release
+      # build with the runner's toolchain; the archive that ships for Linux is
+      # made by package-server below, from the binary built against the RHEL 9
+      # glibc, because one linked here needs the runner's glibc 2.39 and the
+      # updater never checks glibc before installing an archive.
       - name: Package
+        if: ${{ !startsWith(matrix.name, 'linux-') }}
         shell: bash
         run: packaging/package-client.sh "${{ matrix.target }}" "${{ matrix.name }}" "${{ matrix.bin }}"
       # Built on every run, not only on release, so a broken installer script
@@ -156,6 +169,7 @@ jobs:
         if: startsWith(matrix.name, 'macos-')
         run: python3 tools/check-macos-packaging.py "target/${{ matrix.target }}/release/lynxrdp"
       - uses: actions/upload-artifact@v7
+        if: ${{ !startsWith(matrix.name, 'linux-') }}
         with:
           name: lynxrdp-client-${{ matrix.name }}
           path: dist/*
@@ -198,9 +212,11 @@ jobs:
           - name: x86_64
             os: ubuntu-24.04
             arch: amd64
+            triple: x86_64-unknown-linux-gnu
           - name: aarch64
             os: ubuntu-24.04-arm
             arch: arm64
+            triple: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -241,6 +257,15 @@ jobs:
             target/release/lynxrdp
       - name: Build .deb and .rpm
         run: packaging/package-server.sh "${{ matrix.arch }}"
+      # The archive the client's updater downloads for Linux, from the same
+      # floor-checked binary as the packages. The build-client Linux legs do
+      # not make one: theirs would carry the runner's glibc 2.39, and the
+      # updater picks this archive by suffix without looking at glibc, so an
+      # archive install on RHEL 9 would update itself into a binary the
+      # loader refuses -- the exact failure check-glibc-floor.sh exists to
+      # stop. The name has to stay "linux-<arch>": update/mod.rs matches it.
+      - name: Linux client archive
+        run: packaging/package-client.sh "${{ matrix.triple }}" "linux-${{ matrix.name }}" lynxrdp
       - name: Install the .deb and smoke test
         run: |
           set -x
@@ -318,8 +343,53 @@ jobs:
             test -f /var/log/lynxrdp/citest.log.1.gz
             rm -f /var/log/lynxrdp/citest.log /var/log/lynxrdp/citest.log.1.gz
           '
+          # Upgrade path. apt sees the same version and does nothing, so use
+          # dpkg -i, which always unpacks and reconfigures and so runs the new
+          # postinst as "configure <old-version>", exactly what an upgrade
+          # does. The daemon must come back as a new process on the new file:
+          # the old one starts sessions through /proc/self/exe, which reads
+          # "(deleted)" once the binary has been replaced. A unit the
+          # administrator disabled must stay disabled.
+          old_pid="$(systemctl show -p MainPID --value lynxrdpd)"
+          sudo dpkg -i ./dist/lynxrdp-server_*_${{ matrix.arch }}.deb
+          for i in $(seq 1 10); do
+            [ "$(systemctl is-active lynxrdpd || true)" = "active" ] && break
+            sleep 1
+          done
+          new_pid="$(systemctl show -p MainPID --value lynxrdpd)"
+          if [ "$new_pid" = 0 ] || [ "$new_pid" = "$old_pid" ]; then
+            echo "::error::the upgrade did not restart lynxrdpd (pid $old_pid -> $new_pid)"
+            exit 1
+          fi
+          test "$(sudo readlink "/proc/$new_pid/exe")" = /usr/bin/lynxrdpd
+          sudo systemctl disable --now lynxrdpd
+          sudo dpkg -i ./dist/lynxrdp-server_*_${{ matrix.arch }}.deb
+          test "$(systemctl is-enabled lynxrdpd || true)" = disabled
+          test "$(systemctl is-active lynxrdpd || true)" = inactive
+          sudo systemctl enable --now lynxrdpd
+          # Removal must end what the daemon started. Under KillMode=process
+          # anything in the unit's cgroup outlives "systemctl stop" exactly as
+          # a desktop session does, so a stand-in process placed there has to
+          # be gone once the package is (preremove.sh says how). The runtime
+          # directory goes with it; Debian's remove keeps configuration, and
+          # purge is the request to forget the PAM file and the logs too.
+          cg="$(systemctl show -p ControlGroup --value lynxrdpd)"
+          test -n "$cg"
+          sudo sh -c "echo \$\$ > /sys/fs/cgroup$cg/cgroup.procs && echo \$\$ > /tmp/leftover.pid && exec sleep 3600" &
+          sleep 1
+          leftover="$(cat /tmp/leftover.pid)"
+          sudo grep -qx "$leftover" "/sys/fs/cgroup$cg/cgroup.procs"
           sudo apt-get remove -y -q lynxrdp-server
           sudo test ! -e /usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules
+          if sudo kill -0 "$leftover" 2>/dev/null; then
+            echo "::error::a process the daemon left behind survived package removal"
+            exit 1
+          fi
+          sudo test ! -e /run/lynxrdp
+          test -f /etc/pam.d/lynxrdp
+          sudo apt-get purge -y -q lynxrdp-server
+          sudo test ! -e /etc/pam.d/lynxrdp
+          sudo test ! -e /var/log/lynxrdp
       - name: Inspect the .rpm
         run: |
           sudo apt-get install -y -q rpm

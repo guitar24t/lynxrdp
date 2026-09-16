@@ -31,8 +31,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64,   os: ubuntu-24.04,     target: x86_64-unknown-linux-gnu,  bin: lynxrdp }
-          - { name: linux-aarch64,  os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, bin: lynxrdp }
+          # No Linux here on purpose. The Linux archive is made by
+          # package-server below, from the binary built against the RHEL 9
+          # glibc, so that it passes the same floor check as the packages.
+          # Built on this runner it would need glibc 2.39, and the updater
+          # picks the archive by suffix without ever comparing glibc, so an
+          # archive install on RHEL 9 would update itself into a binary the
+          # loader refuses to start.
           # Apple Silicon only; see the note in ci.yml.
           - { name: macos-aarch64,  os: macos-latest,     target: aarch64-apple-darwin,      bin: lynxrdp }
           - { name: windows-x86_64, os: windows-latest,   target: x86_64-pc-windows-msvc,    bin: lynxrdp.exe }
@@ -80,8 +85,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: x86_64,  os: ubuntu-24.04,     arch: amd64 }
-          - { name: aarch64, os: ubuntu-24.04-arm, arch: arm64 }
+          - { name: x86_64,  os: ubuntu-24.04,     arch: amd64, triple: x86_64-unknown-linux-gnu }
+          - { name: aarch64, os: ubuntu-24.04-arm, arch: arm64, triple: aarch64-unknown-linux-gnu }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -112,6 +117,12 @@ jobs:
             target/release/lynxrdp-session \
             target/release/lynxrdp
       - run: packaging/package-server.sh "${{ matrix.arch }}"
+      # The updater's Linux asset, from the same floor-checked binary as the
+      # packages; see the note on build-client above. "linux-<arch>" is the
+      # name update/mod.rs matches, so it is fixed here rather than taken from
+      # a matrix that no longer has a Linux row.
+      - name: Linux client archive
+        run: packaging/package-client.sh "${{ matrix.triple }}" "linux-${{ matrix.name }}" lynxrdp
       - uses: actions/upload-artifact@v7
         with:
           name: lynxrdp-server-${{ matrix.name }}

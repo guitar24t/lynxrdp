@@ -86,6 +86,12 @@ and started), `/etc/lynxrdp/lynxrdp.toml`, `/etc/lynxrdp/startwm.sh`, a PAM
 service file `/etc/pam.d/lynxrdp` and a logrotate snippet
 `/etc/logrotate.d/lynxrdp` (see [Session logs](#session-logs)).
 
+Upgrading the package restarts the daemon and leaves running desktops as they
+are. Removing it ends them, since nothing could reach them again afterwards.
+`apt remove` keeps `/etc/pam.d/lynxrdp` and the session logs and `apt purge`
+deletes them; `dnf remove` removes the PAM file if you never edited it,
+otherwise keeps it as `lynxrdp.rpmsave`, and leaves the logs.
+
 Both server packages also install
 `/usr/share/polkit-1/rules.d/02-lynxrdp-colord.rules` to suppress the
 "Authentication is required to create a color managed device" prompt when a
@@ -225,7 +231,8 @@ versions, and the server needs updating too.
   *Settings → Apps → Optional features* if it is missing.
 * **macOS**: included.
 * **Linux**: `openssh-client` / `openssh-clients`, plus `libxkbcommon-x11`
-  (the `.deb`/`.rpm` client packages declare these).
+  and Mesa's `libGL`/`libEGL`, which the connection manager draws with
+  (the `.deb`/`.rpm` client packages declare all of these).
 
 ## Connecting
 
@@ -277,7 +284,9 @@ Useful options:
 ```
 lynxrdp -p 2222 user@host           # SSH port
 lynxrdp -i ~/.ssh/work user@host    # identity file
-lynxrdp -o ProxyJump=bastion host   # any ssh -o option (repeatable)
+lynxrdp -o ProxyJump=bastion host   # any ssh -o option (repeatable; the
+                                    # manager's SSH options field takes them
+                                    # one per line, without the -o)
 lynxrdp --size 2560x1440 host       # initial remote screen size
 lynxrdp --scale 2 host              # magnify by a whole factor, 1 to 4
 lynxrdp -f host                     # fullscreen (toggle: Ctrl+Alt+Enter)

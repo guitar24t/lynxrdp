@@ -53,9 +53,20 @@ overrides:
       - openssh-client
       - libxkbcommon-x11-0
       - libxkbcommon0
+      # The connection manager draws through eframe's glow backend, which
+      # opens its GL context by dlopen()ing libEGL.so.1 / libGL.so.1 at run
+      # time, so nothing in the binary's ELF headers names them and no tool
+      # derives this. Without them the package installs cleanly and the
+      # launcher fails at window creation, while direct sessions (drawn with
+      # softbuffer) still work -- a confusing half-failure.
+      - libegl1
+      - libgl1
   rpm:
     depends:
       - fuse3
       - openssh-clients
       - libxkbcommon-x11
       - libxkbcommon
+      # Same reasoning as the deb list above.
+      - mesa-libEGL
+      - mesa-libGL
