@@ -163,8 +163,9 @@ jobs:
   # release assets of the newest releases each time, so they have no state
   # of their own to drift. A server package installs the definitions and
   # the public key, which is what lets apt and dnf update the server after
-  # the first install. The key is the LYNXRDP_PACKAGE_SIGNING_KEY secret;
-  # build-repo.sh checks it against the committed public key.
+  # the first install. The key is the LYNXRDP_PACKAGE_SIGNING_KEY secret of
+  # the github-pages environment this job deploys to, so no other job can
+  # read it; build-repo.sh checks it against the committed public key.
   publish-repo:
     name: Publish package repositories
     needs: release

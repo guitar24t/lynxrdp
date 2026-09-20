@@ -29,7 +29,8 @@ sudo curl -fsSL -o /etc/apt/sources.list.d/lynxrdp.sources \
 sudo apt update &amp;&amp; sudo apt install lynxrdp-server</code></pre>
 
 <h2>RHEL, AlmaLinux, Rocky and Fedora</h2>
-<pre><code>sudo dnf config-manager --add-repo https://guitar24t.github.io/lynxrdp/lynxrdp.repo
+<pre><code>sudo curl -fsSL -o /etc/yum.repos.d/lynxrdp.repo \
+  https://guitar24t.github.io/lynxrdp/lynxrdp.repo
 sudo dnf install lynxrdp-server</code></pre>
 
 <h2>Signing key</h2>

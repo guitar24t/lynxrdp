@@ -117,8 +117,10 @@ curl -fsSL https://guitar24t.github.io/lynxrdp/lynxrdp-packages.asc \
 sudo curl -fsSL -o /etc/apt/sources.list.d/lynxrdp.sources \
   https://guitar24t.github.io/lynxrdp/lynxrdp.sources
 sudo apt update && sudo apt install lynxrdp-server
-# RHEL / Fedora
-sudo dnf config-manager --add-repo https://guitar24t.github.io/lynxrdp/lynxrdp.repo
+# RHEL / Fedora (curl rather than config-manager: dnf5 on Fedora 41 and
+# later dropped --add-repo, and a plain file works on every version)
+sudo curl -fsSL -o /etc/yum.repos.d/lynxrdp.repo \
+  https://guitar24t.github.io/lynxrdp/lynxrdp.repo
 sudo dnf install lynxrdp-server
 ```
 

@@ -303,8 +303,10 @@ at `https://guitar24t.github.io/lynxrdp/`, so that `apt` and `dnf` can update
 the server. What its signatures do and do not prove:
 
 * **One key signs everything.** The APT `InRelease`, the RPM `repomd.xml`
-  and every `.rpm` are signed with a key whose private half is an Actions
-  secret of this repository and whose public half ships inside the packages
+  and every `.rpm` are signed with a key whose private half is a secret of
+  the repository's `github-pages` deployment environment, readable only by
+  the release workflow's publishing job on a `v*` tag or `main`, and whose
+  public half ships inside the packages
   (`/usr/share/keyrings/lynxrdp-archive-keyring.gpg` and
   `/etc/pki/rpm-gpg/RPM-GPG-KEY-lynxrdp`). `gpgcheck` and `repo_gpgcheck`
   are on, and the apt source is pinned to that keyring with `Signed-By`.

@@ -347,7 +347,10 @@ not a style question.
   in `release.yml` keeps those out of the repository; never lower it.
 - **The package repositories are signed with one key, and the packages
   install its public half.** The private key is the
-  `LYNXRDP_PACKAGE_SIGNING_KEY` Actions secret; `packaging/keys/lynxrdp-packages.asc`
+  `LYNXRDP_PACKAGE_SIGNING_KEY` secret of the `github-pages` *environment*,
+  not of the repository: only a job that names that environment can read
+  it, and the environment admits runs from `v*` tags and `main` alone, so
+  neither a pull request nor any other job in any workflow ever sees it. `packaging/keys/lynxrdp-packages.asc`
   is the public half, installed by the server packages as the apt keyring
   and the RPM key, and `build-repo.sh` refuses a signing key whose
   fingerprint differs from that file. CI builds the repositories with a
