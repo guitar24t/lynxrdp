@@ -62,6 +62,8 @@ has_ubuntu_session() (
     return 1
 )
 
+# packaging/install.sh carries a copy of this list to decide whether a host
+# has a desktop at all; tools/check-startwm.py fails if the two differ.
 for candidate in \
     "startxfce4" \
     "xfce4-session" \

@@ -143,6 +143,9 @@ cp packaging/repo/lynxrdp.sources "$SITE/lynxrdp.sources"
 sed "s#^gpgkey=.*#gpgkey=$SITE_URL/lynxrdp-packages.asc#" packaging/repo/lynxrdp.repo > "$SITE/lynxrdp.repo"
 sed -e "s#@FINGERPRINT@#$(echo "$KEY" | sed 's/..../& /g; s/ $//')#" \
     packaging/repo/index.html > "$SITE/index.html"
+# The installer is served from the site so one curl sets a host up; it is
+# the same file as in the tree, which is what CI checks.
+cp packaging/install.sh "$SITE/install.sh"
 # Not a Jekyll site: nothing here needs processing, and Jekyll would drop
 # files it considers special.
 : > "$SITE/.nojekyll"

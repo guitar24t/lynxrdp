@@ -21,6 +21,11 @@
 <h1>LynxRDP package repositories</h1>
 <p>Signed APT and RPM repositories for the <a href="https://github.com/guitar24t/lynxrdp">LynxRDP</a> server. A server installed from a release package already knows this repository; the commands below are for setting it up by hand.</p>
 
+<h2>One command</h2>
+<p>On any supported distribution with a desktop environment installed:</p>
+<pre><code>curl -fsSL https://guitar24t.github.io/lynxrdp/install.sh | sudo sh</code></pre>
+<p>It sets up this repository, installs <code>lynxrdp-server</code>, enables the service and checks that it is running. It refuses, without changing anything, on a host that has no desktop environment, and says how to install one.</p>
+
 <h2>Debian and Ubuntu</h2>
 <pre><code>curl -fsSL https://guitar24t.github.io/lynxrdp/lynxrdp-packages.asc \
   | sudo gpg --dearmor -o /usr/share/keyrings/lynxrdp-archive-keyring.gpg

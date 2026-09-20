@@ -182,5 +182,23 @@ class DesktopSelection(unittest.TestCase):
         self.assertEqual(self.launch()["command"], "xterm")
 
 
+class InstallerAgreesWithTheLauncher(unittest.TestCase):
+    """install.sh refuses a host with no desktop, and decides that with its
+    own copy of the launcher's candidate list, because it runs before the
+    package that carries startwm.sh exists on the host. A desktop known to
+    one and not the other would be refused for no reason, or waved through
+    to a bare xterm."""
+
+    def test_the_two_candidate_lists_are_the_same(self):
+        import re
+        launcher = re.search(r"for candidate in \\\n(.*?); do", STARTWM.read_text(), re.S)
+        self.assertIsNotNone(launcher, "startwm.sh candidate loop not found")
+        launcher_list = re.findall(r'"([^"]+)"', launcher.group(1))
+        installer = re.search(r'^DESKTOPS="([^"]+)"', (STARTWM.parent / "install.sh").read_text(), re.M)
+        self.assertIsNotNone(installer, "install.sh DESKTOPS not found")
+        self.assertGreater(len(launcher_list), 5)
+        self.assertEqual(installer.group(1).split(), launcher_list)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

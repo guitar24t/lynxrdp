@@ -71,8 +71,22 @@ Supported server distributions: RHEL 9 (and derivatives), Ubuntu 24.04 and
 
 ## Installing the server
 
-Download the `.deb` or `.rpm` for your architecture from the releases page,
-or build it yourself (see below).
+On a Debian- or RHEL-family host with a desktop environment installed, one
+command sets up the signed package repository, installs the server through
+the package manager, enables the service and checks that it is running:
+
+```sh
+curl -fsSL https://guitar24t.github.io/lynxrdp/install.sh | sudo sh
+```
+
+It checks everything it can refuse on before changing anything. In particular
+it stops, untouched, on a host with no desktop environment and prints the
+command that installs one: the package brings Xvfb but no desktop, and without
+one every user would get a bare xterm. `--no-desktop-check` skips that for
+hosts whose users start their own session from `~/.lynxrdp/session`.
+
+To do it by hand instead, download the `.deb` or `.rpm` for your architecture
+from the releases page, or build it yourself (see below).
 
 ```sh
 # Debian / Ubuntu
