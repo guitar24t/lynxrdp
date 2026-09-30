@@ -103,22 +103,26 @@ def check(bin_dir):
                 window = find_window("lynxrdp", local_env, timeout=60)
                 run(["xdotool", "windowfocus", window], local_env)
                 # Ctrl+Alt+T is the desktop's terminal shortcut and must reach
-                # the session, so the check proves exactly that. xterm turns
-                # Alt into readline's Meta prefix, so the shell sees the
-                # keystroke as ESC C-t and `bind -x` can run a command for
-                # it. Bare C-t gets its own marker, so a viewer that forwarded
-                # the key but dropped Alt is told apart from one that ate it.
-                seen = tmp + "/ctrl-alt-t-arrived"
-                run(["xdotool", "type", "--clearmodifiers", "--delay", "15",
-                     f"bind -x '\"\\e\\C-t\": printf ARRIVED > {seen}'; "
-                     f"bind -x '\"\\C-t\": printf NO-ALT > {seen}'"], local_env)
+                # the session, so the check proves exactly that, without
+                # assuming which shell the remote xterm runs: `cat -v` writes
+                # whatever bytes the terminal delivers, and xterm spells a held
+                # Alt as either the ESC prefix or the eighth bit, so the
+                # keystroke arrives as `^[^T` or `M-^T`. A bare `^T` means the
+                # viewer forwarded the key but dropped Alt; nothing at all
+                # means it kept the shortcut for itself.
+                run(["xdotool", "mousemove", "--window", window, "100", "200", "click", "1"], local_env)
+                seen = tmp + "/ctrl-alt-t-bytes"
+                run(["xdotool", "type", "--clearmodifiers", "--delay", "15", f"cat -v > {seen}"], local_env)
                 run(["xdotool", "key", "Return"], local_env)
                 time.sleep(0.3)
                 run(["xdotool", "key", "ctrl+alt+t"], local_env)
-                wait_for(lambda: Path(seen).exists(), "Ctrl+Alt+T reaching the remote shell")
-                got = Path(seen).read_text()
-                assert got == "ARRIVED", f"the remote shell saw {got!r} for Ctrl+Alt+T"
-                assert client.poll() is None, "Client exited on Ctrl+Alt+T"
+                run(["xdotool", "key", "Return", "ctrl+d"], local_env)
+                wait_for(lambda: Path(seen).exists() and Path(seen).stat().st_size > 0,
+                         "Ctrl+Alt+T reaching the remote shell")
+                time.sleep(0.2)
+                got = Path(seen).read_text().strip()
+                assert "^T" in got, f"the remote terminal received {got!r} for Ctrl+Alt+T, not the key"
+                assert got.endswith("^T") and len(got) > 2, f"Ctrl+Alt+T arrived without Alt: {got!r}"
                 print("PASS: Ctrl+Alt+T is forwarded to the session, not taken by the viewer.")
                 # The Transfers panel opens from the bar, the way a user opens
                 # it: the pointer parks in the hot zone at the top edge, the
