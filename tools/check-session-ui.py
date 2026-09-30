@@ -112,11 +112,14 @@ def check(bin_dir):
                 # means it kept the shortcut for itself.
                 run(["xdotool", "mousemove", "--window", window, "100", "200", "click", "1"], local_env)
                 seen = tmp + "/ctrl-alt-t-bytes"
-                run(["xdotool", "type", "--clearmodifiers", "--delay", "15", f"cat -v > {seen}"], local_env)
+                # `head -n 1` ends the capture at the first newline, so no
+                # Ctrl+D is ever typed: one that landed on the shell's own
+                # prompt would end the shell, the xterm and the session.
+                run(["xdotool", "type", "--clearmodifiers", "--delay", "15", f"head -n 1 | cat -v > {seen}"], local_env)
                 run(["xdotool", "key", "Return"], local_env)
                 time.sleep(0.3)
                 run(["xdotool", "key", "ctrl+alt+t"], local_env)
-                run(["xdotool", "key", "Return", "ctrl+d"], local_env)
+                run(["xdotool", "key", "Return"], local_env)
                 wait_for(lambda: Path(seen).exists() and Path(seen).stat().st_size > 0,
                          "Ctrl+Alt+T reaching the remote shell")
                 time.sleep(0.2)
@@ -128,16 +131,23 @@ def check(bin_dir):
                 # typed line into control characters or capitals, which a
                 # later step would only report as a command that did nothing.
                 probe = tmp + "/typed-after-shortcut"
-                run(["xdotool", "type", "--clearmodifiers", "--delay", "15", f"cat -v > {probe}"], local_env)
+                run(["xdotool", "type", "--clearmodifiers", "--delay", "15", f"head -n 1 | cat -v > {probe}"], local_env)
                 run(["xdotool", "key", "Return"], local_env)
                 time.sleep(0.3)
                 run(["xdotool", "type", "--clearmodifiers", "--delay", "15", "printf GUI_OK"], local_env)
-                run(["xdotool", "key", "Return", "ctrl+d"], local_env)
+                run(["xdotool", "key", "Return"], local_env)
                 wait_for(lambda: Path(probe).exists() and Path(probe).stat().st_size > 0,
                          "typing after Ctrl+Alt+T")
                 time.sleep(0.2)
                 typed = Path(probe).read_text().strip()
                 assert typed == "printf GUI_OK", f"after Ctrl+Alt+T the session received {typed!r} for 'printf GUI_OK'"
+                # The shell is back at its prompt before the panel is opened,
+                # so a failure past this point is the panel's, not the shell's.
+                prompt = tmp + "/prompt-ok"
+                run(["xdotool", "type", "--clearmodifiers", "--delay", "15", f"touch {prompt}"], local_env)
+                run(["xdotool", "key", "Return"], local_env)
+                wait_for(lambda: Path(prompt).exists(), "the remote shell at its prompt after the captures")
+                assert client.poll() is None, "Client exited before the Transfers panel was opened"
                 print("PASS: Ctrl+Alt+T is forwarded to the session, not taken by the viewer.")
                 # The Transfers panel opens from the bar, the way a user opens
                 # it: the pointer parks in the hot zone at the top edge, the
