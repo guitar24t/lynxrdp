@@ -2326,6 +2326,13 @@ impl App {
     ///
     /// These global actions are available while the remote desktop has focus.
     /// Local text fields use the graphical toolkit's normal editing shortcuts.
+    ///
+    /// Ctrl+Alt+T is deliberately not among them. It used to open the
+    /// Transfers panel, and on GNOME, Ubuntu and most other desktops it is
+    /// the shortcut that opens a terminal, which is the first thing many
+    /// people press in a fresh session; a viewer that eats it looks broken.
+    /// The panel has its button on the bar. The others are kept because a
+    /// desktop does not commonly bind them.
     fn accelerator(&self, logical: &Key, physical: PhysicalKey) -> Option<Accelerator> {
         let acc = accelerator_for(self.modifiers, logical, physical)?;
         // Ctrl+Alt+R is ours only while there is nothing to send it to. Taking
@@ -2351,7 +2358,6 @@ impl App {
             return;
         };
         match acc {
-            Accelerator::Transfers => self.open_transfer_panel(),
             Accelerator::Fullscreen => self.toggle_fullscreen(),
             Accelerator::SecureAttention => self.send_secure_attention(),
             Accelerator::Pin => {
@@ -2643,7 +2649,6 @@ fn accelerator_for(
     }
     match logical {
         Key::Named(NamedKey::Enter) => return Some(Accelerator::Fullscreen),
-        Key::Character(c) if c.eq_ignore_ascii_case("t") => return Some(Accelerator::Transfers),
         Key::Named(NamedKey::End) => return Some(Accelerator::SecureAttention),
         Key::Character(c) if c.eq_ignore_ascii_case("b") => return Some(Accelerator::Pin),
         Key::Character(c) if c.eq_ignore_ascii_case("r") => return Some(Accelerator::Reconnect),
@@ -2654,7 +2659,6 @@ fn accelerator_for(
         _ => {}
     }
     match physical {
-        PhysicalKey::Code(KeyCode::KeyT) => Some(Accelerator::Transfers),
         PhysicalKey::Code(KeyCode::KeyB) => Some(Accelerator::Pin),
         PhysicalKey::Code(KeyCode::KeyR) => Some(Accelerator::Reconnect),
         PhysicalKey::Code(KeyCode::KeyQ) => Some(Accelerator::Disconnect),
@@ -2665,8 +2669,6 @@ fn accelerator_for(
 /// An accelerator this window keeps rather than forwarding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Accelerator {
-    /// Ctrl+Alt+T.
-    Transfers,
     /// Ctrl+Alt+Enter.
     Fullscreen,
     /// Ctrl+Alt+End.
@@ -4073,6 +4075,16 @@ mod tests {
         // swallow it, which is the whole reason for the guard.
         assert_eq!(
             accelerator_for(ctrl_alt, &ch("x"), PhysicalKey::Code(KeyCode::KeyB)),
+            None
+        );
+        // Ctrl+Alt+T is the desktop's: it opens a terminal on GNOME and most
+        // others, so it must reach the session however it is spelled.
+        assert_eq!(
+            accelerator_for(ctrl_alt, &ch("t"), PhysicalKey::Code(KeyCode::KeyT)),
+            None
+        );
+        assert_eq!(
+            accelerator_for(ctrl_alt, &ch("\u{2020}"), PhysicalKey::Code(KeyCode::KeyT)),
             None
         );
         // The named keys do not depend on the layout at all.

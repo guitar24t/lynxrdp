@@ -413,7 +413,7 @@ Folder clipboard copies are not supported yet: drag folders into the session
 to copy them. Unreadable files and unsupported selections show a brief error.
 
 
-Choose **Transfers** on the connection bar, or press **Ctrl+Alt+T**, for a movable,
+Choose **Transfers** on the connection bar for a movable,
 non-modal graphical window with per-file progress bars and **Cancel** buttons.
 **Cancel all** also clears files waiting to upload. Closing this window does not
 stop transfers. Under **Download a remote file**, enter the remote path and local

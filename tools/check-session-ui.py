@@ -102,7 +102,30 @@ def check(bin_dir):
                 # absence is not what this check is about.
                 window = find_window("lynxrdp", local_env, timeout=60)
                 run(["xdotool", "windowfocus", window], local_env)
+                # Ctrl+Alt+T is the desktop's terminal shortcut and must reach
+                # the session, so the check proves exactly that: xterm binds
+                # nothing to it and turns it into the control character ^T
+                # followed by nothing useful, but a shell reads the keystroke
+                # and `bind -x` runs a command for it. The marker's content
+                # is what tells a swallowed shortcut from a delivered one.
+                seen = tmp + "/ctrl-alt-t-arrived"
+                run(["xdotool", "type", "--clearmodifiers", "--delay", "15",
+                     f"bind -x '\"\\C-t\": printf ARRIVED > {seen}'"], local_env)
+                run(["xdotool", "key", "Return"], local_env)
+                time.sleep(0.3)
                 run(["xdotool", "key", "ctrl+alt+t"], local_env)
+                wait_for(lambda: Path(seen).exists(), "Ctrl+Alt+T reaching the remote shell")
+                assert Path(seen).read_text() == "ARRIVED"
+                assert client.poll() is None, "Client exited on Ctrl+Alt+T"
+                print("PASS: Ctrl+Alt+T is forwarded to the session, not taken by the viewer.")
+                # The Transfers panel opens from the bar, the way a user opens
+                # it: the pointer parks in the hot zone at the top edge, the
+                # bar comes up after its reveal delay, and the button is
+                # clicked. The rectangle is the crate's own layout for a
+                # 1000-pixel-wide window at scale 1 (overlay::bar_layout).
+                run(["xdotool", "mousemove", "--window", window, "500", "1"], local_env)
+                time.sleep(1.0)  # past overlay::REVEAL_DELAY (600 ms)
+                run(["xdotool", "mousemove", "--window", window, "794", "12", "click", "1"], local_env)
                 time.sleep(0.5)  # Let egui position and paint the details window.
                 # Details stay open on the right. Click the desktop on the left.
                 run(["xdotool", "mousemove", "--window", window, "100", "200", "click", "1"], local_env)

@@ -178,7 +178,9 @@ pub enum Action {
 /// The buttons, left to right; `Disconnect` is laid out hard against the
 /// right edge and the others fill leftwards from it.
 const BUTTONS: [(Action, &str, &str, u32); 4] = [
-    (Action::Transfers, "Transfers", "C-A-T", colour::TEXT),
+    // No accelerator: Ctrl+Alt+T belongs to the desktop, where it opens a
+    // terminal; see `App::accelerator`.
+    (Action::Transfers, "Transfers", "", colour::TEXT),
     (Action::Fullscreen, "Fullscreen", "C-A-Enter", colour::TEXT),
     (
         Action::SecureAttention,
