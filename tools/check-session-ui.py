@@ -123,6 +123,21 @@ def check(bin_dir):
                 got = Path(seen).read_text().strip()
                 assert "^T" in got, f"the remote terminal received {got!r} for Ctrl+Alt+T, not the key"
                 assert got.endswith("^T") and len(got) > 2, f"Ctrl+Alt+T arrived without Alt: {got!r}"
+                # And the keyboard is usable afterwards: a modifier the
+                # shortcut left held on the session would turn the next
+                # typed line into control characters or capitals, which a
+                # later step would only report as a command that did nothing.
+                probe = tmp + "/typed-after-shortcut"
+                run(["xdotool", "type", "--clearmodifiers", "--delay", "15", f"cat -v > {probe}"], local_env)
+                run(["xdotool", "key", "Return"], local_env)
+                time.sleep(0.3)
+                run(["xdotool", "type", "--clearmodifiers", "--delay", "15", "printf GUI_OK"], local_env)
+                run(["xdotool", "key", "Return", "ctrl+d"], local_env)
+                wait_for(lambda: Path(probe).exists() and Path(probe).stat().st_size > 0,
+                         "typing after Ctrl+Alt+T")
+                time.sleep(0.2)
+                typed = Path(probe).read_text().strip()
+                assert typed == "printf GUI_OK", f"after Ctrl+Alt+T the session received {typed!r} for 'printf GUI_OK'"
                 print("PASS: Ctrl+Alt+T is forwarded to the session, not taken by the viewer.")
                 # The Transfers panel opens from the bar, the way a user opens
                 # it: the pointer parks in the hot zone at the top edge, the
@@ -140,7 +155,10 @@ def check(bin_dir):
                 run(["xdotool", "type", "--clearmodifiers", "--delay", "15",
                      f"printf GUI_OK > {marker}"], local_env)
                 run(["xdotool", "key", "Return"], local_env)
-                wait_for(lambda: Path(marker).exists(), "remote typing with details open")
+                # Content, not existence: the shell creates the redirect
+                # target before it writes, and a poll can land in between.
+                wait_for(lambda: Path(marker).exists() and Path(marker).stat().st_size > 0,
+                         "remote typing with details open")
                 # The message is the diagnosis: which character was dropped,
                 # doubled or lost its shift is what a failure here has to say.
                 typed = Path(marker).read_text()
