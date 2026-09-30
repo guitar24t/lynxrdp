@@ -129,7 +129,7 @@ never shadows a release. To skip the download and start from the repository:
 curl -fsSL https://guitar24t.github.io/lynxrdp/lynxrdp-packages.asc \
   | sudo gpg --dearmor -o /usr/share/keyrings/lynxrdp-archive-keyring.gpg
 sudo curl -fsSL -o /etc/apt/sources.list.d/lynxrdp.sources \
-  https://guitar24t.github.io/lynxrdp/lynxrdp.sources
+  "https://guitar24t.github.io/lynxrdp/lynxrdp-$(dpkg --print-architecture).sources"
 sudo apt update && sudo apt install lynxrdp-server
 # RHEL / Fedora (curl rather than config-manager: dnf5 on Fedora 41 and
 # later dropped --add-repo, and a plain file works on every version)

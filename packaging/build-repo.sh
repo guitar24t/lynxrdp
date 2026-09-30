@@ -136,7 +136,15 @@ done
 # ---- Keys, definitions, front page ----------------------------------------
 cp "$PUBLIC" "$SITE/lynxrdp-packages.asc"
 gpg --batch --yes --dearmor --output "$SITE/lynxrdp-archive-keyring.gpg" "$PUBLIC"
-cp packaging/repo/lynxrdp.sources "$SITE/lynxrdp.sources"
+# One sources file per architecture the archive carries, since apt fetches
+# every architecture a sources entry names (see the template). The
+# unsuffixed file, kept for anyone who followed older instructions, names
+# none and so behaves as apt's default: every architecture the host has
+# enabled, with a notice for each one the archive lacks.
+for arch in "${!deb_arches[@]}"; do
+    sed "s/@ARCH@/$arch/" packaging/repo/lynxrdp.sources > "$SITE/lynxrdp-$arch.sources"
+done
+grep -v '^Architectures: @ARCH@$' packaging/repo/lynxrdp.sources > "$SITE/lynxrdp.sources"
 # The packaged .repo trusts the key file the package installed; the copy on
 # the site is for hosts that start from the repository, so it fetches the
 # key from the site instead.

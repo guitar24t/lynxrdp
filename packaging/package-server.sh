@@ -35,6 +35,9 @@ export VERSION PRERELEASE ARCH
 mkdir -p target/packaging dist
 gpg --batch --yes --dearmor --output target/packaging/lynxrdp-archive-keyring.gpg \
     packaging/keys/lynxrdp-packages.asc
+# The apt source names the package's own architecture; see the comment in
+# the template for why it must name exactly one.
+sed "s/@ARCH@/$ARCH/" packaging/repo/lynxrdp.sources > target/packaging/lynxrdp.sources
 for cfg in packaging/nfpm-server.yaml packaging/nfpm-client.yaml; do
     for fmt in deb rpm; do
         nfpm package -f "$cfg" -p "$fmt" -t dist/

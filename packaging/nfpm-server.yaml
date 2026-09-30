@@ -80,7 +80,7 @@ contents:
   # format gets its own definition and the public signing key in the form
   # its tools read. The definitions are configuration so an administrator's
   # edit (a mirror, a disabled entry) survives an upgrade.
-  - src: packaging/repo/lynxrdp.sources
+  - src: target/packaging/lynxrdp.sources
     dst: /etc/apt/sources.list.d/lynxrdp.sources
     type: config
     packager: deb

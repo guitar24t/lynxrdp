@@ -437,6 +437,7 @@ jobs:
           # committed key, and the committed key is the one the release
           # workflow will sign with.
           test -f /etc/apt/sources.list.d/lynxrdp.sources
+          grep -qx "Architectures: $(dpkg --print-architecture)" /etc/apt/sources.list.d/lynxrdp.sources
           committed="$(gpg --batch --show-keys --with-colons packaging/keys/lynxrdp-packages.asc | awk -F: '/^fpr/ { print $10; exit }')"
           gpg --batch --show-keys --with-colons /usr/share/keyrings/lynxrdp-archive-keyring.gpg | grep -q "^fpr:.*:$committed:"
           sudo apt-get purge -y -q lynxrdp-server

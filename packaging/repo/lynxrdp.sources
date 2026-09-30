@@ -1,8 +1,18 @@
 # Installed by the lynxrdp-server package so that apt can update it from the
 # repository the release workflow publishes. The keyring beside it is the
 # public half of the key every release signs with; see SECURITY.md.
+#
+# Architectures is what stops apt on a multiarch host (i386 enabled beside
+# amd64, as any machine with Steam or Wine has) from asking this repository
+# for i386 indexes it does not have and printing a notice about it on every
+# update: without the line apt asks every source for every architecture it
+# knows, and with it apt fetches exactly the architectures named. So the
+# line names one, the package's own: package-server.sh fills it in for
+# the .deb and build-repo.sh for the copies the site serves, one per
+# architecture.
 Types: deb
 URIs: https://guitar24t.github.io/lynxrdp/apt
 Suites: stable
 Components: main
+Architectures: @ARCH@
 Signed-By: /usr/share/keyrings/lynxrdp-archive-keyring.gpg

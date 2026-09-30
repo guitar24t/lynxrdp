@@ -30,7 +30,7 @@
 <pre><code>curl -fsSL https://guitar24t.github.io/lynxrdp/lynxrdp-packages.asc \
   | sudo gpg --dearmor -o /usr/share/keyrings/lynxrdp-archive-keyring.gpg
 sudo curl -fsSL -o /etc/apt/sources.list.d/lynxrdp.sources \
-  https://guitar24t.github.io/lynxrdp/lynxrdp.sources
+  "https://guitar24t.github.io/lynxrdp/lynxrdp-$(dpkg --print-architecture).sources"
 sudo apt update &amp;&amp; sudo apt install lynxrdp-server</code></pre>
 
 <h2>RHEL, AlmaLinux, Rocky and Fedora</h2>

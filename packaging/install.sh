@@ -197,7 +197,11 @@ case "$FAMILY" in
         # The site serves the keyring in the binary form Signed-By expects,
         # so a host without gpg can still be set up.
         fetch "$SITE/lynxrdp-archive-keyring.gpg" "$tmp/keyring.gpg"
-        fetch "$SITE/lynxrdp.sources" "$tmp/lynxrdp.sources"
+        # The sources file for this host's architecture alone: one that named
+        # more would have apt fetch indexes for architectures the host does
+        # not have, and one that named none makes a multiarch host ask for
+        # i386 indexes the archive lacks and print a notice each update.
+        fetch "$SITE/lynxrdp-$(dpkg --print-architecture).sources" "$tmp/lynxrdp.sources"
         install -D -m 0644 "$tmp/keyring.gpg" /usr/share/keyrings/lynxrdp-archive-keyring.gpg
         # A host that already has the package has the package's own copy of
         # the definition, possibly edited by its administrator; leave it.
