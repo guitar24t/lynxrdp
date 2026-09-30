@@ -1749,6 +1749,7 @@ impl App {
 
     /// Do what a bar button or its accelerator asks.
     fn run_overlay_action(&mut self, action: overlay::Action, event_loop: &ActiveEventLoop) {
+        log::debug!("bar action {action:?}");
         match action {
             overlay::Action::Transfers => self.open_transfer_panel(),
             overlay::Action::Fullscreen => self.toggle_fullscreen(),
@@ -2379,6 +2380,19 @@ impl App {
     /// is the one part that needs the event loop, and keeping it out is what
     /// lets a test press keys without one.
     fn key_input(&mut self, key: KeyInput<'_>) -> Option<Accelerator> {
+        // One line per key at debug level is what turns "the shortcut does
+        // nothing" into a diagnosis: whether it arrived, how the OS spelled
+        // it, and whether the viewer kept it.
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "key {:?} on {:?} down={} modifiers={:?} accelerator={:?}",
+                key.logical,
+                key.physical,
+                key.down,
+                self.modifiers,
+                self.accelerator(key.logical, key.physical)
+            );
+        }
         if key.down {
             if let Some(acc) = self.accelerator(key.logical, key.physical) {
                 // A held accelerator auto-repeats. The action ran on the
@@ -3155,6 +3169,13 @@ impl ApplicationHandler<Wake> for App {
                 state, button: b, ..
             } => {
                 let down = state == ElementState::Pressed;
+                log::debug!(
+                    "mouse {b:?} down={down} on_bar={} bar_press={} ui_keyboard={} link_up={}",
+                    self.pointer_on_bar,
+                    self.bar_press,
+                    self.ui_keyboard,
+                    self.link_up()
+                );
                 // A press that started on the bar owns its release wherever
                 // that lands, or the session would see a release it never saw
                 // a press for.

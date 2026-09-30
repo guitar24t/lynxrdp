@@ -714,6 +714,15 @@ impl Overlay {
         if want == self.visible {
             return false;
         }
+        log::debug!(
+            "bar {}: pinned={} pointed={} focused={} on_bar={} dwelt={}",
+            if want { "shown" } else { "hidden" },
+            self.pinned,
+            pointed,
+            self.focused,
+            self.on_bar,
+            dwelt
+        );
         self.visible = want;
         if !want {
             self.hover = None;
@@ -753,6 +762,26 @@ impl Overlay {
                 self.hover,
                 self.armed,
             );
+        }
+        // Where the buttons are, in window pixels, each time that changes.
+        // The positions depend on the window width and on how much status
+        // text fits, so a test that wants to click one reads them from here
+        // rather than guessing; tools/check-session-ui.py does. Logged as the
+        // bar is painted rather than as it is raised, because the layout
+        // only exists once it has been painted.
+        if log::log_enabled!(log::Level::Debug)
+            && self.layout.as_ref().map(|l| &l.buttons) != Some(&layout.buttons)
+        {
+            for b in &layout.buttons {
+                log::debug!(
+                    "bar button {:?} at x={} y={} w={} h={}",
+                    b.action,
+                    b.rect.x,
+                    b.rect.y + self.top_inset,
+                    b.rect.width,
+                    b.rect.height
+                );
+            }
         }
         self.layout = Some(layout);
         self.painted = Some(bar);

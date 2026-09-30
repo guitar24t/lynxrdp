@@ -7,10 +7,13 @@ On WSL, use a mount namespace with a writable /tmp/.X11-unix.
 """
 import argparse
 import os
+import re
 from pathlib import Path
 import select
 import socket
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -42,6 +45,27 @@ def find_window(class_name, env, timeout=15):
     return run(args, env).splitlines()[0]
 
 
+def bar_button(log_path, action, timeout=15):
+    """Centre of a bar button, from the client's own layout log line.
+
+    The bar logs every button's rectangle as it comes up, so this also waits
+    for the reveal itself; the dwell is REVEAL_DELAY and the line follows
+    within a tick of it.
+    """
+    pattern = re.compile(rf"bar button {action} at x=(\d+) y=(\d+) w=(\d+) h=(\d+)")
+    found = []
+
+    def seen():
+        matches = pattern.findall(Path(log_path).read_text(errors="replace"))
+        if matches:
+            found[:] = [int(v) for v in matches[-1]]
+        return bool(matches)
+
+    wait_for(seen, f"the bar to come up with a {action} button", timeout)
+    x, y, w, h = found
+    return x + w // 2, y + h // 2
+
+
 def window_size(window, env):
     fields = dict(line.split("=", 1) for line in run(
         ["xdotool", "getwindowgeometry", "--shell", window], env
@@ -56,6 +80,11 @@ def check(bin_dir):
             try:
                 local_env = dict(os.environ, XDG_RUNTIME_DIR=tmp)
                 local_env.pop("WAYLAND_DISPLAY", None)
+                # The client's debug log is how this check learns where the
+                # bar's buttons are (see bar_button below); a bare "info" would
+                # leave it guessing at coordinates that depend on the window
+                # width and the status text.
+                local_env.setdefault("RUST_LOG", "info,lynxrdp_client=debug")
                 display = subprocess.Popen(
                     ["Xvfb", "-displayfd", "1", "-screen", "0", "1200x900x24", "-nolisten", "tcp"],
                     stdout=subprocess.PIPE, stderr=log, text=True,
@@ -152,11 +181,13 @@ def check(bin_dir):
                 # The Transfers panel opens from the bar, the way a user opens
                 # it: the pointer parks in the hot zone at the top edge, the
                 # bar comes up after its reveal delay, and the button is
-                # clicked. The rectangle is the crate's own layout for a
-                # 1000-pixel-wide window at scale 1 (overlay::bar_layout).
+                # clicked where the client says it is. A fixed coordinate once
+                # landed on Ctrl+Alt+Del instead, because the buttons move
+                # with the window width and the status text.
                 run(["xdotool", "mousemove", "--window", window, "500", "1"], local_env)
-                time.sleep(1.0)  # past overlay::REVEAL_DELAY (600 ms)
-                run(["xdotool", "mousemove", "--window", window, "794", "12", "click", "1"], local_env)
+                log.flush()
+                x, y = bar_button(tmp + "/test.log", "Transfers")
+                run(["xdotool", "mousemove", "--window", window, str(x), str(y), "click", "1"], local_env)
                 time.sleep(0.5)  # Let egui position and paint the details window.
                 # Details stay open on the right. Click the desktop on the left.
                 run(["xdotool", "mousemove", "--window", window, "100", "200", "click", "1"], local_env)
@@ -233,8 +264,21 @@ def check(bin_dir):
                 )
                 print("PASS: fixed-resolution mode preserves server-controlled window sizing.")
             except Exception:
+                # The client's and session's own words are the diagnosis a
+                # bare traceback lacks; the directory is gone once this
+                # block ends, so they are printed here or never. xkbcomp's
+                # keysym warnings are dropped because they are most of it.
                 log.flush()
-                print(Path(tmp + "/test.log").read_text()[-6000:])
+                # The whole log, for a developer who wants more than the tail.
+                keep = os.environ.get("LYNXRDP_UI_CHECK_LOG")
+                if keep:
+                    shutil.copyfile(tmp + "/test.log", keep)
+                lines = Path(tmp + "/test.log").read_text(errors="replace").splitlines()
+                noise = ("xkbcomp", "Could not resolve keysym", "tracing::span", "winit::window",
+                         "DEBUG lynxrdp_client::gui_paint", "DEBUG lynxrdp_client::outbound")
+                kept = [l for l in lines if not any(n in l for n in noise)]
+                print("---- last lines of the client and session logs ----", file=sys.stderr)
+                print("\n".join(kept[-120:]), file=sys.stderr)
                 raise
             finally:
                 for process in reversed(children):
