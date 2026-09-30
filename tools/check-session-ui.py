@@ -103,19 +103,21 @@ def check(bin_dir):
                 window = find_window("lynxrdp", local_env, timeout=60)
                 run(["xdotool", "windowfocus", window], local_env)
                 # Ctrl+Alt+T is the desktop's terminal shortcut and must reach
-                # the session, so the check proves exactly that: xterm binds
-                # nothing to it and turns it into the control character ^T
-                # followed by nothing useful, but a shell reads the keystroke
-                # and `bind -x` runs a command for it. The marker's content
-                # is what tells a swallowed shortcut from a delivered one.
+                # the session, so the check proves exactly that. xterm turns
+                # Alt into readline's Meta prefix, so the shell sees the
+                # keystroke as ESC C-t and `bind -x` can run a command for
+                # it. Bare C-t gets its own marker, so a viewer that forwarded
+                # the key but dropped Alt is told apart from one that ate it.
                 seen = tmp + "/ctrl-alt-t-arrived"
                 run(["xdotool", "type", "--clearmodifiers", "--delay", "15",
-                     f"bind -x '\"\\C-t\": printf ARRIVED > {seen}'"], local_env)
+                     f"bind -x '\"\\e\\C-t\": printf ARRIVED > {seen}'; "
+                     f"bind -x '\"\\C-t\": printf NO-ALT > {seen}'"], local_env)
                 run(["xdotool", "key", "Return"], local_env)
                 time.sleep(0.3)
                 run(["xdotool", "key", "ctrl+alt+t"], local_env)
                 wait_for(lambda: Path(seen).exists(), "Ctrl+Alt+T reaching the remote shell")
-                assert Path(seen).read_text() == "ARRIVED"
+                got = Path(seen).read_text()
+                assert got == "ARRIVED", f"the remote shell saw {got!r} for Ctrl+Alt+T"
                 assert client.poll() is None, "Client exited on Ctrl+Alt+T"
                 print("PASS: Ctrl+Alt+T is forwarded to the session, not taken by the viewer.")
                 # The Transfers panel opens from the bar, the way a user opens
