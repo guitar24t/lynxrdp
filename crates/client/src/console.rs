@@ -16,6 +16,14 @@
 //! One visible difference remains, and it is inherent to the subsystem rather
 //! than to this code: `cmd.exe` does not wait for a GUI-subsystem process, so
 //! it returns to the prompt while the output is still arriving.
+//!
+//! The same subsystem choice has a second cost, on the other side of the
+//! process tree: a console program started by a process with no console --
+//! `ssh.exe`, started by a session the launcher opened from Explorer -- is
+//! given a brand new console, and that one is visible. It stayed on the
+//! screen for as long as the tunnel did. [`hide_child_console`] is the other
+//! half of the arrangement: it stops the child from opening a window, and
+//! only when there is no console of ours for the child to join instead.
 
 /// Attach to the parent process's console, if it has one.
 ///
@@ -108,3 +116,36 @@ pub fn attach_to_parent() {
 /// Nothing to do: every other platform starts with usable standard handles.
 #[cfg(not(windows))]
 pub fn attach_to_parent() {}
+
+/// Keep a console program `command` starts from opening a console window.
+///
+/// Only when this process has no console. If it has one -- the command line
+/// case, where [`attach_to_parent`] joined the terminal -- the child inherits
+/// it and prints and prompts where the user is looking, and the flag would
+/// take that away: `CREATE_NO_WINDOW` gives the child a hidden console of its
+/// own rather than the parent's, and ssh's prompt would go into it unseen.
+/// Without one, the child gets the hidden console instead of the visible one
+/// Windows would otherwise create for it, and prompts reach the user through
+/// the askpass helper as they already do for the connection manager's ssh.
+///
+/// Call after [`attach_to_parent`]: it decides by whether that found a
+/// console.
+#[cfg(windows)]
+pub fn hide_child_console(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+
+    /// CREATE_NO_WINDOW
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // SAFETY: plain FFI with no arguments; a process without a console gets a
+    // null handle back, which is the answer this wants.
+    let has_console = !unsafe { GetConsoleWindow() }.is_null();
+    if !has_console {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+/// Nothing to do: no other platform opens a window for a child process.
+#[cfg(not(windows))]
+pub fn hide_child_console(_command: &mut std::process::Command) {}

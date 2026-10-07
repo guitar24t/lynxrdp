@@ -774,6 +774,10 @@ impl Tunnel {
         for (k, v) in &cfg.env {
             command.env(k, v);
         }
+        // Started by a session with no console -- one the launcher opened
+        // from Explorer -- ssh would otherwise be handed a visible console
+        // window of its own for the life of the tunnel.
+        crate::console::hide_child_console(&mut command);
         let child = spawn_ssh(command).with_context(|| {
             format!(
                 "could not run '{}'; is an OpenSSH client installed?",

@@ -381,7 +381,12 @@ Real failures from this repo, each of which passed on Linux first:
 - **The Windows client is built for the GUI subsystem**
   (`#![windows_subsystem = "windows"]`), so it does not flash a console from
   Explorer. `console.rs` reattaches to the parent terminal to keep the command
-  line working — if you add early output, make sure it still lands there.
+  line working — if you add early output, make sure it still lands there. The
+  flip side: a console program started by a process *without* a console gets
+  a visible one of its own, which is how the tunnel's `ssh.exe` once kept a
+  console window open for the whole session. Spawn console programs through
+  `console::hide_child_console`, which applies `CREATE_NO_WINDOW` only when
+  there is no console of ours to inherit.
 - Clipboard file lists have no cross-platform crate: X11 `text/uri-list`,
   Windows `CF_HDROP`, macOS `NSPasteboard`, three implementations in
   `fileclip.rs` behind one interface. A change to one usually needs all three.
