@@ -1687,7 +1687,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lynxrdp-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1724,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "lynxrdp-filecopy"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "lynxrdp-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "log",
  "lz4_flex",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "lynxrdp-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
