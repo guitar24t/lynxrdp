@@ -78,13 +78,7 @@ impl Outbound {
         }
         let sender = self.sender.as_ref().context("connection writer closed")?;
         let size = bytes.len();
-        if self
-            .queued_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                n.checked_add(size).filter(|total| *total <= MAX_BYTES)
-            })
-            .is_err()
-        {
+        if !self.reserve(size) {
             return self.fail("outgoing connection stalled: byte queue limit reached");
         }
         if sender.try_send(bytes).is_err() {
@@ -92,6 +86,30 @@ impl Outbound {
             return self.fail("outgoing connection stalled: message queue unavailable");
         }
         Ok(())
+    }
+
+    /// Add `size` to the queued byte count unless that would pass the limit.
+    ///
+    /// Spelled out as a compare-exchange loop rather than `fetch_update`,
+    /// which stable Rust deprecated in favour of a `try_update` that is newer
+    /// than this workspace's minimum toolchain -- so neither name compiles
+    /// warning-free on both ends.
+    fn reserve(&self, size: usize) -> bool {
+        let mut queued = self.queued_bytes.load(Ordering::Relaxed);
+        loop {
+            let Some(total) = queued.checked_add(size).filter(|t| *t <= MAX_BYTES) else {
+                return false;
+            };
+            match self.queued_bytes.compare_exchange_weak(
+                queued,
+                total,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(now) => queued = now,
+            }
+        }
     }
 
     fn fail(&self, reason: &str) -> Result<()> {
