@@ -6,6 +6,7 @@ pub mod cursor;
 pub(crate) mod drop;
 mod empty_drop;
 pub mod input;
+pub mod repaint;
 pub mod resize;
 
 use std::sync::Mutex;

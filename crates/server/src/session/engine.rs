@@ -55,6 +55,7 @@ use crate::x11::capture::{coalesce, DamageTracker, ScreenCapture};
 use crate::x11::clipboard::{Clipboard, ClipboardEvent};
 use crate::x11::cursor::CursorTracker;
 use crate::x11::input::InputInjector;
+use crate::x11::repaint::Repainter;
 use crate::x11::resize::resize_screen;
 use crate::x11::XDisplay;
 use crate::SERVER_NAME;
@@ -395,6 +396,10 @@ pub struct Core {
     /// Captures in a row that failed on stale root geometry; see
     /// [`STALE_CAPTURE_LIMIT`].
     stale_captures: u32,
+    /// Kicks a compositor whose frame clock stalled across a root resize;
+    /// see `x11::repaint`. Optional because a display without XFIXES cannot
+    /// announce its compositor, and the session is still worth having.
+    repainter: Option<Repainter>,
 }
 
 /// Why the core loop stopped.
@@ -479,6 +484,13 @@ impl Core {
             .ok();
         let fileio =
             FileIo::spawn(events_tx.clone()).context("starting the session file worker")?;
+        let repainter = match Repainter::new(display.clone()) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                log::warn!("compositor repaint nudges disabled: {e:#}");
+                None
+            }
+        };
         log::info!(
             "session core ready: {w}x{h}, shm={}, cursor={}, clipboard={}, max_fps={}, \
              in_flight={}{}",
@@ -525,6 +537,7 @@ impl Core {
             served: (w, h),
             capture_max,
             stale_captures: 0,
+            repainter,
         })
     }
 
@@ -701,6 +714,17 @@ impl Core {
                 log::debug!("X error: {e:?}");
             }
             _ => {}
+        }
+        if let Some(r) = self.repainter.as_mut() {
+            if r.handle_event(&ev) {
+                // The desktop's compositor has just taken the screen. If a
+                // resize landed while it was starting, the redraw it owes may
+                // never come on its own; the nudges this arms see that it does.
+                log::info!("a compositing manager has taken the screen");
+                if let Err(e) = r.tick() {
+                    log::warn!("compositor repaint nudge failed: {e:#}");
+                }
+            }
         }
         if self.clipboard.is_some() {
             // Clipboard failures are logged, never propagated. `?` here reaches
@@ -1672,6 +1696,17 @@ impl Core {
             }
         }
         log::info!("screen is now {w}x{h}");
+        // Whoever changed the size, the compositor now owes a redraw of the
+        // whole stage, and a resize that lands while it is starting is the
+        // one it can lose. Our own full refresh above resends what the X
+        // server holds; this is what makes sure that is a desktop and not
+        // the black it holds until the compositor paints.
+        if let Some(r) = self.repainter.as_mut() {
+            r.screen_changed();
+            if let Err(e) = r.tick() {
+                log::warn!("compositor repaint nudge failed: {e:#}");
+            }
+        }
     }
 
     /// Send a frame if one is due, and sync the pointer position.
@@ -1855,6 +1890,17 @@ impl Core {
 
         let outcome = self.transfers.poll();
         self.apply_transfer_outcome(outcome);
+
+        // Nudges due since the last tick. Not fatal: this is a courtesy to
+        // the compositor, and a failure here is an X error on a one-pixel
+        // window of ours, which is no reason to end the user's desktop.
+        if let Some(r) = self.repainter.as_mut() {
+            if !r.is_idle() {
+                if let Err(e) = r.tick() {
+                    log::warn!("compositor repaint nudge failed: {e:#}");
+                }
+            }
+        }
 
         // A selection owner that has wedged sends nothing, and an idle desktop
         // produces no other X events either, so `handle_event` never runs and

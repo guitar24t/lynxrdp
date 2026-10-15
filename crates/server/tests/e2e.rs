@@ -326,34 +326,41 @@ struct KeySink {
     keysyms: Vec<u32>,
 }
 
+/// An ordinary X client connection to the session's display, with the
+/// session's private cookie handed over directly.
+///
+/// `RustConnection::connect` finds a cookie through the `XAUTHORITY`
+/// variable, and that is process-wide: with the suite running its tests on
+/// two threads, two of these setting it and then connecting can each read the
+/// other's file and be refused by the wrong Xvfb. So resolve the display the
+/// way x11rb does and skip only the environment lookup. Returns the
+/// connection and its screen number.
+fn x_connection(s: &Session) -> (x11rb::rust_connection::RustConnection, usize) {
+    use x11rb::reexports::x11rb_protocol::parse_display::parse_display;
+    use x11rb::rust_connection::{DefaultStream, RustConnection};
+    let display = parse_display(Some(&s.display)).expect("parse display");
+    let (stream, _peer) = display
+        .connect_instruction()
+        .find_map(|addr| DefaultStream::connect(&addr).ok())
+        .expect("connect display socket");
+    let screen_num = usize::from(display.screen);
+    let conn = RustConnection::connect_to_stream_with_auth_info(
+        stream,
+        screen_num,
+        b"MIT-MAGIC-COOKIE-1".to_vec(),
+        cookie_from(&s.xauth()),
+    )
+    .expect("connect display");
+    (conn, screen_num)
+}
+
 impl KeySink {
     fn open(s: &Session) -> Self {
         use x11rb::connection::Connection;
         use x11rb::protocol::xproto::{
             ConnectionExt as _, CreateWindowAux, EventMask, InputFocus, WindowClass,
         };
-        use x11rb::reexports::x11rb_protocol::parse_display::parse_display;
-        use x11rb::rust_connection::{DefaultStream, RustConnection};
-        // Connect as an ordinary X client with the session's private cookie
-        // handed over directly. `RustConnection::connect` finds a cookie
-        // through the `XAUTHORITY` variable, and that is process-wide: with
-        // the suite running its tests on two threads, two of these setting
-        // it and then connecting can each read the other's file and be
-        // refused by the wrong Xvfb. So resolve the display the way x11rb
-        // does and skip only the environment lookup.
-        let display = parse_display(Some(&s.display)).expect("parse display");
-        let (stream, _peer) = display
-            .connect_instruction()
-            .find_map(|addr| DefaultStream::connect(&addr).ok())
-            .expect("connect display socket");
-        let screen_num = usize::from(display.screen);
-        let conn = RustConnection::connect_to_stream_with_auth_info(
-            stream,
-            screen_num,
-            b"MIT-MAGIC-COOKIE-1".to_vec(),
-            cookie_from(&s.xauth()),
-        )
-        .expect("connect display");
+        let (conn, screen_num) = x_connection(s);
         let setup = conn.setup();
         let root = setup.roots[screen_num].root;
         let (min, max) = (setup.min_keycode, setup.max_keycode);
@@ -685,6 +692,236 @@ fn initial_size_can_shrink_one_axis_while_growing_the_other() {
     assert!(wait_for(&mut c, Duration::from_secs(10), |ev, c| {
         matches!(ev, ClientEvent::Frame { .. }) && c.size() == (1728, 1084)
     }));
+}
+
+/// What a compositing window manager would see of the session: the windows
+/// mapped and unmapped on the root. Used to check that the session nudges a
+/// compositor after a resize the way `x11::repaint` says it does -- by
+/// mapping a one-pixel override-redirect window and taking it down again.
+struct RootWatcher {
+    conn: x11rb::rust_connection::RustConnection,
+    root: u32,
+    screen_num: usize,
+}
+
+/// One map or unmap of a child of the root, as the watcher saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nudge {
+    Map {
+        window: u32,
+        override_redirect: bool,
+    },
+    Unmap {
+        window: u32,
+    },
+}
+
+impl RootWatcher {
+    fn open(s: &Session) -> Self {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _, EventMask};
+        let (conn, screen_num) = x_connection(s);
+        let root = conn.setup().roots[screen_num].root;
+        conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+        Self {
+            conn,
+            root,
+            screen_num,
+        }
+    }
+
+    /// Every map and unmap of a root child seen within `timeout`, or until
+    /// `enough` of them have been.
+    fn collect(&self, timeout: Duration, enough: usize) -> Vec<(Instant, Nudge)> {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::Event;
+        let deadline = Instant::now() + timeout;
+        let mut out = Vec::new();
+        while Instant::now() < deadline && out.len() < enough {
+            match self.conn.poll_for_event().unwrap() {
+                Some(Event::MapNotify(e)) if e.event == self.root => out.push((
+                    Instant::now(),
+                    Nudge::Map {
+                        window: e.window,
+                        override_redirect: e.override_redirect,
+                    },
+                )),
+                Some(Event::UnmapNotify(e)) if e.event == self.root => {
+                    out.push((Instant::now(), Nudge::Unmap { window: e.window }))
+                }
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        out
+    }
+
+    /// Announce a compositing manager the way one does: by owning the
+    /// `_NET_WM_CM_S<screen>` selection.
+    fn claim_compositor(&self) {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+        let window = self.conn.generate_id().unwrap();
+        self.conn
+            .create_window(
+                x11rb::COPY_DEPTH_FROM_PARENT,
+                window,
+                self.root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WindowClass::INPUT_ONLY,
+                x11rb::COPY_FROM_PARENT,
+                &CreateWindowAux::new(),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        let name = format!("_NET_WM_CM_S{}", self.screen_num);
+        let atom = self
+            .conn
+            .intern_atom(false, name.as_bytes())
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        self.conn
+            .set_selection_owner(window, atom, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        self.conn.flush().unwrap();
+    }
+}
+
+/// The windows a series of nudges mapped, checked for shape: all the same
+/// one-pixel override-redirect window, each map followed by its unmap.
+fn assert_nudge_series(seen: &[(Instant, Nudge)], at_least: usize) {
+    let maps: Vec<u32> = seen
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Nudge::Map {
+                window,
+                override_redirect: true,
+            } => Some(*window),
+            Nudge::Map {
+                override_redirect: false,
+                ..
+            } => panic!("a nudge window was not override-redirect: {seen:?}"),
+            Nudge::Unmap { .. } => None,
+        })
+        .collect();
+    assert!(
+        maps.len() >= at_least,
+        "expected at least {at_least} nudges, saw {}: {seen:?}",
+        maps.len()
+    );
+    assert!(
+        maps.windows(2).all(|w| w[0] == w[1]),
+        "nudges should reuse one window: {seen:?}"
+    );
+    let unmaps = seen
+        .iter()
+        .filter(|(_, n)| matches!(n, Nudge::Unmap { window } if *window == maps[0]))
+        .count();
+    assert!(
+        unmaps + 1 >= maps.len(),
+        "every nudge but perhaps the last should have been unmapped again: {seen:?}"
+    );
+}
+
+/// A root resize while GNOME was starting once left the desktop black: every
+/// process healthy, the shell owing a full redraw at the new size, and its
+/// frame clock never ticking to paint it -- until something mapped a window.
+/// So after a resize the session maps one, more than once, spread over the
+/// seconds a compositor takes to come up behind the resize that stalled it.
+#[test]
+fn a_root_resize_nudges_the_compositor_to_repaint() {
+    require_x_tools!();
+    let s = Session::start(640, 480, "none", &[]);
+    let mut c = s.connect(None);
+    s.x("xsetroot", &["-solid", "#336699"]);
+    assert!(wait_for(&mut c, Duration::from_secs(5), |_, c| c
+        .framebuffer()
+        .get(0, 0)
+        == 0x336699));
+    let watcher = RootWatcher::open(&s);
+    // Nothing is mapped on a quiet root: the series must be caused by the
+    // resize, not by the session's ordinary startup.
+    assert!(
+        watcher.collect(Duration::from_millis(500), 1).is_empty(),
+        "a root child was mapped before any resize"
+    );
+
+    let started = Instant::now();
+    c.request_resize(800, 600).unwrap();
+    assert!(wait_for(&mut c, Duration::from_secs(10), |ev, _| matches!(
+        ev,
+        ClientEvent::Resized {
+            width: 800,
+            height: 600
+        }
+    )));
+    // Three maps and three unmaps, the last pair due three seconds after
+    // the resize; give the housekeeping tick room to deliver it.
+    let seen = watcher.collect(Duration::from_secs(5), 6);
+    assert_nudge_series(&seen, 3);
+    let first = seen
+        .iter()
+        .find(|(_, n)| matches!(n, Nudge::Map { .. }))
+        .map(|(at, _)| *at)
+        .unwrap();
+    assert!(
+        first.duration_since(started) < Duration::from_secs(1),
+        "the first nudge should follow the resize at once, not {:?} later",
+        first.duration_since(started)
+    );
+
+    // Without a compositor, the nudge window shows the root's own
+    // background and is gone again within a tick, so the picture the client
+    // holds is the plain root colour -- at the top-left corner where the
+    // window was, as everywhere else.
+    assert!(wait_for(&mut c, Duration::from_secs(10), |_, c| c
+        .framebuffer()
+        .get(799, 599)
+        == 0x336699));
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        let _ = c.poll_event(Duration::from_millis(50));
+    }
+    assert_eq!(c.framebuffer().get(0, 0), 0x336699);
+}
+
+/// The compositor that needs nudging is the one that was still starting
+/// when the resize landed, so its arrival -- it owns `_NET_WM_CM_S0` from
+/// the moment it can composite -- arms a series of its own.
+#[test]
+fn a_compositor_arriving_late_is_nudged_too() {
+    require_x_tools!();
+    let s = Session::start(640, 480, "none", &[]);
+    let mut c = s.connect(None);
+    assert!(wait_for(&mut c, Duration::from_secs(5), |ev, _| matches!(
+        ev,
+        ClientEvent::Frame { .. }
+    )));
+    let watcher = RootWatcher::open(&s);
+    assert!(
+        watcher.collect(Duration::from_millis(500), 1).is_empty(),
+        "a root child was mapped before any compositor appeared"
+    );
+    watcher.claim_compositor();
+    let seen = watcher.collect(Duration::from_secs(5), 6);
+    // The claim maps the compositor's own selection window too; it is
+    // INPUT_ONLY and never mapped, so what the watcher sees is the session's.
+    assert_nudge_series(&seen, 3);
 }
 
 #[test]

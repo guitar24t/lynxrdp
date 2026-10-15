@@ -359,6 +359,18 @@ not a style question.
   old key whose packages carry the new public file, then replace the
   secret; a server that skipped that release reinstalls from the releases
   page.
+- **A root resize is followed by compositor nudges, and they stay.** The
+  session resends the whole screen after a size change, but what it resends
+  is the X server's framebuffer, and a compositor whose frame clock stalled
+  across the change has not painted into it yet -- a GNOME session reached
+  this way was black for as long as anyone waited, with every process
+  healthy, until something mapped a window. `x11/repaint.rs` maps and unmaps
+  a one-pixel override-redirect window of its own after every resize and
+  again when `_NET_WM_CM_S0` changes hands, spread over a few seconds so a
+  compositor still starting at the resize is caught too. The e2e tests
+  watch the root for exactly that series. Do not "tidy" the repeats into a
+  single nudge: the one sent at the resize is the one a starting compositor
+  is guaranteed to miss.
 
 ## Platform traps
 
