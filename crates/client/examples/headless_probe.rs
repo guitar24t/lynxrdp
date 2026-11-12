@@ -52,7 +52,10 @@ fn main() {
                 width: w,
                 height: h,
             })) => {
-                println!("{:>6.2}s resized to {w}x{h}", started.elapsed().as_secs_f64());
+                println!(
+                    "{:>6.2}s resized to {w}x{h}",
+                    started.elapsed().as_secs_f64()
+                );
                 // The real client's fullscreen viewport does not change size
                 // because the desktop applied a mode of its own: it asks for
                 // its own size back, which is the burst being reproduced.
