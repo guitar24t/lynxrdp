@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xproto::{self, ConnectionExt as _, ImageOrder, VisualClass};
-use x11rb::protocol::{damage, randr, shm, xfixes, xtest};
+use x11rb::protocol::{composite, damage, randr, shm, xfixes, xtest};
 use x11rb::rust_connection::RustConnection;
 
 /// A connection to the session's X server plus the facts we need about it.
@@ -44,6 +44,9 @@ pub struct Extensions {
     pub xtest: bool,
     /// RANDR (resizing).
     pub randr: bool,
+    /// Composite 0.3 or later (the overlay window, where a compositing
+    /// manager keeps the stage that `repaint` exposes).
+    pub composite: bool,
 }
 
 impl XDisplay {
@@ -99,6 +102,7 @@ impl XDisplay {
             xfixes: has(xfixes::X11_EXTENSION_NAME)?,
             xtest: has(xtest::X11_EXTENSION_NAME)?,
             randr: has(randr::X11_EXTENSION_NAME)?,
+            composite: has(composite::X11_EXTENSION_NAME)?,
         };
         // Version negotiation: XFIXES and DAMAGE require it before use.
         if ext.xfixes {
@@ -135,6 +139,16 @@ impl XDisplay {
                     v.minor_version
                 );
                 ext.randr = false;
+            }
+        }
+        if ext.composite {
+            // GetOverlayWindow arrived in 0.3; a server older than that has
+            // no overlay for a compositor to keep its stage in anyway.
+            let v = composite::query_version(&conn, 0, 4)?
+                .reply()
+                .context("composite version")?;
+            if (v.major_version, v.minor_version) < (0, 3) {
+                ext.composite = false;
             }
         }
         if ext.xtest {

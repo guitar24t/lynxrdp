@@ -361,16 +361,27 @@ not a style question.
   page.
 - **A root resize is followed by compositor nudges, and they stay.** The
   session resends the whole screen after a size change, but what it resends
-  is the X server's framebuffer, and a compositor whose frame clock stalled
-  across the change has not painted into it yet -- a GNOME session reached
-  this way was black for as long as anyone waited, with every process
-  healthy, until something mapped a window. `x11/repaint.rs` maps and unmaps
-  a one-pixel override-redirect window of its own after every resize and
-  again when `_NET_WM_CM_S0` changes hands, spread over a few seconds so a
-  compositor still starting at the resize is caught too. The e2e tests
-  watch the root for exactly that series. Do not "tidy" the repeats into a
-  single nudge: the one sent at the resize is the one a starting compositor
-  is guaranteed to miss.
+  is the X server's framebuffer, and a compositor caught by the change may
+  never paint a full frame into it again -- a GNOME session reached this
+  way was black for as long as anyone waited, with every process healthy,
+  mutter pasting only newly changed rectangles onto a stage window the
+  resize had emptied. `x11/repaint.rs` sends an `Expose` over the whole
+  stage window (the children of the Composite overlay) after every resize
+  and again when `_NET_WM_CM_S0` changes hands, spread over a few seconds so
+  a compositor still starting at the resize is caught too, and once more
+  whenever the screen is still all black within a minute of the compositor
+  arriving. The e2e tests stand in a compositor and watch its stage for
+  exactly that series. Do not "tidy" the repeats into a single nudge: the
+  one sent at the resize is the one a starting compositor is guaranteed to
+  miss. And do not go back to mapping a hint window: that queues a redraw
+  of the hint's own pixels, which is precisely what a probe of the black
+  session saw mutter do with a new window, and nothing more. To see any of
+  this against a real compositor, `crates/client/examples/headless_probe.rs`
+  holds a connection and prints how much of the picture is black
+  (`PROBE_BURST_MS` times a resize burst into the shell's startup); painting
+  the stage window black from another X client puts a healthy GNOME into
+  exactly the state the field showed, and a fixed session heals it within a
+  second where 0.1.3 never did.
 
 ## Platform traps
 

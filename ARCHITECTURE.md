@@ -121,14 +121,17 @@ Root resizes are adopted from `RRScreenChangeNotify`, whoever caused them
 a saved layout), and every adoption is followed by a full refresh. That
 resends what the X server holds -- which is only a desktop once the
 compositor has painted one. A resize that lands while GNOME Shell is
-starting can leave its frame clock stalled with a whole-stage redraw
-pending, and the session then faithfully serves a black screen from a
-healthy desktop. `x11/repaint.rs` is the answer: after every root size
-change, and again when a compositing manager takes `_NET_WM_CM_S0`, the
-session maps and unmaps a one-pixel override-redirect window a few times
-over the next seconds. A compositor accounts for a new window by redrawing
-its stage, which paints whatever was owed; without a compositor the window
-shows the root's own background and the encoder has nothing to send.
+starting can leave its stage window empty with no full frame ever queued
+-- mutter presents only the rectangles that changed, and software GL
+gives it no buffer age to notice the loss by -- and the session then
+faithfully serves a black screen from a healthy desktop. `x11/repaint.rs`
+is the answer: after every root size change, and again when a compositing
+manager takes `_NET_WM_CM_S0`, the session sends an `Expose` over the
+whole of the compositor's stage window (the children of the Composite
+overlay) a few times over the next seconds, which mutter answers with a
+full redraw and a full swap. For a minute after the compositor arrives an
+entirely black screen earns another. Without a compositor there is no
+stage and nothing is sent.
 
 ## Protocol
 

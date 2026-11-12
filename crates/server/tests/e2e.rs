@@ -694,67 +694,104 @@ fn initial_size_can_shrink_one_axis_while_growing_the_other() {
     }));
 }
 
-/// What a compositing window manager would see of the session: the windows
-/// mapped and unmapped on the root. Used to check that the session nudges a
-/// compositor after a resize the way `x11::repaint` says it does -- by
-/// mapping a one-pixel override-redirect window and taking it down again.
-struct RootWatcher {
+/// A compositing manager, as far as the session can tell: it owns
+/// `_NET_WM_CM_S<screen>` and keeps a stage window under the Composite
+/// overlay, the way mutter does. Used to check that the session asks such a
+/// stage to repaint after a resize the way `x11::repaint` says it does -- by
+/// exposing the whole of it.
+struct CompositorStandIn {
     conn: x11rb::rust_connection::RustConnection,
     root: u32,
     screen_num: usize,
+    stage: u32,
+    width: u16,
+    height: u16,
 }
 
-/// One map or unmap of a child of the root, as the watcher saw it.
+/// One `Expose` the stand-in's stage received.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Nudge {
-    Map {
-        window: u32,
-        override_redirect: bool,
-    },
-    Unmap {
-        window: u32,
-    },
+struct Exposed {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
 }
 
-impl RootWatcher {
+impl CompositorStandIn {
+    /// Take the overlay and map a stage window the size of the root under
+    /// it, listening for exposes; nothing is claimed yet.
     fn open(s: &Session) -> Self {
         use x11rb::connection::Connection;
-        use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _, EventMask};
+        use x11rb::protocol::composite::ConnectionExt as _;
+        use x11rb::protocol::xproto::{
+            ConnectionExt as _, CreateWindowAux, EventMask, WindowClass,
+        };
         let (conn, screen_num) = x_connection(s);
-        let root = conn.setup().roots[screen_num].root;
-        conn.change_window_attributes(
-            root,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::SUBSTRUCTURE_NOTIFY),
+        let screen = &conn.setup().roots[screen_num];
+        let (root, width, height) = (screen.root, screen.width_in_pixels, screen.height_in_pixels);
+        let overlay = conn
+            .composite_get_overlay_window(root)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .overlay_win;
+        let stage = conn.generate_id().unwrap();
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            stage,
+            overlay,
+            0,
+            0,
+            width,
+            height,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new()
+                .background_pixel(0x224466)
+                .event_mask(EventMask::EXPOSURE),
         )
         .unwrap()
         .check()
         .unwrap();
-        Self {
+        conn.map_window(stage).unwrap().check().unwrap();
+        conn.flush().unwrap();
+        let this = Self {
             conn,
             root,
             screen_num,
-        }
+            stage,
+            width,
+            height,
+        };
+        // Mapping exposes the window once on its own; that one is not the
+        // session's doing.
+        let initial = this.collect(Duration::from_secs(2), 1);
+        assert!(
+            !initial.is_empty(),
+            "the stage was mapped but never exposed"
+        );
+        this
     }
 
-    /// Every map and unmap of a root child seen within `timeout`, or until
-    /// `enough` of them have been.
-    fn collect(&self, timeout: Duration, enough: usize) -> Vec<(Instant, Nudge)> {
+    /// Every expose of the stage seen within `timeout`, or until `enough`
+    /// of them have been.
+    fn collect(&self, timeout: Duration, enough: usize) -> Vec<(Instant, Exposed)> {
         use x11rb::connection::Connection;
         use x11rb::protocol::Event;
         let deadline = Instant::now() + timeout;
         let mut out = Vec::new();
         while Instant::now() < deadline && out.len() < enough {
             match self.conn.poll_for_event().unwrap() {
-                Some(Event::MapNotify(e)) if e.event == self.root => out.push((
+                Some(Event::Expose(e)) if e.window == self.stage => out.push((
                     Instant::now(),
-                    Nudge::Map {
-                        window: e.window,
-                        override_redirect: e.override_redirect,
+                    Exposed {
+                        x: e.x,
+                        y: e.y,
+                        width: e.width,
+                        height: e.height,
                     },
                 )),
-                Some(Event::UnmapNotify(e)) if e.event == self.root => {
-                    out.push((Instant::now(), Nudge::Unmap { window: e.window }))
-                }
                 Some(_) => {}
                 None => std::thread::sleep(Duration::from_millis(10)),
             }
@@ -762,7 +799,7 @@ impl RootWatcher {
         out
     }
 
-    /// Announce a compositing manager the way one does: by owning the
+    /// Announce the compositing manager the way one does: by owning the
     /// `_NET_WM_CM_S<screen>` selection.
     fn claim_compositor(&self) {
         use x11rb::connection::Connection;
@@ -800,65 +837,52 @@ impl RootWatcher {
             .unwrap();
         self.conn.flush().unwrap();
     }
+
+    /// The exposes a series of nudges produced, checked for shape: each one
+    /// covering the whole stage, and at least `at_least` of them.
+    fn assert_nudge_series(&self, seen: &[(Instant, Exposed)], at_least: usize) {
+        let whole = Exposed {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        };
+        let full = seen.iter().filter(|(_, e)| *e == whole).count();
+        assert!(
+            full >= at_least,
+            "expected at least {at_least} whole-stage exposes, saw {full}: {seen:?}"
+        );
+        assert_eq!(
+            full,
+            seen.len(),
+            "every nudge should expose the whole stage, not a part of it: {seen:?}"
+        );
+    }
 }
 
-/// The windows a series of nudges mapped, checked for shape: all the same
-/// one-pixel override-redirect window, each map followed by its unmap.
-fn assert_nudge_series(seen: &[(Instant, Nudge)], at_least: usize) {
-    let maps: Vec<u32> = seen
-        .iter()
-        .filter_map(|(_, n)| match n {
-            Nudge::Map {
-                window,
-                override_redirect: true,
-            } => Some(*window),
-            Nudge::Map {
-                override_redirect: false,
-                ..
-            } => panic!("a nudge window was not override-redirect: {seen:?}"),
-            Nudge::Unmap { .. } => None,
-        })
-        .collect();
-    assert!(
-        maps.len() >= at_least,
-        "expected at least {at_least} nudges, saw {}: {seen:?}",
-        maps.len()
-    );
-    assert!(
-        maps.windows(2).all(|w| w[0] == w[1]),
-        "nudges should reuse one window: {seen:?}"
-    );
-    let unmaps = seen
-        .iter()
-        .filter(|(_, n)| matches!(n, Nudge::Unmap { window } if *window == maps[0]))
-        .count();
-    assert!(
-        unmaps + 1 >= maps.len(),
-        "every nudge but perhaps the last should have been unmapped again: {seen:?}"
-    );
-}
-
-/// A root resize while GNOME was starting once left the desktop black: every
-/// process healthy, the shell owing a full redraw at the new size, and its
-/// frame clock never ticking to paint it -- until something mapped a window.
-/// So after a resize the session maps one, more than once, spread over the
-/// seconds a compositor takes to come up behind the resize that stalled it.
+/// A root resize while GNOME was starting left the desktop black: every
+/// process healthy, the shell presenting only the rectangles that changed
+/// onto a stage window the resize had emptied, and never a full frame. An
+/// `Expose` over the whole stage is what makes mutter queue one. So after
+/// a resize the session sends one, more than once, spread over the seconds
+/// a compositor takes to come up behind the resize that caught it.
 #[test]
 fn a_root_resize_nudges_the_compositor_to_repaint() {
     require_x_tools!();
     let s = Session::start(640, 480, "none", &[]);
     let mut c = s.connect(None);
-    s.x("xsetroot", &["-solid", "#336699"]);
-    assert!(wait_for(&mut c, Duration::from_secs(5), |_, c| c
-        .framebuffer()
-        .get(0, 0)
-        == 0x336699));
-    let watcher = RootWatcher::open(&s);
-    // Nothing is mapped on a quiet root: the series must be caused by the
-    // resize, not by the session's ordinary startup.
+    assert!(wait_for(&mut c, Duration::from_secs(5), |ev, _| matches!(
+        ev,
+        ClientEvent::Frame { .. }
+    )));
+    let compositor = CompositorStandIn::open(&s);
+    compositor.claim_compositor();
+    // The claim itself arms a series; let it run out, then make sure a
+    // quiet session exposes nothing on its own.
+    let _ = compositor.collect(Duration::from_secs(7), usize::MAX);
     assert!(
-        watcher.collect(Duration::from_millis(500), 1).is_empty(),
-        "a root child was mapped before any resize"
+        compositor.collect(Duration::from_millis(500), 1).is_empty(),
+        "the stage was exposed before any resize"
     );
 
     let started = Instant::now();
@@ -870,34 +894,16 @@ fn a_root_resize_nudges_the_compositor_to_repaint() {
             height: 600
         }
     )));
-    // Three maps and three unmaps, the last pair due three seconds after
-    // the resize; give the housekeeping tick room to deliver it.
-    let seen = watcher.collect(Duration::from_secs(5), 6);
-    assert_nudge_series(&seen, 3);
-    let first = seen
-        .iter()
-        .find(|(_, n)| matches!(n, Nudge::Map { .. }))
-        .map(|(at, _)| *at)
-        .unwrap();
+    // Three exposes within five seconds: at the resize, a second later and
+    // three seconds later, with the housekeeping tick's slack.
+    let seen = compositor.collect(Duration::from_secs(5), 3);
+    compositor.assert_nudge_series(&seen, 3);
+    let first = seen.first().map(|(at, _)| *at).unwrap();
     assert!(
         first.duration_since(started) < Duration::from_secs(1),
         "the first nudge should follow the resize at once, not {:?} later",
         first.duration_since(started)
     );
-
-    // Without a compositor, the nudge window shows the root's own
-    // background and is gone again within a tick, so the picture the client
-    // holds is the plain root colour -- at the top-left corner where the
-    // window was, as everywhere else.
-    assert!(wait_for(&mut c, Duration::from_secs(10), |_, c| c
-        .framebuffer()
-        .get(799, 599)
-        == 0x336699));
-    let settle = Instant::now() + Duration::from_millis(300);
-    while Instant::now() < settle {
-        let _ = c.poll_event(Duration::from_millis(50));
-    }
-    assert_eq!(c.framebuffer().get(0, 0), 0x336699);
 }
 
 /// The compositor that needs nudging is the one that was still starting
@@ -912,16 +918,48 @@ fn a_compositor_arriving_late_is_nudged_too() {
         ev,
         ClientEvent::Frame { .. }
     )));
-    let watcher = RootWatcher::open(&s);
+    let compositor = CompositorStandIn::open(&s);
     assert!(
-        watcher.collect(Duration::from_millis(500), 1).is_empty(),
-        "a root child was mapped before any compositor appeared"
+        compositor.collect(Duration::from_millis(500), 1).is_empty(),
+        "the stage was exposed before any compositor was announced"
     );
-    watcher.claim_compositor();
-    let seen = watcher.collect(Duration::from_secs(5), 6);
-    // The claim maps the compositor's own selection window too; it is
-    // INPUT_ONLY and never mapped, so what the watcher sees is the session's.
-    assert_nudge_series(&seen, 3);
+    compositor.claim_compositor();
+    let seen = compositor.collect(Duration::from_secs(5), 3);
+    compositor.assert_nudge_series(&seen, 3);
+}
+
+/// Without a compositing manager there is no stage to expose, and the
+/// session sends nothing: a resize under a plain window manager must not
+/// touch the overlay, which would flash it over the desktop.
+#[test]
+fn no_compositor_means_no_nudge() {
+    require_x_tools!();
+    let s = Session::start(640, 480, "none", &[]);
+    let mut c = s.connect(None);
+    s.x("xsetroot", &["-solid", "#336699"]);
+    assert!(wait_for(&mut c, Duration::from_secs(5), |_, c| c
+        .framebuffer()
+        .get(0, 0)
+        == 0x336699));
+    c.request_resize(800, 600).unwrap();
+    assert!(wait_for(&mut c, Duration::from_secs(10), |ev, _| matches!(
+        ev,
+        ClientEvent::Resized {
+            width: 800,
+            height: 600
+        }
+    )));
+    assert!(wait_for(&mut c, Duration::from_secs(10), |_, c| c
+        .framebuffer()
+        .get(799, 599)
+        == 0x336699));
+    // Through the whole series the picture stays the plain root colour.
+    let settle = Instant::now() + Duration::from_millis(3500);
+    while Instant::now() < settle {
+        let _ = c.poll_event(Duration::from_millis(50));
+        assert_eq!(c.framebuffer().get(0, 0), 0x336699);
+        assert_eq!(c.framebuffer().get(799, 599), 0x336699);
+    }
 }
 
 #[test]

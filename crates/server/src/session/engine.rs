@@ -396,9 +396,10 @@ pub struct Core {
     /// Captures in a row that failed on stale root geometry; see
     /// [`STALE_CAPTURE_LIMIT`].
     stale_captures: u32,
-    /// Kicks a compositor whose frame clock stalled across a root resize;
-    /// see `x11::repaint`. Optional because a display without XFIXES cannot
-    /// announce its compositor, and the session is still worth having.
+    /// Makes a compositor present its whole stage after a root resize left
+    /// its window empty; see `x11::repaint`. Optional because a display
+    /// without XFIXES cannot announce its compositor, and the session is
+    /// still worth having.
     repainter: Option<Repainter>,
 }
 
@@ -718,8 +719,9 @@ impl Core {
         if let Some(r) = self.repainter.as_mut() {
             if r.handle_event(&ev) {
                 // The desktop's compositor has just taken the screen. If a
-                // resize landed while it was starting, the redraw it owes may
-                // never come on its own; the nudges this arms see that it does.
+                // resize landed while it was starting, the full frame it owes
+                // may never come on its own; the nudges this arms see that
+                // it does.
                 log::info!("a compositing manager has taken the screen");
                 if let Err(e) = r.tick() {
                     log::warn!("compositor repaint nudge failed: {e:#}");
@@ -1696,11 +1698,11 @@ impl Core {
             }
         }
         log::info!("screen is now {w}x{h}");
-        // Whoever changed the size, the compositor now owes a redraw of the
-        // whole stage, and a resize that lands while it is starting is the
-        // one it can lose. Our own full refresh above resends what the X
-        // server holds; this is what makes sure that is a desktop and not
-        // the black it holds until the compositor paints.
+        // Whoever changed the size, the compositor now owes a full frame,
+        // and a resize that lands while it is starting is the one it can
+        // lose. Our own full refresh above resends what the X server holds;
+        // this is what makes sure that is a desktop and not the black it
+        // holds until the compositor paints.
         if let Some(r) = self.repainter.as_mut() {
             r.screen_changed();
             if let Err(e) = r.tick() {
@@ -1891,10 +1893,15 @@ impl Core {
         let outcome = self.transfers.poll();
         self.apply_transfer_outcome(outcome);
 
-        // Nudges due since the last tick. Not fatal: this is a courtesy to
-        // the compositor, and a failure here is an X error on a one-pixel
-        // window of ours, which is no reason to end the user's desktop.
+        // Nudges due since the last tick, and the watch for a screen that
+        // stayed black after its compositor arrived. Not fatal: this is a
+        // courtesy to the compositor, and a failure here is an X error on a
+        // request about its windows, which is no reason to end the user's
+        // desktop.
         if let Some(r) = self.repainter.as_mut() {
+            if r.wants_black_check() && self.screen.pixels().iter().all(|&p| p == 0) {
+                r.screen_is_black();
+            }
             if !r.is_idle() {
                 if let Err(e) = r.tick() {
                     log::warn!("compositor repaint nudge failed: {e:#}");
